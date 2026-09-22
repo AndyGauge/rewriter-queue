@@ -44,6 +44,24 @@ Single-file output (≤500 lines) needs no markers — just emit the Rust source
 
 **Critical rules — violations cause build failures:**
 - Never abbreviate, truncate, or summarize code. Every function body must be fully written out.
-- Never write `// ... unchanged`, `// ... other tools`, `// TODO`, `unimplemented!()`, or any placeholder. A reviewer will reject any file containing these.
+- No unfinished work, under any spelling. This means: `// TODO`, `// ... unchanged`, `// Placeholder` (or any other comment saying a part isn't real), `unimplemented!()`, `todo!()`, or a body that returns an empty/default value standing in for real logic (`Vec::new()` where the contract requires actually collecting something, `None` where a value is required). If a rule elsewhere in this document names a specific banned string, treat that as an example of the pattern, not the whole list — the test is "does this function actually do what the contract says," not "does it avoid these exact tokens."
 - If you are implementing a chunk of a larger file, implement every item in that chunk completely. Other chunks are handled separately — do not reference them.
 - The output must pass `cargo build`, `cargo clippy -D warnings`, and `cargo test`.
+
+**Adding a dependency:** if your implementation genuinely needs a crate that isn't already in
+`Cargo.toml` (`serde` for `#[derive(Serialize, Deserialize)]`, `thiserror` for `#[derive(Error)]`,
+etc.), you may emit a `// === Cargo.toml ===` section alongside your `.rs` files, using the same
+marker format, with the full corrected file content. Don't assume a derive macro or attribute is
+available without first checking it's actually declared as a dependency — `cannot find derive
+macro` / `cannot find attribute` errors mean it isn't.
+
+**Two more common sources of build failures, beyond the path idiom above:**
+- **Using a value after moving it into a struct literal.** `Foo { field: v, other: v.len() }` moves
+  `v` into `field` before `other` can borrow it. Compute anything you need from a value (`.len()`,
+  `.clone()`, etc.) *before* the struct literal moves it, or reorder fields so the borrow happens
+  first, or clone deliberately if you actually need two independent copies.
+- **`thiserror`'s `#[source]` field must itself be an error type** (implement `std::error::Error`)
+  — a `String` or `Option<String>` field cannot be `#[source]`. Use `#[error("{0}")]` with a
+  `String` payload instead if you just need a message, not a wrapped error to chain from. Likewise,
+  any enum or struct you compare with `==` or print with `{:?}` needs `#[derive(PartialEq)]` /
+  `#[derive(Debug)]` respectively — don't assume derives are implied.
