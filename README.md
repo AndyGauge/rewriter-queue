@@ -50,11 +50,14 @@ them at — a local `llama.cpp`/`vLLM` server, or a hosted API.
 - **`claude-code-plugin/`** — packages the queue's MCP tools plus each
   skill as a Claude Code slash command. See its own README.
 
+Full docs, starting with a tutorial: **https://andygauge.github.io/rewriter-queue/**
+
 ## Quickstart
 
-```sh
-cargo build --release
-```
+Grab a prebuilt binary for your platform from the
+[latest release](https://github.com/AndyGauge/rewriter-queue/releases/latest)
+— no local Rust toolchain needed. (Building from source is `cargo build
+--release`, if you'd rather; see [`docs/installation.md`](docs/installation.md).)
 
 1. **Point it at an inference backend.** Write `~/.config/rewriter/config.toml`:
 

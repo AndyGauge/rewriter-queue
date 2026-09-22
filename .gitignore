@@ -3,6 +3,7 @@
 Cargo.lock
 *.log
 .DS_Store
+/book/
 
 # Local queue state and per-run artifacts — regenerable, and often contain
 # the source/output of whatever project someone ran through this.

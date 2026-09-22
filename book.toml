@@ -1,0 +1,8 @@
+[book]
+title = "rewriter-queue"
+authors = ["Andy Gauge"]
+language = "en"
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/AndyGauge/rewriter-queue"
