@@ -1,0 +1,6 @@
+{
+  "rewriter-queue": {
+    "command": "rewriter-queue",
+    "args": ["mcp"]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "rewriter-queue",
+  "displayName": "Rewriter Queue",
+  "description": "Submit, watch, and download multi-agent code-synthesis jobs, plus each reviewer/implementer persona as a standalone slash command.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Andy Gauge"
+  },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["code-synthesis", "multi-agent", "code-review", "mcp"],
+  "commands": ["./commands/"],
+  "mcpServers": "./mcp-servers/config.json"
+}

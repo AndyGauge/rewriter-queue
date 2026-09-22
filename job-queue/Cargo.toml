@@ -1,0 +1,23 @@
+[package]
+name = "job-queue"
+version = "0.1.0"
+edition = "2021"
+description = "File-backed batch queue for orchestrator runs, with a worker, live watch view and MCP server"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rewriter-queue"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+libc = "0.2"
+ureq = { workspace = true }
+toml = { workspace = true }
+walkdir = { workspace = true }
+tiny_http = "0.12"
+tar = "0.4"
+flate2 = "1"
+url = "2"

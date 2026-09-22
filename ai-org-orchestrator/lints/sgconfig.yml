@@ -1,0 +1,5 @@
+# ast-grep plugin directory for the quality gate. Anyone can add a check here —
+# drop a new rule YAML into rules/ and quality_gate() picks it up automatically
+# on the next run, no recompiling the orchestrator. See rules/README.md.
+ruleDirs:
+  - rules

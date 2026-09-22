@@ -1,0 +1,10 @@
+/target/
+**/target/
+Cargo.lock
+*.log
+.DS_Store
+
+# Local queue state and per-run artifacts — regenerable, and often contain
+# the source/output of whatever project someone ran through this.
+/queue-data/
+*.checkpoint

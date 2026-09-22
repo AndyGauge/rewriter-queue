@@ -1,0 +1,16 @@
+id: reflexive-multi-mutex
+language: rust
+severity: warning
+message: >-
+  Arc<Mutex<_>> field. If 2+ such fields exist on the enclosing struct, that's
+  a lock-ordering-deadlock risk waiting to happen -- consider whether a single
+  actor task owning the state (one mpsc channel, no lock) is the better shape
+  instead of one lock per subsystem.
+rule:
+  kind: field_declaration
+  has:
+    field: type
+    regex: '^Arc<Mutex<'
+  inside:
+    kind: struct_item
+    stopBy: end

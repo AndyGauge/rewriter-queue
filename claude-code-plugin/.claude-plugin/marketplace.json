@@ -1,0 +1,14 @@
+{
+  "name": "rewriter-queue-marketplace",
+  "description": "Marketplace hosting the rewriter-queue Claude Code plugin: submit/watch synthesis jobs and each review persona as a slash command.",
+  "owner": {
+    "name": "Andy Gauge"
+  },
+  "plugins": [
+    {
+      "name": "rewriter-queue",
+      "source": "./",
+      "description": "Submit, watch, and download multi-agent code-synthesis jobs, plus each reviewer/implementer persona as a standalone slash command."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "inference-providers"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable inference provider registry with cost-aware routing"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "inference_providers"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+toml = { workspace = true }
