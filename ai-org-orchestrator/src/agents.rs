@@ -11,7 +11,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
         // Only the agents that generate large code artifacts need the top tier
         "TargetImplementer" | "MergeAgent" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
-        "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect"
+        "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
         | "TestEngineer" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
@@ -26,7 +26,7 @@ pub fn agent_hora_depth(name: &str) -> u8 {
     let base = name.split('-').next().unwrap_or(name);
     match base {
         "MissionArchitect" | "InductiveReasoner" => 3,
-        "MergeAgent" | "SchemaArchitect" => 2,
+        "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" => 2,
         "TargetImplementer" | "ContractReviewer" | "TestEngineer" | "MaintenanceReviewer"
         | "ProductionReadinessReviewer" => 1,
         _ => 0,
@@ -48,3 +48,4 @@ pub const IP_COUNSEL: &str = include_str!("../../skills/ip-counsel.md");
 pub const FORMAL_METHODS_REVIEWER: &str = include_str!("../../skills/formal-methods-reviewer.md");
 pub const PRODUCTION_READINESS_REVIEWER: &str =
     include_str!("../../skills/production-readiness-reviewer.md");
+pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");

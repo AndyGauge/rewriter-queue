@@ -1,0 +1,91 @@
+Based on the ObjectiveContract, Schema, and iteration budget (N=10), I'll break down the implementation into milestones that can each be completed within about 10 build-fix rounds. Here's the decomposition:
+
+```
+## MILESTONE: research-database-core
+RISK: EASY
+TASK: Implement the core ResearchDatabase struct with findings and sources storage. This includes:
+- Implementing the basic struct with HashMap fields
+- Adding getter/setter methods for findings and sources
+- Implementing basic serialization/deserialization
+- Adding validation for required fields (chapter_id, content, etc.)
+- Corresponds to V1's ResearchDatabase set/get functionality but with proper type safety
+
+## MILESTONE: research-outline-basic
+RISK: EASY
+TASK: Implement the basic ResearchOutline struct and its methods:
+- Implement ResearchItem struct with all required fields
+- Implement add_research_item method with section number handling
+- Implement verify_research_item method with status updates
+- Add basic validation for research items
+- Corresponds to V1's ResearchOutline add/verify methods
+
+## MILESTONE: footgun-report-structures
+RISK: EASY
+TASK: Implement all data structures related to footgun reports:
+- FootgunReport struct with all required fields
+- ReportType enum and its variants
+- VerificationStatus enum
+- Corresponds to V1's footgun report structures but with proper Rust types
+
+## MILESTONE: verification-result-types
+RISK: EASY
+TASK: Implement verification-related data structures:
+- VerificationResult struct with validated/invalid/skipped reports
+- VerificationStats struct with counters
+- Corresponds to V1's verification result structures
+
+## MILESTONE: workflow-result-types
+RISK: EASY
+TASK: Implement workflow-related data structures:
+- WorkflowResult struct with state and counters
+- WorkflowMetadata struct with timing info
+- WorkflowState enum
+- WorkflowOptions struct
+- Corresponds to V1's workflow result structures
+
+## MILESTONE: orchestrator-types
+RISK: EASY
+TASK: Implement orchestrator-related data structures:
+- OrchestratorResult struct with reports and errors
+- OrchestratorMetadata struct with statistics
+- OrchestratorMode enum
+- ResearchOrchestratorInstance struct
+- OrchestratorConfig struct
+- Corresponds to V1's orchestrator structures
+
+## MILESTONE: research-verification-trait
+RISK: EASY
+TASK: Implement the ResearchVerification trait with basic functionality:
+- Implement verify_research_reports method (basic implementation)
+- Implement verify_single_report method with field validation
+- Implement get_verification_stats method
+- Add basic verification logic for required fields
+- Corresponds to V1's ResearchVerification verifyResearchReports method
+
+## MILESTONE: research-workflow-trait
+RISK: EASY
+TASK: Implement the ResearchWorkflow trait with basic functionality:
+- Implement research_footguns_workflow method skeleton
+- Implement get_workflow_state method
+- Add basic state transition logic
+- Corresponds to V1's ResearchWorkflow researchFootgunsWorkflow method
+
+## MILESTONE: research-orchestrator-trait
+RISK: EASY
+TASK: Implement the ResearchOrchestrator trait with basic functionality:
+- Implement get_instance method
+- Implement quick_research method skeleton
+- Implement dry_run_research method skeleton
+- Implement run_research method skeleton
+- Implement get_current_instance method
+- Corresponds to V1's ResearchOrchestrator methods
+
+## MILESTONE: error-handling-types
+RISK: EASY
+TASK: Implement error handling structures:
+- WorkflowError enum with variants
+- Basic error creation methods
+- Corresponds to V1's error handling requirements
+```
+
+Each milestone is focused on a specific set of related types or functionality, with clear boundaries and dependencies only on previously completed milestones or the schema. This decomposition ensures each piece can be implemented, tested, and reviewed within the 10-round budget while maintaining independence between milestones.

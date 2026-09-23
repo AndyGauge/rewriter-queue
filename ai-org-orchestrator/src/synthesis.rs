@@ -1,8 +1,9 @@
 use crate::manager::{Manager, CHUNK_TARGET, SPLIT_THRESHOLD};
 use crate::agents::{
-    FORMAL_METHODS_REVIEWER, IP_COUNSEL, MAINTENANCE_REVIEWER, MERGE_AGENT,
+    FORMAL_METHODS_REVIEWER, IP_COUNSEL, MAINTENANCE_REVIEWER, MERGE_AGENT, MILESTONE_PLANNER,
     PRODUCTION_READINESS_REVIEWER, SECURITY_REVIEWER, SECURITY_REVIEWER_FINAL,
 };
+use std::collections::HashMap;
 
 impl<'a> Manager<'a> {
     fn parallel_degree(&self) -> usize {
@@ -59,13 +60,20 @@ impl<'a> Manager<'a> {
     /// rewrite — cheaper and faster, especially on a slow local model. An LLM review
     /// rejection (security/maintenance) is holistic prose critique with no fixed location,
     /// so that path still asks for a full regeneration, unchanged.
+    /// `id_prefix` namespaces this call's checkpoints (`<id_prefix>/iter/<n>/...`) so multiple
+    /// concurrent or nested callers — one per milestone, for instance — don't collide. Returns
+    /// `(code, passed)`: `passed` is false when the iteration budget ran out before the quality
+    /// gate and review both passed, so a caller can tell "this is done" from "this is a
+    /// best-effort result I gave up on" and react differently (e.g. escalate for a finer split)
+    /// instead of silently treating both the same way.
     pub fn run_with_dual_review(
         &self,
+        id_prefix: &str,
         worker_name: &str,
         worker_system: &str,
         base_task: &str,
         max_iter: usize,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<(String, bool), Box<dyn std::error::Error>> {
         enum NextCall {
             Full(String),
             Patch(String), // the quality gate's error text to patch against last_output
@@ -75,7 +83,7 @@ impl<'a> Manager<'a> {
         let mut last_output = String::new();
 
         for iteration in 0..max_iter {
-            let raw = self.ws.checkpoint(&format!("dual_review/iter/{iteration}/worker"), || {
+            let raw = self.ws.checkpoint(&format!("{id_prefix}/iter/{iteration}/worker"), || {
                 match &next {
                     NextCall::Full(task) => self.run(worker_name, worker_system, task),
                     NextCall::Patch(errors) => self.try_patch(
@@ -106,10 +114,10 @@ impl<'a> Manager<'a> {
             }
 
             let review_input = format!("Review this output:\n\n{clean}");
-            let security = self.ws.checkpoint(&format!("dual_review/iter/{iteration}/security"), || {
+            let security = self.ws.checkpoint(&format!("{id_prefix}/iter/{iteration}/security"), || {
                 self.run("SecurityReviewer", SECURITY_REVIEWER, &review_input)
             })?;
-            let maintenance = self.ws.checkpoint(&format!("dual_review/iter/{iteration}/maintenance"), || {
+            let maintenance = self.ws.checkpoint(&format!("{id_prefix}/iter/{iteration}/maintenance"), || {
                 self.run("MaintenanceReviewer", MAINTENANCE_REVIEWER, &review_input)
             })?;
 
@@ -117,7 +125,7 @@ impl<'a> Manager<'a> {
             let maintenance_ok = maintenance.trim_start().to_uppercase().starts_with("APPROVE");
 
             if security_ok && maintenance_ok {
-                return Ok(last_output);
+                return Ok((last_output, true));
             }
 
             let mut feedback_parts = Vec::new();
@@ -146,11 +154,7 @@ impl<'a> Manager<'a> {
             ));
         }
 
-        self.ws.log_agent_decision(
-            worker_name,
-            "max iterations reached — accepting last output",
-        )?;
-        Ok(last_output)
+        Ok((last_output, false))
     }
 
     /// Ask for a minimal SEARCH/REPLACE patch against `last_output` that fixes
@@ -276,12 +280,7 @@ impl<'a> Manager<'a> {
         // (contract, schema, test matrix) that inflates its size regardless of V1 size.
         // Splitting a small V1 forces a merge step that degrades quality on weak merge models.
         if degree == 1 || v1_source.len() <= SPLIT_THRESHOLD {
-            let code = self.run_with_dual_review(
-                "TargetImplementer",
-                worker_system,
-                &full_task,
-                max_iter,
-            )?;
+            let code = self.synthesize_by_milestones(worker_system, contract, schema, &full_task, max_iter)?;
             self.run_review_panel(&code, contract)?;
             return Ok(code);
         }
@@ -441,5 +440,317 @@ impl<'a> Manager<'a> {
         self.run_review_panel(&merged, contract)?;
 
         Ok(merged)
+    }
+
+    /// Cap on how many times a piece of work can be recursively re-split before we give up and
+    /// implement it as-is. Without a cap, a MilestonePlanner that never settles could recurse
+    /// forever; three levels is enough to turn "the whole crate" into pieces small enough for a
+    /// single implementer attempt in practice, and a genuinely pathological milestone should
+    /// surface as a deviation for a human, not loop.
+    const MAX_SPLIT_DEPTH: usize = 3;
+
+    /// Entry point: plan the work into milestones sized to `max_iter`, implement each one
+    /// independently (checkpointed on its own, so a crash mid-way only redoes the milestone it
+    /// was on), and merge their file sections into one crate. Replaces handing the whole crate
+    /// to one `run_with_dual_review` call as a single all-or-nothing bet against the iteration
+    /// budget — see `ai-org-orchestrator/lints` README and the root README's design notes for
+    /// why that bet kept losing in practice.
+    pub fn synthesize_by_milestones(
+        &self,
+        worker_system: &str,
+        contract: &str,
+        schema: &str,
+        root_task: &str,
+        max_iter: usize,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let sections =
+            self.implement_milestones("root", root_task, worker_system, contract, schema, max_iter, 0)?;
+        Ok(Self::format_multi_file(&sections))
+    }
+
+    /// Ask MilestonePlanner to break `task` into milestones estimated to fit `max_iter` each,
+    /// then implement every milestone — recursing on any the planner still calls HARD, or that
+    /// actually failed to converge within its budget, up to `MAX_SPLIT_DEPTH`.
+    fn implement_milestones(
+        &self,
+        id_prefix: &str,
+        task: &str,
+        worker_system: &str,
+        contract: &str,
+        schema: &str,
+        max_iter: usize,
+        depth: usize,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        let plan_task = format!("{task}\n\n# Iteration Budget\nN = {max_iter}");
+        let plan_text = self.ws.checkpoint(&format!("{id_prefix}/plan"), || {
+            self.run("MilestonePlanner", MILESTONE_PLANNER, &plan_task)
+        })?;
+        let milestones = parse_milestone_plan(&plan_text);
+
+        let mut sections = HashMap::new();
+        for milestone in milestones {
+            let ms_id = format!("{id_prefix}/{}", milestone.name);
+
+            if milestone.risk == Risk::Hard && depth < Self::MAX_SPLIT_DEPTH {
+                eprintln!(
+                    "  [milestones] '{}' planned HARD at depth {depth} — splitting further",
+                    milestone.name
+                );
+                self.ws.log_deviation(
+                    "MilestonePlanner",
+                    &format!(
+                        "Milestone '{}' estimated HARD for a {max_iter}-iteration budget — \
+                         splitting into sub-milestones (depth {depth})",
+                        milestone.name
+                    ),
+                )?;
+                let sub = self.implement_milestones(
+                    &ms_id,
+                    &milestone.task,
+                    worker_system,
+                    contract,
+                    schema,
+                    max_iter,
+                    depth + 1,
+                )?;
+                sections.extend(sub);
+                continue;
+            }
+
+            let base_task = format!(
+                "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+                 # Milestone: {}\n{}",
+                milestone.name, milestone.task
+            );
+            let (code, passed) = self.run_with_dual_review(
+                &ms_id,
+                "TargetImplementer",
+                worker_system,
+                &base_task,
+                max_iter,
+            )?;
+
+            if !passed && depth < Self::MAX_SPLIT_DEPTH {
+                eprintln!(
+                    "  [milestones] '{}' did not converge in {max_iter} iterations — \
+                     escalating for a finer split",
+                    milestone.name
+                );
+                self.ws.log_deviation(
+                    "MilestonePlanner",
+                    &format!(
+                        "Milestone '{}' did not pass its quality gate within {max_iter} \
+                         iterations as a single unit — splitting further (depth {depth})",
+                        milestone.name
+                    ),
+                )?;
+                let retry_task = format!(
+                    "{}\n\n# Why This Needs Splitting\nA previous attempt implemented this as \
+                     one unit and did not pass its quality gate within {max_iter} iterations. \
+                     Split it into two or more smaller, independently-implementable pieces.",
+                    milestone.task
+                );
+                let sub = self.implement_milestones(
+                    &ms_id,
+                    &retry_task,
+                    worker_system,
+                    contract,
+                    schema,
+                    max_iter,
+                    depth + 1,
+                )?;
+                sections.extend(sub);
+                continue;
+            }
+
+            if !passed {
+                self.ws.log_agent_decision(
+                    "MilestonePlanner",
+                    &format!(
+                        "Milestone '{}' still failing its quality gate at max split depth \
+                         {depth} — accepting best effort",
+                        milestone.name
+                    ),
+                )?;
+            }
+            sections.extend(Self::parse_file_sections(&code));
+        }
+        Ok(sections)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Risk {
+    Easy,
+    Hard,
+}
+
+#[derive(Debug, Clone)]
+struct Milestone {
+    name: String,
+    risk: Risk,
+    task: String,
+}
+
+/// Parse MilestonePlanner's `## MILESTONE: <name>` / `RISK: EASY|HARD` / `TASK: ...` blocks.
+/// Tolerant of a missing/garbled RISK line (defaults to Hard — forces a split rather than
+/// silently trusting an ambiguous plan) and of TASK spanning multiple lines up to the next
+/// milestone marker.
+fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
+    let mut milestones = Vec::new();
+    let mut name: Option<String> = None;
+    let mut risk = Risk::Hard;
+    let mut task = String::new();
+
+    let flush = |name: &mut Option<String>, risk: &mut Risk, task: &mut String, out: &mut Vec<Milestone>| {
+        if let Some(n) = name.take() {
+            out.push(Milestone { name: n, risk: risk.clone(), task: task.trim().to_string() });
+        }
+        *risk = Risk::Hard;
+        task.clear();
+    };
+
+    // Whether we're past a closing ``` fence and waiting for the next milestone marker.
+    // Models often wrap the *whole* plan in one fence (closing it only after the last
+    // milestone, with trailing commentary after that) rather than fencing each milestone
+    // individually — without this, that trailing prose glues onto the last milestone's task.
+    // Resetting on the next marker also keeps this correct if a model instead fences each
+    // milestone separately.
+    let mut suppressed = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## MILESTONE:") {
+            flush(&mut name, &mut risk, &mut task, &mut milestones);
+            name = Some(rest.trim().to_string());
+            suppressed = false;
+        } else if let Some(rest) = trimmed.strip_prefix("RISK:") {
+            risk = if rest.trim().eq_ignore_ascii_case("EASY") { Risk::Easy } else { Risk::Hard };
+        } else if let Some(rest) = trimmed.strip_prefix("TASK:") {
+            task.push_str(rest.trim());
+            task.push('\n');
+        } else if trimmed == "```" {
+            if name.is_some() {
+                suppressed = true;
+            }
+        } else if name.is_some() && !suppressed && !trimmed.is_empty() {
+            task.push_str(line);
+            task.push('\n');
+        }
+    }
+    flush(&mut name, &mut risk, &mut task, &mut milestones);
+    milestones
+}
+
+#[cfg(test)]
+mod milestone_tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_milestones_with_multiline_tasks() {
+        let text = "\
+## MILESTONE: research-database
+RISK: EASY
+TASK: Implement the ResearchDatabase struct and its add/get/verify methods,
+covering the edge cases in section 3.1 of the contract.
+
+## MILESTONE: research-workflow
+RISK: HARD
+TASK: Implement the whole workflow orchestration.
+";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 2);
+        assert_eq!(milestones[0].name, "research-database");
+        assert_eq!(milestones[0].risk, Risk::Easy);
+        assert!(milestones[0].task.contains("add/get/verify"));
+        assert!(milestones[0].task.contains("edge cases"));
+        assert_eq!(milestones[1].name, "research-workflow");
+        assert_eq!(milestones[1].risk, Risk::Hard);
+    }
+
+    #[test]
+    fn missing_or_garbled_risk_line_defaults_to_hard() {
+        let text = "\
+## MILESTONE: mystery
+TASK: No RISK line was given at all.
+";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].risk, Risk::Hard);
+    }
+
+    #[test]
+    fn text_before_any_milestone_marker_is_discarded() {
+        let text = "Some preamble the model wrote before the first marker.\n\n\
+## MILESTONE: only-one\nRISK: EASY\nTASK: Just this.\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].task, "Just this.");
+    }
+
+    /// Regression test for a real devstral response: the whole plan wrapped in one fence, with
+    /// prose commentary after the closing fence -- that trailing prose used to glue onto the
+    /// last milestone's task.
+    #[test]
+    fn trailing_prose_after_a_whole_plan_fence_does_not_leak_into_the_last_task() {
+        let text = "Here's the decomposition:\n\n\
+```\n\
+## MILESTONE: first-one\n\
+RISK: EASY\n\
+TASK: Do the first thing.\n\
+\n\
+## MILESTONE: last-one\n\
+RISK: EASY\n\
+TASK: Do the last thing.\n\
+```\n\
+\n\
+Each milestone is focused and independently implementable.\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 2);
+        assert_eq!(milestones[1].name, "last-one");
+        assert_eq!(milestones[1].task, "Do the last thing.");
+        assert!(!milestones[1].task.contains("independently implementable"));
+    }
+
+    /// A model that fences each milestone separately (rather than the whole plan at once)
+    /// must still parse all of them, not just the first.
+    #[test]
+    fn per_milestone_fencing_does_not_truncate_the_plan() {
+        let text = "\
+## MILESTONE: first-one\n\
+RISK: EASY\n\
+TASK: Do the first thing.\n\
+```\n\
+\n\
+## MILESTONE: last-one\n\
+RISK: EASY\n\
+TASK: Do the last thing.\n\
+```\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 2);
+        assert_eq!(milestones[0].task, "Do the first thing.");
+        assert_eq!(milestones[1].task, "Do the last thing.");
+    }
+
+    /// Not a synthetic example: a real devstral response to the actual MilestonePlanner
+    /// prompt, captured while validating this feature. Locks in that the real, messier shape
+    /// (whole-plan fence, bullet-list tasks, trailing summary prose) parses cleanly end to end.
+    #[test]
+    fn parses_a_real_captured_devstral_response() {
+        let text = include_str!("testdata_real_milestone_response.txt");
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones.len(), 10);
+        assert_eq!(milestones[0].name, "research-database-core");
+        assert_eq!(milestones[9].name, "error-handling-types");
+        for m in &milestones {
+            assert_eq!(m.risk, Risk::Easy);
+            assert!(!m.task.is_empty());
+            assert!(!m.task.contains("```"), "fence leaked into {}: {}", m.name, m.task);
+        }
+        assert!(
+            !milestones[9].task.contains("independently"),
+            "trailing summary prose leaked into last milestone: {}",
+            milestones[9].task
+        );
     }
 }
