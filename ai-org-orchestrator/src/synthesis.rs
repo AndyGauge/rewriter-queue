@@ -463,8 +463,9 @@ impl<'a> Manager<'a> {
         root_task: &str,
         max_iter: usize,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let sections =
+        let mut sections =
             self.implement_milestones("root", root_task, worker_system, contract, schema, max_iter, 0)?;
+        ensure_module_declarations(&mut sections);
         Ok(Self::format_multi_file(&sections))
     }
 
@@ -519,7 +520,12 @@ impl<'a> Manager<'a> {
 
             let base_task = format!(
                 "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
-                 # Milestone: {}\n{}",
+                 # Milestone: {}\n{}\n\n\
+                 # Scope\nImplement only the file(s) this milestone owns. Do not add or edit a \
+                 `mod` declaration for this milestone's own module in `main.rs`/`lib.rs` — that \
+                 wiring is added automatically after every milestone is done, specifically so \
+                 that milestones implemented independently never collide by both editing the \
+                 same shared entry file.",
                 milestone.name, milestone.task
             );
             let (code, passed) = self.run_with_dual_review(
@@ -596,6 +602,52 @@ struct Milestone {
 /// Tolerant of a missing/garbled RISK line (defaults to Hard — forces a split rather than
 /// silently trusting an ambiguous plan) and of TASK spanning multiple lines up to the next
 /// milestone marker.
+/// Register every top-level `src/*.rs` module in the crate's entry file (`src/main.rs`,
+/// falling back to `src/lib.rs`), inserting only the `mod <name>;` lines that aren't already
+/// present. This is deliberately mechanical, not an implementer's job: two milestones that each
+/// need their own module registered are otherwise both trying to hand-edit the same shared
+/// file, and since each milestone's `run_with_dual_review` loop only tracks its own in-memory
+/// copy of what it last wrote, one milestone's edit to that file can silently diverge from what
+/// another milestone (or this same file's own owning milestone, on a later iteration) has
+/// since put on disk -- surfacing as "SEARCH text not found" patch failures with no single
+/// milestone at fault. Doing this once, after every milestone's own file(s) are settled,
+/// removes the shared file from contention entirely.
+fn ensure_module_declarations(sections: &mut HashMap<String, String>) {
+    let entry_path = if sections.contains_key("src/main.rs") {
+        "src/main.rs"
+    } else if sections.contains_key("src/lib.rs") {
+        "src/lib.rs"
+    } else {
+        return; // no entry file yet -- nothing to wire up
+    };
+
+    let module_names: Vec<String> = sections
+        .keys()
+        .filter(|p| p.as_str() != entry_path)
+        .filter_map(|p| {
+            let rel = p.strip_prefix("src/")?;
+            let name = rel.strip_suffix(".rs")?;
+            (!name.contains('/')).then(|| name.to_string()) // direct children of src/ only
+        })
+        .collect();
+
+    let entry = sections.get_mut(entry_path).unwrap();
+    let mut missing: Vec<String> = module_names
+        .into_iter()
+        .filter(|name| {
+            let declared = format!("mod {name};");
+            let declared_pub = format!("pub mod {name};");
+            !entry.contains(&declared) && !entry.contains(&declared_pub)
+        })
+        .collect();
+    missing.sort();
+
+    if !missing.is_empty() {
+        let decls: String = missing.iter().map(|n| format!("mod {n};\n")).collect();
+        *entry = format!("{decls}{entry}");
+    }
+}
+
 fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     let mut milestones = Vec::new();
     let mut name: Option<String> = None;
@@ -640,6 +692,66 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     }
     flush(&mut name, &mut risk, &mut task, &mut milestones);
     milestones
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn adds_mod_declarations_for_every_other_top_level_file() {
+        let mut s = sections(&[
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+            ("src/database.rs", "pub struct Database;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        let main = &s["src/main.rs"];
+        assert!(main.contains("mod collector;"));
+        assert!(main.contains("mod database;"));
+        assert!(main.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn does_not_duplicate_an_already_present_declaration() {
+        let mut s = sections(&[
+            ("src/main.rs", "mod collector;\nfn main() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        assert_eq!(s["src/main.rs"].matches("mod collector;").count(), 1);
+    }
+
+    #[test]
+    fn a_pub_mod_declaration_also_counts_as_already_present() {
+        let mut s = sections(&[
+            ("src/main.rs", "pub mod collector;\nfn main() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        assert_eq!(s["src/main.rs"].matches("mod collector;").count(), 1);
+    }
+
+    #[test]
+    fn no_entry_file_is_a_no_op() {
+        let mut s = sections(&[("src/collector.rs", "pub struct Collector;\n")]);
+        ensure_module_declarations(&mut s);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn falls_back_to_lib_rs_when_there_is_no_main_rs() {
+        let mut s = sections(&[
+            ("src/lib.rs", "pub fn hello() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        assert!(s["src/lib.rs"].contains("mod collector;"));
+    }
 }
 
 #[cfg(test)]
