@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1]
+
+### Added
+
+- Line-range patching. Every patch call site (`try_patch`, `try_patch_document`) offered
+  only SEARCH/REPLACE — an exact-text match that fails whenever a model doesn't copy
+  existing whitespace precisely, or the snippet isn't unique. `patch.rs` now also
+  supports `## FILE: path:12-30` + `<<<<<<< NEW ... >>>>>>> NEW`, replacing an inclusive,
+  1-indexed line range — a single number (`path:12`) for one line, `end == start - 1`
+  (e.g. `12-11`) to insert before a line without removing anything, and appending past
+  the last line the same way. Both forms are always available side by side through one
+  shared `apply_patch()`, and can be mixed freely within a single patch response (edits
+  to the same file are applied line-range-first, then SEARCH/REPLACE, both validated —
+  overlapping or out-of-range line edits are rejected rather than guessed at). The
+  "current content" shown in every patch prompt is now line-numbered so a model can
+  actually target a line-range edit accurately.
+
 ## [0.3.0]
 
 ### Added

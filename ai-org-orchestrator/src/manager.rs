@@ -181,18 +181,12 @@ impl<'a> Manager<'a> {
 
         let patch_task = format!(
             "{base_task}\n\n\
-             # Current Output\n{last_output}\n\n\
+             # Current Output (line numbers shown for reference — not part of the document)\n{}\n\n\
              # Review Feedback ({label})\n{review_feedback}\n\n\
              Address the feedback above with a minimal patch instead of rewriting the whole \
-             document. Emit exactly one block per change:\n\n\
-             ## FILE: document\n\
-             <<<<<<< SEARCH\n\
-             <exact existing text, including whitespace, that appears exactly once and \
-             pinpoints the change>\n\
-             =======\n\
-             <replacement text>\n\
-             >>>>>>> REPLACE\n\n\
-             Record any new deviations you observe — do not implement them."
+             document. {}",
+            crate::patch::format_multi_file_numbered(&sections),
+            crate::patch::PATCH_FORMAT_INSTRUCTIONS,
         );
         let patch_text = self.run(worker_name, worker_system, &patch_task)?;
 

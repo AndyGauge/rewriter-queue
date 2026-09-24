@@ -178,20 +178,12 @@ impl<'a> Manager<'a> {
         let sections = Self::parse_file_sections(last_output);
         let patch_task = format!(
             "{base_task}\n\n\
-             # Current Implementation\n{}\n\n\
+             # Current Implementation (line numbers shown for reference — not part of the file)\n{}\n\n\
              # Quality Gate Failures ({label})\n{quality_errors}\n\n\
              Fix ALL issues above with a minimal patch instead of rewriting the file(s). \
-             For each fix, emit a block in exactly this form:\n\n\
-             ## FILE: <path exactly as shown above>\n\
-             <<<<<<< SEARCH\n\
-             <exact existing text, including whitespace, that appears exactly once and \
-             pinpoints the change>\n\
-             =======\n\
-             <replacement text>\n\
-             >>>>>>> REPLACE\n\n\
-             One such block per change — do not repeat unchanged code. Only emit a full \
-             `// === path ===` file if you are adding a brand-new file not shown above.",
-            Self::format_multi_file(&sections)
+             {}",
+            crate::patch::format_multi_file_numbered(&sections),
+            crate::patch::PATCH_FORMAT_INSTRUCTIONS,
         );
         let patch_text = self.run(worker_name, worker_system, &patch_task)?;
 
