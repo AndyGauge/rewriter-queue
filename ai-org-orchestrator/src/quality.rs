@@ -111,9 +111,13 @@ impl<'a> Manager<'a> {
     /// Handles multi-file output (`// === src/file.rs ===` markers).
     /// Applies `cargo fmt`, enforces 500-line limit per file, then checks
     /// build / clippy / test. Returns `(clean_source, errors)`.
-    pub(crate) fn quality_gate(&self, raw_code: &str) -> (String, String) {
+    ///
+    /// `variant` selects which crate directory this call builds against -- `None` is the
+    /// shared default-sequential directory; `Some(id)` is one milestone's isolated
+    /// workspace during an explicit parallel fan-out wave (see `Workspace::v2_dir`).
+    pub(crate) fn quality_gate(&self, raw_code: &str, variant: Option<&str>) -> (String, String) {
         let code = Self::strip_fences(raw_code);
-        let v2_dir = self.ws.root.join("artifacts/v2");
+        let v2_dir = self.ws.v2_dir(variant);
         let manifest = v2_dir.join("Cargo.toml");
 
         if !manifest.exists() {

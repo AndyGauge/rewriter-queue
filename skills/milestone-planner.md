@@ -14,6 +14,7 @@ Respond with one block per milestone, in implementation order (earlier milestone
 ```
 ## MILESTONE: <short kebab-case name, e.g. research-database>
 RISK: EASY
+DEPENDS_ON: <see below>
 TASK: <a self-contained paragraph telling an implementer exactly what this milestone
 covers — which struct/trait/module, which contract behaviors and edge cases apply to
 it, and which V1 logic it corresponds to. An implementer given only this paragraph,
@@ -23,3 +24,35 @@ the contract, and the schema should have everything they need.>
 Every milestone you emit must be RISK: EASY. If your first pass at decomposing the
 work produces something you'd call HARD, that means split it further before
 responding — HARD is a signal to keep decomposing, never a final answer.
+
+## DEPENDS_ON: build a real graph, default to sequential
+
+`DEPENDS_ON` is how you tell the system which milestones can genuinely be worked on
+at the same time. Milestones that end up in the same wave of the dependency graph are
+built concurrently, each in its own isolated workspace — so this line is a real claim
+about independence, not busywork.
+
+Three ways to write it, and when each is correct:
+
+- **Omit the line entirely.** This is the default and the common case: this milestone
+  depends on the one listed immediately before it. An unmodified plan where you never
+  write `DEPENDS_ON` at all schedules exactly the way milestones always used to —
+  strictly one after another, in the order you listed them.
+- **`DEPENDS_ON: none`.** An explicit, deliberate claim that this milestone needs
+  nothing from any other milestone in this plan, and nothing else in the plan needs
+  it either — only the schema's already-defined types. Two or more milestones that
+  are all `none` (or otherwise share no dependency relationship) run at the same
+  time.
+- **`DEPENDS_ON: <name>, <name>`.** This milestone needs specific earlier milestones'
+  code to exist first (e.g. it calls a function another milestone defines), but is
+  otherwise unrelated to the rest of the plan — so it isn't forced into the full
+  sequential chain, just made to wait for exactly what it actually needs.
+
+Only reach for `none` or a named list when the independence is real: no shared file,
+no one calling the other's code, nothing that would only surface as a bug once both
+pieces exist together. Two isolated workspaces both passing their own quality gate
+proves nothing about whether they'd actually integrate — that's exactly the risk of
+calling something independent when it isn't. When in doubt, leave the default
+(sequential) and let it depend on the previous milestone; fan-out is an optimization
+for genuinely separable work (two unrelated modules that only share types the schema
+already nailed down), not something to reach for by default.

@@ -134,7 +134,7 @@ fn infer_local_tier(lower: &str) -> ModelTier {
 
     for word in lower.split(|c: char| !c.is_alphanumeric()) {
         if word.ends_with('b') {
-            if let Ok(n) = word[..word.len() - 1].parse::<u32>() {
+            if let Ok(n) = word.strip_suffix('b').unwrap_or(word).parse::<u32>() {
                 return match n {
                     n if n >= 20 => ModelTier::Heavy,
                     n if n >= 7 && is_coder => ModelTier::Heavy, // promote specialised models
