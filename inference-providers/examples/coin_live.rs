@@ -8,7 +8,7 @@ use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo,
 use inference_providers::Registry;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -21,11 +21,18 @@ struct Faulty {
     p_error: f64,
     rng: Mutex<u64>,
     calls: Arc<AtomicUsize>,
+    armed: Arc<AtomicBool>,
 }
 
 impl Faulty {
-    fn wrap(inner: Box<dyn Provider>, p_rate_limit: f64, p_error: f64, seed: u64, calls: Arc<AtomicUsize>) -> Self {
-        Faulty { inner, p_rate_limit, p_error, rng: Mutex::new(seed | 1), calls }
+    fn wrap(
+        inner: Box<dyn Provider>,
+        (p_rate_limit, p_error): (f64, f64),
+        seed: u64,
+        calls: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
+    ) -> Self {
+        Faulty { inner, p_rate_limit, p_error, rng: Mutex::new(seed | 1), calls, armed }
     }
 
     fn uniform(&self) -> f64 {
@@ -43,6 +50,9 @@ impl Provider for Faulty {
     fn is_available(&self) -> bool { self.inner.is_available() }
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.armed.load(Ordering::SeqCst) {
+            return self.inner.complete(req);
+        }
         let u = self.uniform();
         if u < self.p_rate_limit {
             return Err(ProviderError::RateLimit);
@@ -157,13 +167,21 @@ fn faults(cfg: &Config, calls_per_run: usize, pacing_ms: u64, out: &mut dyn FnMu
     ];
     for (label, p_rl, p_err) in scenarios {
         for depth in [0u8, 3] {
+            // Faults go to whichever provider the router prefers after QQ, so the
+            // scenario exercises demotion and recovery regardless of box load.
+            let armed: Vec<Arc<AtomicBool>> = cfg.providers.iter().map(|_| Arc::new(AtomicBool::new(false))).collect();
             let counters: Vec<Arc<AtomicUsize>> = cfg.providers.iter().map(|_| Arc::new(AtomicUsize::new(0))).collect();
             let providers: Vec<Box<dyn Provider>> = real_providers(cfg).into_iter().enumerate().map(|(i, p)| {
-                let (rl, er) = if i == 0 { (p_rl, p_err) } else { (0.0, 0.0) };
-                Box::new(Faulty::wrap(p, rl, er, 0xC0FFEE + i as u64, counters[i].clone())) as Box<dyn Provider>
+                Box::new(Faulty::wrap(p, (p_rl, p_err), 0xC0FFEE, counters[i].clone(), armed[i].clone())) as Box<dyn Provider>
             }).collect();
             let names: Vec<String> = providers.iter().map(|p| p.name().to_string()).collect();
             let r = Registry::with_providers(providers, WEIGHTS);
+            r.run_qq();
+            let preferred = r.complete(&ping(ModelTier::Light, depth)).map(|resp| resp.provider).unwrap_or_default();
+            let faulty = names.iter().position(|n| *n == preferred).unwrap_or(0);
+            out(json!({ "exp": "faults-init", "scenario": label, "depth": depth, "faulty": names[faulty], "providers": snapshot_json(&r) }));
+            counters.iter().for_each(|c| c.store(0, Ordering::SeqCst));
+            armed[faulty].store(true, Ordering::SeqCst);
 
             let mut served: std::collections::BTreeMap<String, usize> = Default::default();
             let mut failed = 0usize;
@@ -187,7 +205,7 @@ fn faults(cfg: &Config, calls_per_run: usize, pacing_ms: u64, out: &mut dyn FnMu
             }
             let attempts: usize = counters.iter().map(|c| c.load(Ordering::SeqCst)).sum();
             out(json!({
-                "exp": "faults", "scenario": label, "depth": depth, "faulty": names[0], "pacing_ms": pacing_ms,
+                "exp": "faults", "scenario": label, "depth": depth, "faulty": names[faulty], "pacing_ms": pacing_ms,
                 "calls": calls_per_run, "failed": failed, "served": served,
                 "attempts": attempts, "fallthroughs": attempts - (calls_per_run - failed),
                 "attempts_by_provider": names.iter().zip(&counters).map(|(n, c)| (n.clone(), c.load(Ordering::SeqCst))).collect::<std::collections::BTreeMap<_, _>>(),

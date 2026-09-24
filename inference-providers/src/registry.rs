@@ -6,6 +6,7 @@ use crate::{
     config::{Config, ProviderKind},
     types::{InferenceRequest, InferenceResponse, ModelTier, ProviderError},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -17,6 +18,9 @@ const ERROR_HALF_LIFE_SECS: f64 = 30.0;
 // Denominator floor for the error rate: a provider with fewer than this many
 // (age-weighted) samples is treated as if the missing samples were successes.
 const ERROR_MIN_WEIGHT: f64 = 5.0;
+// Every Nth Hora-0 call goes to the least-recently-used eligible provider so that
+// metrics of providers the ranking has pushed aside keep getting refreshed.
+const EXPLORE_EVERY: u64 = 20;
 
 fn decay(age: std::time::Duration, half_life_secs: f64) -> f64 {
     0.5f64.powf(age.as_secs_f64() / half_life_secs)
@@ -29,6 +33,7 @@ struct ProviderMetrics {
     backoff_at: Instant,
     quality_score: f64,                 // 0.0–1.0 from QQ; 1.0 until proven otherwise
     context_ok: bool,                   // passed the 4k context probe
+    last_used: Option<Instant>,
 }
 
 impl Default for ProviderMetrics {
@@ -40,6 +45,7 @@ impl Default for ProviderMetrics {
             backoff_at: Instant::now(),
             quality_score: 1.0,
             context_ok: true,
+            last_used: None,
         }
     }
 }
@@ -67,6 +73,7 @@ impl ProviderMetrics {
     }
 
     fn push_error_sample(&mut self, is_error: bool, now: Instant) {
+        self.last_used = Some(now);
         self.recent_errors.push((now, is_error));
         if self.recent_errors.len() > 20 {
             self.recent_errors.remove(0);
@@ -111,6 +118,7 @@ pub struct ProviderSnapshot {
 pub struct Registry {
     slots: Vec<Arc<Slot>>,
     weights: (f64, f64, f64), // (cost, latency, quality)
+    explore_tick: AtomicU64,
 }
 
 impl Registry {
@@ -154,7 +162,7 @@ impl Registry {
         }
 
         let r = &cfg.router;
-        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality) }
+        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality), explore_tick: AtomicU64::new(0) }
     }
 
     /// Build from already-constructed providers with explicit (cost, latency, quality) weights.
@@ -163,7 +171,7 @@ impl Registry {
             .into_iter()
             .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()) }))
             .collect();
-        Registry { slots, weights }
+        Registry { slots, weights, explore_tick: AtomicU64::new(0) }
     }
 
     pub fn snapshot(&self) -> Vec<ProviderSnapshot> {
@@ -207,7 +215,7 @@ impl Registry {
             }));
         }
 
-        Registry { slots, weights: (1.0, 0.5, 2.0) }
+        Registry { slots, weights: (1.0, 0.5, 2.0), explore_tick: AtomicU64::new(0) }
     }
 
     /// Run the Qualification Query battery against every available provider.
@@ -353,6 +361,14 @@ impl Registry {
         if let Some(hint) = req.slot_hint {
             let pos = hint % scored.len();
             scored.rotate_left(pos);
+        } else if hora_depth == 0
+            && self.explore_tick.fetch_add(1, Ordering::Relaxed) % EXPLORE_EVERY == EXPLORE_EVERY - 1
+        {
+            let stalest = (0..scored.len())
+                .min_by_key(|&i| scored[i].0.metrics.lock().unwrap().last_used)
+                .unwrap_or(0);
+            let slot = scored.remove(stalest);
+            scored.insert(0, slot);
         }
 
         let mut last_err = ProviderError::Unavailable("all providers failed".into());

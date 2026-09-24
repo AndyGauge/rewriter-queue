@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0]
+
+### Added
+
+- Final integration gate. Every milestone (and every chunk in the legacy fan-out
+  path) only ever had its own quality gate run against its own slice in isolation —
+  nothing ever built the fully assembled crate together, so a crate with two
+  milestones each writing their own version of the crate root could pass every
+  individual check and still not compile. Now, once milestones are merged and module
+  declarations wired up, the whole crate is built, linted, and tested for real; a
+  failure goes through the same patch-and-retry loop as everything else and, if it
+  still won't build after every attempt, the run fails outright instead of silently
+  returning broken code as a "finished" V2.
+- Soundness as a hard gate. `FormalMethodsReviewer` calling a program `UNSOUND` — a
+  real panic on valid input, or a violated totality/determinism guarantee — used to
+  only be logged as a deferred deviation, the same as a stylistic disagreement. It's
+  now repaired the same way a build failure is (a targeted patch, re-verified against
+  the build, reviewer asked again) and fails the run if it's still `UNSOUND` after
+  every attempt.
+- Scope gap-fill. A milestone plan can be wrong in a way no single milestone's own
+  convergence failure ever reveals: it simply didn't enumerate enough milestones for
+  the schema's full scope (three planned for a 10-iteration budget when the schema
+  actually needed six). After the initial plan is implemented, `MilestonePlanner` is
+  handed everything built so far and asked whether the contract and schema are fully
+  covered; if not, it plans milestones for exactly the gap, which get implemented and
+  merged the same way, and the question is asked again — up to three rounds before a
+  deviation is logged instead of replanning indefinitely.
+- Registry exploration. Time-decayed backoff (0.2.0) means a demoted provider's
+  penalty fades even without new traffic, but a provider the router never actually
+  picks still never gets a fresh error-rate/latency sample to prove it's recovered.
+  Every 20th Hora-0 (lowest-stakes) call now goes to whichever eligible provider was
+  least recently used instead of the top-ranked one, so demoted providers keep
+  getting real data point refreshes; deeper, higher-stakes calls never explore.
+
+### Fixed
+
+- All three of the above were root-caused against a real run (job #10): a crate that
+  didn't compile (`mod lib;` referencing a second, independently-written crate root)
+  shipped anyway because nothing ever built the assembled whole, alongside real
+  soundness violations (a double-verification panic, a non-deterministic timestamp)
+  that were logged but never blocked delivery, and a milestone plan that silently
+  under-scoped the work rather than planning for all of it.
+
 ## [0.2.0]
 
 ### Added

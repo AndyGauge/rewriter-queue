@@ -217,34 +217,125 @@ impl<'a> Manager<'a> {
         }
     }
 
-    /// Run IP Counsel and Formal Methods Reviewer. Findings are always recorded as
-    /// deviations — neither agent blocks synthesis.
+    /// Build, lint, and test the *fully assembled* crate — every milestone's sections
+    /// merged together, module declarations wired up, the works — and repair it against its
+    /// own errors if it fails, up to `max_repair_attempts` times. Every milestone (and every
+    /// chunk in the legacy fan-out path) only ever gets its own quality gate run against its
+    /// own slice in an isolated or scratch directory (see `Workspace::v2_dir`); this is the
+    /// first and only point where the whole crate as it will actually ship gets built and
+    /// tested together, so it's the only place a cross-milestone problem — two milestones
+    /// each writing their own version of the crate root, a module one file expects that
+    /// another never produced — can even be seen, let alone fixed.
+    ///
+    /// This is a hard gate, not a deviation: a crate that still doesn't build or pass its
+    /// own tests after every repair attempt is a failed run, returned as `Err` rather than
+    /// silently handed back as if it were a finished V2. Delivering something that doesn't
+    /// compile as a "success" is exactly the failure mode this closes.
+    fn integration_check_and_repair(
+        &self,
+        mut sections: HashMap<String, String>,
+        contract: &str,
+        schema: &str,
+        worker_system: &str,
+        max_repair_attempts: usize,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        let base_task = format!(
+            "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+             You are fixing build/lint/test failures in the FULLY ASSEMBLED crate, produced \
+             by merging several independently-implemented pieces. A failure here can be \
+             cross-file in a way no single piece's own author could have seen: two pieces may \
+             each define their own version of the same type, or one module may reference \
+             another that was never produced under the name it expects. Fix the actual cause \
+             — prefer removing or merging a duplicate/conflicting definition over patching \
+             around it."
+        );
+
+        for attempt in 0..max_repair_attempts {
+            let code = Self::format_multi_file(&sections);
+            let (clean, errors) = self.quality_gate(&code, None);
+            if errors.is_empty() {
+                return Ok(Self::parse_file_sections(&clean));
+            }
+
+            eprintln!(
+                "    [integration] attempt {} — fully assembled crate failed the gate \
+                 ({} bytes of errors), attempting a cross-file repair",
+                attempt + 1,
+                errors.len()
+            );
+            self.ws.log_deviation(
+                "TargetImplementer-Integration",
+                &format!(
+                    "Integration attempt {attempt} — full-crate quality gate failed:\n{errors}"
+                ),
+            )?;
+
+            let repaired_raw = self.ws.checkpoint(&format!("integration/repair/{attempt}"), || {
+                self.try_patch(
+                    "TargetImplementer-Integration",
+                    worker_system,
+                    &base_task,
+                    &clean,
+                    &errors,
+                    &format!("integration attempt {attempt}"),
+                )
+            })?;
+            sections = Self::parse_file_sections(&repaired_raw);
+        }
+
+        // The loop above only re-gates at the top of the *next* iteration, so the very last
+        // repair attempt's result never gets checked without one final gate here.
+        let code = Self::format_multi_file(&sections);
+        let (clean, errors) = self.quality_gate(&code, None);
+        if errors.is_empty() {
+            return Ok(Self::parse_file_sections(&clean));
+        }
+
+        self.ws.log_agent_decision(
+            "TargetImplementer-Integration",
+            &format!(
+                "Fully assembled crate still fails its quality gate after \
+                 {max_repair_attempts} integration repair attempts — failing the run instead \
+                 of delivering a crate that does not build:\n{errors}"
+            ),
+        )?;
+        Err(format!(
+            "V2 crate does not build/pass tests after {max_repair_attempts} integration \
+             repair attempts:\n{errors}"
+        )
+        .into())
+    }
+
+    /// Run IP Counsel, the (hard-gated) Formal Methods soundness check, and Production
+    /// Readiness. IP and production-readiness findings are always recorded as deviations —
+    /// genuine judgment calls, not blocked on. Soundness is different (see
+    /// `enforce_soundness`) and can repair `code`, so this returns the — possibly repaired —
+    /// code the caller should actually ship, not just `()`.
     fn run_review_panel(
         &self,
-        code: &str,
+        code: String,
         contract: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let task = format!(
-            "# ObjectiveContract\n{contract}\n\n# V2 Implementation\n```rust\n{code}\n```"
-        );
+        schema: &str,
+        worker_system: &str,
+        max_repair_attempts: usize,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let review_task = |c: &str| {
+            format!("# ObjectiveContract\n{contract}\n\n# V2 Implementation\n```rust\n{c}\n```")
+        };
+
         let ip = self.ws.checkpoint("review_panel/ip_counsel", || {
-            self.run("IpCounsel", IP_COUNSEL, &task)
+            self.run("IpCounsel", IP_COUNSEL, &review_task(&code))
         })?;
         if !ip.trim_start().to_uppercase().starts_with("CLEAR") {
             self.ws
                 .log_deviation("IpCounsel", &format!("IP concerns (deferred):\n{ip}"))?;
         }
-        let fm = self.ws.checkpoint("review_panel/formal_methods", || {
-            self.run("FormalMethodsReviewer", FORMAL_METHODS_REVIEWER, &task)
-        })?;
-        if !fm.trim_start().to_uppercase().starts_with("SOUND") {
-            self.ws.log_deviation(
-                "FormalMethodsReviewer",
-                &format!("Soundness concerns (deferred):\n{fm}"),
-            )?;
-        }
+
+        let code =
+            self.enforce_soundness(code, contract, schema, worker_system, max_repair_attempts)?;
+
         let readiness = self.ws.checkpoint("review_panel/production_readiness", || {
-            self.run("ProductionReadinessReviewer", PRODUCTION_READINESS_REVIEWER, &task)
+            self.run("ProductionReadinessReviewer", PRODUCTION_READINESS_REVIEWER, &review_task(&code))
         })?;
         if !readiness.trim_start().to_uppercase().starts_with("READY") {
             self.ws.log_deviation(
@@ -252,7 +343,100 @@ impl<'a> Manager<'a> {
                 &format!("Production-readiness concerns (deferred):\n{readiness}"),
             )?;
         }
-        Ok(())
+        Ok(code)
+    }
+
+    /// FormalMethodsReviewer is a hard gate, unlike the rest of the review panel: a program
+    /// it calls UNSOUND has a real panic on valid input, or violates a totality/determinism
+    /// guarantee the contract implies — that's a defect, not the kind of judgment call IP
+    /// framing or production-readiness usually are (job #10's V2 panicked on double
+    /// verification and returned a different timestamp for "the same" report on repeated
+    /// calls — both UNSOUND, both shipped anyway, because this used to be deferred-only).
+    ///
+    /// Repairs the same way the integration gate does: a targeted patch against the
+    /// reviewer's own finding, checkpointed so a resume doesn't redo it, re-verified against
+    /// the build (a soundness fix can break compilation) before asking the reviewer again.
+    /// Fails the run if it's still UNSOUND after every attempt, rather than shipping code
+    /// with a known soundness violation.
+    fn enforce_soundness(
+        &self,
+        mut code: String,
+        contract: &str,
+        schema: &str,
+        worker_system: &str,
+        max_repair_attempts: usize,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let review_task = |c: &str| {
+            format!("# ObjectiveContract\n{contract}\n\n# V2 Implementation\n```rust\n{c}\n```")
+        };
+        let repair_base_task = format!(
+            "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+             FormalMethodsReviewer found a soundness violation in the implementation below — a \
+             real panic on valid input, or a violation of a totality/determinism guarantee the \
+             contract implies. Fix the actual defect, not just the specific input the reviewer \
+             happened to construct to demonstrate it."
+        );
+
+        for attempt in 0..max_repair_attempts {
+            let fm = self.ws.checkpoint(&format!("review_panel/formal_methods/{attempt}"), || {
+                self.run("FormalMethodsReviewer", FORMAL_METHODS_REVIEWER, &review_task(&code))
+            })?;
+            if fm.trim_start().to_uppercase().starts_with("SOUND") {
+                return Ok(code);
+            }
+
+            eprintln!(
+                "    [soundness] attempt {} — FormalMethodsReviewer found a violation, repairing",
+                attempt + 1
+            );
+            self.ws.log_deviation(
+                "FormalMethodsReviewer",
+                &format!("Attempt {attempt} — soundness violation, repairing:\n{fm}"),
+            )?;
+
+            let repaired_raw =
+                self.ws.checkpoint(&format!("review_panel/soundness_repair/{attempt}"), || {
+                    self.try_patch(
+                        "TargetImplementer-Soundness",
+                        worker_system,
+                        &repair_base_task,
+                        &code,
+                        &fm,
+                        &format!("soundness attempt {attempt}"),
+                    )
+                })?;
+
+            // A soundness fix can break the build -- re-verify before asking the reviewer
+            // again, so it's never handed code the compiler would reject.
+            let repaired_sections = self.integration_check_and_repair(
+                Self::parse_file_sections(&repaired_raw),
+                contract,
+                schema,
+                worker_system,
+                max_repair_attempts,
+            )?;
+            code = Self::format_multi_file(&repaired_sections);
+        }
+
+        let fm = self.ws.checkpoint(&format!("review_panel/formal_methods/{max_repair_attempts}"), || {
+            self.run("FormalMethodsReviewer", FORMAL_METHODS_REVIEWER, &review_task(&code))
+        })?;
+        if fm.trim_start().to_uppercase().starts_with("SOUND") {
+            return Ok(code);
+        }
+
+        self.ws.log_agent_decision(
+            "FormalMethodsReviewer",
+            &format!(
+                "Still UNSOUND after {max_repair_attempts} repair attempts — failing the run \
+                 instead of delivering code with a known soundness violation:\n{fm}"
+            ),
+        )?;
+        Err(format!(
+            "V2 implementation still fails FormalMethodsReviewer's soundness check after \
+             {max_repair_attempts} repair attempts:\n{fm}"
+        )
+        .into())
     }
 
     /// Synthesize V2: split if large (hourglass fan-out), then merge (converge).
@@ -285,8 +469,11 @@ impl<'a> Manager<'a> {
         // (contract, schema, test matrix) that inflates its size regardless of V1 size.
         // Splitting a small V1 forces a merge step that degrades quality on weak merge models.
         if degree == 1 || v1_source.len() <= SPLIT_THRESHOLD {
+            // synthesize_by_milestones already runs the fully-assembled crate through
+            // integration_check_and_repair before returning, so `code` here is guaranteed to
+            // build/lint/test clean — the review panel below only ever sees code that works.
             let code = self.synthesize_by_milestones(worker_system, contract, schema, &full_task, max_iter)?;
-            self.run_review_panel(&code, contract)?;
+            let code = self.run_review_panel(code, contract, schema, worker_system, max_iter)?;
             return Ok(code);
         }
 
@@ -355,39 +542,15 @@ impl<'a> Manager<'a> {
             self.run("MergeAgent", MERGE_AGENT, &merge_task)
         })?;
 
-        // Quality gate on merged output — one repair pass if it fails
-        let (merged_clean, merge_quality_errors) = self.quality_gate(&merged_raw, None);
-        let merged = if merge_quality_errors.is_empty() {
-            merged_clean
-        } else {
-            eprintln!(
-                "  [quality] merged output failed gate — running repair pass ({} bytes of errors)",
-                merge_quality_errors.len()
-            );
-            self.ws.log_deviation(
-                "MergeAgent",
-                &format!("Merged output failed quality gate:\n{merge_quality_errors}"),
-            )?;
-            let repair_base_task = format!("# ObjectiveContract\n{contract}");
-            let repaired_raw = self.ws.checkpoint("merge/repair", || {
-                self.try_patch(
-                    "TargetImplementer-Repair",
-                    worker_system,
-                    &repair_base_task,
-                    &merged_clean,
-                    &merge_quality_errors,
-                    "merge repair",
-                )
-            })?;
-            let (repaired_clean, repair_errors) = self.quality_gate(&repaired_raw, None);
-            if !repair_errors.is_empty() {
-                self.ws.log_deviation(
-                    "TargetImplementer-Repair",
-                    &format!("Repair pass still has quality issues (deferred):\n{repair_errors}"),
-                )?;
-            }
-            repaired_clean
-        };
+        eprintln!("  final integration check (build + clippy + test on the merged crate)");
+        let merged_sections = self.integration_check_and_repair(
+            Self::parse_file_sections(Self::strip_fences(&merged_raw)),
+            contract,
+            schema,
+            worker_system,
+            max_iter,
+        )?;
+        let merged = Self::format_multi_file(&merged_sections);
 
         // Security review on merged (fan-out: record as deviation, cannot loop back)
         let review_chunks = Self::split_source(&merged);
@@ -442,7 +605,7 @@ impl<'a> Manager<'a> {
             )?;
         }
 
-        self.run_review_panel(&merged, contract)?;
+        let merged = self.run_review_panel(merged, contract, schema, worker_system, max_iter)?;
 
         Ok(merged)
     }
@@ -453,6 +616,13 @@ impl<'a> Manager<'a> {
     /// single implementer attempt in practice, and a genuinely pathological milestone should
     /// surface as a deviation for a human, not loop.
     const MAX_SPLIT_DEPTH: usize = 3;
+
+    /// Cap on how many times the plan as a whole can go back to MilestonePlanner for a second
+    /// opinion on scope (`fill_scope_gaps`), distinct from `MAX_SPLIT_DEPTH` — that cap bounds
+    /// re-splitting *one* milestone that's too big; this one bounds re-*planning* because the
+    /// original decomposition simply didn't enumerate enough milestones in the first place
+    /// (planner said 3 for an N=10 budget, the schema actually needed 6).
+    const MAX_GAP_FILL_ROUNDS: usize = 3;
 
     /// Entry point: plan the work into milestones sized to `max_iter`, implement each one
     /// independently (checkpointed on its own, so a crash mid-way only redoes the milestone it
@@ -472,7 +642,93 @@ impl<'a> Manager<'a> {
             "root", root_task, worker_system, contract, schema, max_iter, 0, None,
         )?;
         ensure_module_declarations(&mut sections);
+
+        let sections = self.fill_scope_gaps(sections, contract, schema, worker_system, max_iter)?;
+
+        eprintln!(
+            "==> Final integration check (build + clippy + test on the fully assembled crate)"
+        );
+        let sections =
+            self.integration_check_and_repair(sections, contract, schema, worker_system, max_iter)?;
         Ok(Self::format_multi_file(&sections))
+    }
+
+    /// A milestone plan can be wrong in a way `implement_milestones`'s own per-milestone
+    /// escalation never catches: not that one milestone was too big for its budget, but that
+    /// the plan simply didn't enumerate enough milestones to begin with (three planned for an
+    /// N=10 budget when the schema actually implies six — the planner under-counted the
+    /// *scope*, not the difficulty of any one piece). Nothing about a single milestone
+    /// converging cleanly tells you the plan as a whole was complete.
+    ///
+    /// So once the current plan's milestones are all implemented, go back to MilestonePlanner
+    /// with what's actually been built and ask it to compare that against the contract and
+    /// schema: if something required is still missing, it plans milestones for exactly the gap
+    /// (reusing the same `implement_milestones` machinery — same wave scheduling, same isolated
+    /// workspaces for genuine fan-out, same HARD/convergence-failure recursion), which get
+    /// merged in and the question gets asked again. Stops as soon as a round finds nothing
+    /// missing, or after `MAX_GAP_FILL_ROUNDS` rounds — a plan that still can't converge on
+    /// "complete" that many times over gets a deviation instead of an unbounded planning loop.
+    fn fill_scope_gaps(
+        &self,
+        mut sections: HashMap<String, String>,
+        contract: &str,
+        schema: &str,
+        worker_system: &str,
+        max_iter: usize,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        for round in 0..Self::MAX_GAP_FILL_ROUNDS {
+            let implemented = Self::format_multi_file(&sections);
+            let gap_task = format!(
+                "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+                 # Already Implemented\n```rust\n{implemented}\n```\n\n\
+                 Compare what's already implemented above against the ObjectiveContract and \
+                 Schema. If every type, method, and behavior the schema requires already \
+                 exists in the code above, emit no milestones at all — respond with exactly \
+                 the single word NONE and nothing else. Otherwise, plan milestones — in the \
+                 exact same format as before — covering ONLY what's still missing. Do not \
+                 re-plan, re-describe, or duplicate anything already implemented above."
+            );
+
+            let id_prefix = format!("root/gap-fill-{round}");
+            let added = self.implement_milestones(
+                &id_prefix, &gap_task, worker_system, contract, schema, max_iter, 0, None,
+            )?;
+
+            if added.is_empty() {
+                eprintln!(
+                    "  [gap-fill] round {round}: scope is complete, nothing further missing"
+                );
+                return Ok(sections);
+            }
+
+            eprintln!(
+                "  [gap-fill] round {round}: original plan under-scoped the work — planner \
+                 added {} more file(s) to close the gap",
+                added.len()
+            );
+            self.ws.log_agent_decision(
+                "MilestonePlanner",
+                &format!(
+                    "Gap-fill round {round}: the milestone plan did not cover the full \
+                     contract/schema scope on its own — added {} file(s) worth of milestones \
+                     to close the gap.",
+                    added.len()
+                ),
+            )?;
+
+            sections.extend(added);
+            ensure_module_declarations(&mut sections);
+        }
+
+        self.ws.log_deviation(
+            "MilestonePlanner",
+            &format!(
+                "Scope may still be incomplete after {} gap-fill rounds — proceeding with what \
+                 was implemented rather than looping indefinitely.",
+                Self::MAX_GAP_FILL_ROUNDS
+            ),
+        )?;
+        Ok(sections)
     }
 
     /// Ask MilestonePlanner to break `task` into milestones estimated to fit `max_iter` each,
@@ -1148,5 +1404,391 @@ TASK: Do the last thing.\n\
         let waves = schedule_waves(&ms);
         let scheduled: Vec<usize> = waves.iter().flatten().copied().collect();
         assert_eq!(scheduled.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod integration_gate_tests {
+    use super::*;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Always answers with the same canned text, regardless of the prompt -- enough to drive
+    /// `integration_check_and_repair`'s control flow (gate fails -> patch -> gate again)
+    /// without needing a real model.
+    struct FixedReply {
+        text: String,
+        models: Vec<ModelInfo>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Provider for FixedReply {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, _req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(InferenceResponse {
+                text: self.text.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-integration-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn repairs_a_broken_assembled_crate_within_the_attempt_budget() {
+        let ws = temp_ws("repair-ok");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let patch = "## FILE: src/main.rs\n\
+                     <<<<<<< SEARCH\n    undefined_fn();\n=======\n    println!(\"fixed\");\n\
+                     >>>>>>> REPLACE\n";
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: patch.to_string(),
+            models: vec![mock_model()],
+            calls: calls.clone(),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let broken = sections(&[("src/main.rs", "fn main() {\n    undefined_fn();\n}\n")]);
+        let fixed = mgr
+            .integration_check_and_repair(broken, "contract", "schema", "worker system", 3)
+            .expect("an assembled crate the model can actually fix should succeed");
+
+        assert!(fixed["src/main.rs"].contains("println!(\"fixed\")"));
+        // One patch call fixes it -- the gate passes on the very next check, no further calls.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fails_the_run_after_exhausting_repair_attempts_on_an_unfixable_crate() {
+        let ws = temp_ws("repair-exhaust");
+        // No SEARCH/REPLACE markers at all -- apply_patch can never match, so try_patch always
+        // falls back to full regeneration, which this mock also answers with the same broken
+        // source, so the crate can never actually get fixed.
+        let broken_src = "fn main() {\n    undefined_fn();\n}\n";
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: broken_src.to_string(),
+            models: vec![mock_model()],
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let broken = sections(&[("src/main.rs", broken_src)]);
+        let err = mgr
+            .integration_check_and_repair(broken, "contract", "schema", "worker system", 2)
+            .expect_err("a crate that can never be fixed must fail the run, not succeed");
+
+        assert!(
+            err.to_string().contains("does not build"),
+            "expected a build-failure message, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod soundness_gate_tests {
+    use super::*;
+    use crate::agents::FORMAL_METHODS_REVIEWER;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Answers `FORMAL_METHODS_REVIEWER` requests distinctly from patch requests -- identified
+    /// by the exact system prompt, since that's the one thing that differs between an
+    /// `enforce_soundness` call to the reviewer and a call to the patcher.
+    struct SequencedReply {
+        formal_calls: Arc<AtomicUsize>,
+        formal_replies: Vec<String>,
+        patch_text: String,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for SequencedReply {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            let text = if req.system == FORMAL_METHODS_REVIEWER {
+                let n = self.formal_calls.fetch_add(1, Ordering::SeqCst);
+                self.formal_replies[n.min(self.formal_replies.len() - 1)].clone()
+            } else {
+                self.patch_text.clone()
+            };
+            Ok(InferenceResponse {
+                text,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-soundness-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    #[test]
+    fn repairs_an_unsound_program_and_confirms_soundness_before_returning() {
+        let ws = temp_ws("repair-ok");
+        let provider: Box<dyn Provider> = Box::new(SequencedReply {
+            formal_calls: Arc::new(AtomicUsize::new(0)),
+            formal_replies: vec!["UNSOUND\n\ntotality: panics".into(), "SOUND\n\nno issues".into()],
+            patch_text: "## FILE: src/main.rs\n\
+                         <<<<<<< SEARCH\n    println!(\"unsound\");\n=======\n    println!(\"sound\");\n\
+                         >>>>>>> REPLACE\n"
+                .into(),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let code = "// === src/main.rs ===\nfn main() {\n    println!(\"unsound\");\n}\n".to_string();
+        let result = mgr
+            .enforce_soundness(code, "contract", "schema", "worker system", 2)
+            .expect("a soundness violation the model can fix should succeed");
+
+        assert!(result.contains("println!(\"sound\")"));
+    }
+
+    #[test]
+    fn fails_the_run_when_the_program_is_still_unsound_after_every_repair_attempt() {
+        let ws = temp_ws("repair-exhaust");
+        let provider: Box<dyn Provider> = Box::new(SequencedReply {
+            formal_calls: Arc::new(AtomicUsize::new(0)),
+            // Always UNSOUND, no matter how many times it's asked.
+            formal_replies: vec!["UNSOUND\n\ntotality: still panics".into()],
+            patch_text: "## FILE: src/main.rs\n\
+                         <<<<<<< SEARCH\n    println!(\"v1\");\n=======\n    println!(\"v2\");\n\
+                         >>>>>>> REPLACE\n"
+                .into(),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let code = "// === src/main.rs ===\nfn main() {\n    println!(\"v1\");\n}\n".to_string();
+        let err = mgr
+            .enforce_soundness(code, "contract", "schema", "worker system", 1)
+            .expect_err("a soundness violation that never resolves must fail the run");
+
+        assert!(
+            err.to_string().contains("soundness check"),
+            "expected a soundness-failure message, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gap_fill_tests {
+    use super::*;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Dispatches by exact system prompt: MilestonePlanner gets a scripted sequence of
+    /// replies (index by call count), reviewers always approve, and anything else
+    /// (TargetImplementer) gets a fixed, self-contained, buildable two-file crate.
+    struct RoleScripted {
+        planner_calls: Arc<AtomicUsize>,
+        planner_replies: Vec<String>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for RoleScripted {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            let text = if req.system == MILESTONE_PLANNER {
+                let n = self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                self.planner_replies[n.min(self.planner_replies.len() - 1)].clone()
+            } else if req.system == SECURITY_REVIEWER {
+                "COMPLIANT".to_string()
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE".to_string()
+            } else {
+                // TargetImplementer: a complete, self-contained, buildable crate -- a real
+                // milestone building alone (no prior wave's files on disk yet) must include
+                // its own main.rs the same way, since Cargo needs one to build at all.
+                "// === src/main.rs ===\nfn main() {}\n\
+                 // === src/extra.rs ===\npub fn helper() -> i32 { 42 }\n"
+                    .to_string()
+            };
+            Ok(InferenceResponse {
+                text,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-gap-fill-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    const MILESTONE_PLAN: &str = "\
+## MILESTONE: extra-module\nRISK: EASY\nTASK: Add a missing helper module.\n";
+
+    #[test]
+    fn adds_a_missing_milestone_the_original_plan_left_out_then_stops() {
+        let ws = temp_ws("adds-then-stops");
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn Provider> = Box::new(RoleScripted {
+            planner_calls: planner_calls.clone(),
+            planner_replies: vec![MILESTONE_PLAN.to_string(), "NONE".to_string()],
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
+        let result = mgr
+            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3)
+            .expect("a fixable gap should resolve, not error");
+
+        assert!(result.contains_key("src/extra.rs"));
+        assert!(
+            result["src/main.rs"].contains("mod extra;"),
+            "gap-fill milestone's module was never wired into the entry file: {}",
+            result["src/main.rs"]
+        );
+        // Round 0 found the gap and planned it; round 1 confirmed nothing else was missing.
+        assert_eq!(planner_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn does_not_replan_at_all_when_the_first_round_already_says_nothing_is_missing() {
+        let ws = temp_ws("already-complete");
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn Provider> = Box::new(RoleScripted {
+            planner_calls: planner_calls.clone(),
+            planner_replies: vec!["NONE".to_string()],
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
+        let result = mgr
+            .fill_scope_gaps(initial.clone(), "contract", "schema", "worker system", 3)
+            .expect("an already-complete plan must not error");
+
+        assert_eq!(result, initial);
+        assert_eq!(planner_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn gives_up_after_max_rounds_instead_of_replanning_forever() {
+        let ws = temp_ws("never-settles");
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        // Never says NONE, no matter how many times it's asked.
+        let provider: Box<dyn Provider> = Box::new(RoleScripted {
+            planner_calls: planner_calls.clone(),
+            planner_replies: vec![MILESTONE_PLAN.to_string()],
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
+        let result = mgr
+            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3)
+            .expect("exhausting gap-fill rounds must not fail the whole run");
+
+        assert!(result.contains_key("src/extra.rs"));
+        assert_eq!(planner_calls.load(Ordering::SeqCst), Manager::MAX_GAP_FILL_ROUNDS);
+
+        let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
+        assert!(deviations.contains("may still be incomplete"));
     }
 }

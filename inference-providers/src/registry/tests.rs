@@ -401,6 +401,44 @@ fn recovery_time_grows_with_depth() {
 }
 
 #[test]
+fn depth_zero_explores_stalest_provider_every_twentieth_call() {
+    let (r, calls) = demoted_pair(Duration::ZERO);
+    for _ in 0..(2 * EXPLORE_EVERY) {
+        r.try_complete(&req(ModelTier::Light, 0, 0)).unwrap();
+    }
+    assert_eq!(calls[0].load(Ordering::SeqCst), 2);
+    assert_eq!(calls[1].load(Ordering::SeqCst), 2 * EXPLORE_EVERY as usize - 2);
+}
+
+#[test]
+fn deeper_calls_never_explore() {
+    for depth in 1..=3u8 {
+        let (r, calls) = demoted_pair(Duration::ZERO);
+        for _ in 0..(2 * EXPLORE_EVERY) {
+            r.try_complete(&req(ModelTier::Light, 0, depth)).unwrap();
+        }
+        assert_eq!(calls[0].load(Ordering::SeqCst), 0, "depth {depth}");
+    }
+}
+
+#[test]
+fn failed_exploration_falls_through_to_best() {
+    let (r, calls, _) = Builder::new()
+        .add("broken", vec![model(ModelTier::Light, 0.0, 0.0)], true, |_| Err(ProviderError::RateLimit))
+        .ok("paid", ModelTier::Light, 0.1)
+        .build();
+    {
+        let mut m = r.slots[0].metrics.lock().unwrap();
+        m.record_rate_limit(Instant::now());
+    }
+    for _ in 0..(2 * EXPLORE_EVERY) {
+        assert!(r.try_complete(&req(ModelTier::Light, 0, 0)).is_ok());
+    }
+    assert_eq!(calls[0].load(Ordering::SeqCst), 2);
+    assert_eq!(calls[1].load(Ordering::SeqCst), 2 * EXPLORE_EVERY as usize);
+}
+
+#[test]
 fn rolling_windows_hold_last_twenty_samples() {
     let mut m = ProviderMetrics::default();
     let now = m.backoff_at;

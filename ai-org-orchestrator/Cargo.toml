@@ -1,6 +1,6 @@
 [package]
 name = "ai-org-orchestrator"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Token-aware multi-agent orchestrator for V1→V2 code synthesis"
 license = "MIT OR Apache-2.0"
