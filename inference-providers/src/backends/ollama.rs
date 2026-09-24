@@ -121,7 +121,7 @@ fn infer_tier(model: &str) -> ModelTier {
     for suffix in &["b-instruct", "b_instruct", "b-chat", "b_chat", "b-q", "b:q", "b"] {
         if let Some(pos) = lower.rfind(suffix) {
             let before = &lower[..pos];
-            if let Some(n_str) = before.split(|c: char| !c.is_ascii_digit()).last() {
+            if let Some(n_str) = before.split(|c: char| !c.is_ascii_digit()).next_back() {
                 if let Ok(n) = n_str.parse::<u32>() {
                     return if n >= 20 {
                         ModelTier::Heavy

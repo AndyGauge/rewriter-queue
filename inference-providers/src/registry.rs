@@ -7,13 +7,28 @@ use crate::{
     types::{InferenceRequest, InferenceResponse, ModelTier, ProviderError},
 };
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+#[cfg(test)]
+mod tests;
+
+const BACKOFF_HALF_LIFE_SECS: f64 = 10.0;
+const ERROR_HALF_LIFE_SECS: f64 = 30.0;
+// Denominator floor for the error rate: a provider with fewer than this many
+// (age-weighted) samples is treated as if the missing samples were successes.
+const ERROR_MIN_WEIGHT: f64 = 5.0;
+
+fn decay(age: std::time::Duration, half_life_secs: f64) -> f64 {
+    0.5f64.powf(age.as_secs_f64() / half_life_secs)
+}
 
 struct ProviderMetrics {
-    latency_samples: Vec<u64>, // last 20 observed latencies in ms
-    recent_errors: Vec<bool>,  // last 20 calls: true = any error
-    backoff_factor: f64,       // spikes on 429/413, decays on success
-    quality_score: f64,        // 0.0–1.0 from QQ; 1.0 until proven otherwise
-    context_ok: bool,          // passed the 4k context probe
+    latency_samples: Vec<u64>,          // last 20 observed latencies in ms
+    recent_errors: Vec<(Instant, bool)>, // last 20 calls: true = any error
+    backoff_factor: f64,                // value at `backoff_at`; spikes on 429/413, decays with time and success
+    backoff_at: Instant,
+    quality_score: f64,                 // 0.0–1.0 from QQ; 1.0 until proven otherwise
+    context_ok: bool,                   // passed the 4k context probe
 }
 
 impl Default for ProviderMetrics {
@@ -22,6 +37,7 @@ impl Default for ProviderMetrics {
             latency_samples: Vec::new(),
             recent_errors: Vec::new(),
             backoff_factor: 0.0,
+            backoff_at: Instant::now(),
             quality_score: 1.0,
             context_ok: true,
         }
@@ -38,16 +54,20 @@ impl ProviderMetrics {
         sorted[sorted.len() / 2] as f64
     }
 
-    fn error_rate(&self) -> f64 {
-        if self.recent_errors.is_empty() {
-            return 0.0;
-        }
-        self.recent_errors.iter().filter(|&&e| e).count() as f64
-            / self.recent_errors.len() as f64
+    fn error_rate(&self, now: Instant) -> f64 {
+        let (errors, total) = self.recent_errors.iter().fold((0.0, 0.0), |(e, t), &(at, is_err)| {
+            let w = decay(now.saturating_duration_since(at), ERROR_HALF_LIFE_SECS);
+            (e + if is_err { w } else { 0.0 }, t + w)
+        });
+        errors / f64::max(total, ERROR_MIN_WEIGHT)
     }
 
-    fn push_error_sample(&mut self, is_error: bool) {
-        self.recent_errors.push(is_error);
+    fn backoff(&self, now: Instant) -> f64 {
+        self.backoff_factor * decay(now.saturating_duration_since(self.backoff_at), BACKOFF_HALF_LIFE_SECS)
+    }
+
+    fn push_error_sample(&mut self, is_error: bool, now: Instant) {
+        self.recent_errors.push((now, is_error));
         if self.recent_errors.len() > 20 {
             self.recent_errors.remove(0);
         }
@@ -60,20 +80,32 @@ impl ProviderMetrics {
         }
     }
 
-    fn record_success(&mut self) {
-        self.backoff_factor = (self.backoff_factor * 0.5).max(0.0);
-        self.push_error_sample(false);
+    fn record_success(&mut self, now: Instant) {
+        self.backoff_factor = self.backoff(now) * 0.5;
+        self.backoff_at = now;
+        self.push_error_sample(false, now);
     }
 
-    fn record_rate_limit(&mut self) {
-        self.backoff_factor = (self.backoff_factor * 2.0 + 1.0).min(64.0);
-        self.push_error_sample(true);
+    fn record_rate_limit(&mut self, now: Instant) {
+        self.backoff_factor = (self.backoff(now) * 2.0 + 1.0).min(64.0);
+        self.backoff_at = now;
+        self.push_error_sample(true, now);
     }
 }
 
 struct Slot {
     provider: Box<dyn Provider>,
     metrics: Mutex<ProviderMetrics>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSnapshot {
+    pub name: String,
+    pub latency_p50_ms: f64,
+    pub error_rate: f64,
+    pub backoff_factor: f64,
+    pub quality_score: f64,
+    pub context_ok: bool,
 }
 
 pub struct Registry {
@@ -123,6 +155,32 @@ impl Registry {
 
         let r = &cfg.router;
         Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality) }
+    }
+
+    /// Build from already-constructed providers with explicit (cost, latency, quality) weights.
+    pub fn with_providers(providers: Vec<Box<dyn Provider>>, weights: (f64, f64, f64)) -> Self {
+        let slots = providers
+            .into_iter()
+            .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()) }))
+            .collect();
+        Registry { slots, weights }
+    }
+
+    pub fn snapshot(&self) -> Vec<ProviderSnapshot> {
+        self.slots.iter()
+            .map(|s| {
+                let m = s.metrics.lock().unwrap();
+                let now = Instant::now();
+                ProviderSnapshot {
+                    name: s.provider.name().to_string(),
+                    latency_p50_ms: m.latency_p50_ms(),
+                    error_rate: m.error_rate(now),
+                    backoff_factor: m.backoff(now),
+                    quality_score: m.quality_score,
+                    context_ok: m.context_ok,
+                }
+            })
+            .collect()
     }
 
     /// Build from environment variables only (no config file needed).
@@ -282,9 +340,10 @@ impl Registry {
         };
 
         // Sort by score, then try in order — fall through on rate limit or error.
+        let now = Instant::now();
         let mut scored: Vec<(&Arc<Slot>, f64)> = candidates
             .iter()
-            .map(|s| (*s, self.score(s, est_input, est_output, hora_depth)))
+            .map(|s| (*s, self.score(s, est_input, est_output, hora_depth, now)))
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -303,16 +362,16 @@ impl Registry {
                 Ok(resp) => {
                     let mut m = slot.metrics.lock().unwrap();
                     m.record_latency(resp.latency_ms);
-                    m.record_success();
+                    m.record_success(Instant::now());
                     return Ok(resp);
                 }
                 Err(ProviderError::RateLimit) => {
-                    slot.metrics.lock().unwrap().record_rate_limit();
+                    slot.metrics.lock().unwrap().record_rate_limit(Instant::now());
                     eprintln!("    [{}] rate limited — trying next provider", slot.provider.name());
                     last_err = ProviderError::RateLimit;
                 }
                 Err(e) => {
-                    slot.metrics.lock().unwrap().push_error_sample(true);
+                    slot.metrics.lock().unwrap().push_error_sample(true, Instant::now());
                     eprintln!("    [{}] error: {e} — trying next provider", slot.provider.name());
                     last_err = e;
                 }
@@ -322,7 +381,7 @@ impl Registry {
         Err(last_err)
     }
 
-    fn score(&self, slot: &Arc<Slot>, est_input: u32, est_output: u32, hora_depth: u8) -> f64 {
+    fn score(&self, slot: &Arc<Slot>, est_input: u32, est_output: u32, hora_depth: u8, now: Instant) -> f64 {
         let m = slot.metrics.lock().unwrap();
         let model = slot.provider.models().first();
 
@@ -333,12 +392,12 @@ impl Registry {
 
         let latency = m.latency_p50_ms() / 1000.0;
         let quality_penalty = 1.0 - m.quality_score;
-        let backoff = m.backoff_factor;
+        let backoff = m.backoff(now);
 
         // Hora reliability bias: 2^depth × error_rate.
         // A provider with 15% error rate costs 8× more for a Hora-3 root task
         // than for a Hora-0 atomic task. Routes roots to reliable providers automatically.
-        let reliability_bias = 2f64.powi(hora_depth as i32) * m.error_rate();
+        let reliability_bias = 2f64.powi(hora_depth as i32) * m.error_rate(now);
 
         let (wc, wl, wq) = self.weights;
         wc * price + wl * latency + wq * quality_penalty + backoff + reliability_bias
@@ -348,10 +407,10 @@ impl Registry {
 fn tier_compatible(model_tier: ModelTier, req_tier: ModelTier) -> bool {
     // Any model can handle requests at or below its tier.
     // Heavy handles everything; Light handles Light and Micro; Micro handles only Micro.
-    match (model_tier, req_tier) {
-        (ModelTier::Heavy, _) => true,
-        (ModelTier::Light, ModelTier::Light | ModelTier::Micro) => true,
-        (ModelTier::Micro, ModelTier::Micro) => true,
-        _ => false,
-    }
+    matches!(
+        (model_tier, req_tier),
+        (ModelTier::Heavy, _)
+            | (ModelTier::Light, ModelTier::Light | ModelTier::Micro)
+            | (ModelTier::Micro, ModelTier::Micro)
+    )
 }

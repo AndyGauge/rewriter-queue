@@ -168,6 +168,36 @@ impl Workspace {
     pub fn deviations_path(&self) -> PathBuf {
         self.root.join("deviations.md")
     }
+
+    /// Root directory for a synthesis run's V2 crate draft. `variant` isolates one
+    /// milestone's build from every other's -- used only when an explicit, non-default
+    /// parallel fan-out wave puts two or more milestones' `cargo build`/`clippy`/`test`
+    /// runs (and the quality gate's stale-file cleanup) in flight at the same time,
+    /// where sharing one directory would race. `None` is the shared, default-sequential
+    /// crate directory that the rest of the pipeline (and every milestone that only ever
+    /// runs one-at-a-time) uses.
+    pub fn v2_dir(&self, variant: Option<&str>) -> PathBuf {
+        match variant {
+            Some(v) => self.root.join("artifacts/fanout").join(v),
+            None => self.root.join("artifacts/v2"),
+        }
+    }
+
+    /// Seed a freshly-isolated milestone workspace with the current crate manifest
+    /// before it starts its own quality-gate loop. Only the manifest is copied: like the
+    /// shared sequential crate directory, an isolated one is scratch space the quality
+    /// gate repopulates from that one milestone's own output every iteration, not a
+    /// snapshot of sibling milestones' code -- see the scheduling comment in
+    /// `synthesis.rs` for why a milestone never needs to see sibling code to build.
+    pub fn seed_variant_workspace(&self, from: Option<&str>, variant: &str) -> std::io::Result<()> {
+        let dst = self.v2_dir(Some(variant));
+        fs::create_dir_all(&dst)?;
+        let src_manifest = self.v2_dir(from).join("Cargo.toml");
+        if src_manifest.exists() {
+            fs::copy(&src_manifest, dst.join("Cargo.toml"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Directories that are never source, regardless of language.

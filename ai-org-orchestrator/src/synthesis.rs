@@ -61,7 +61,11 @@ impl<'a> Manager<'a> {
     /// rejection (security/maintenance) is holistic prose critique with no fixed location,
     /// so that path still asks for a full regeneration, unchanged.
     /// `id_prefix` namespaces this call's checkpoints (`<id_prefix>/iter/<n>/...`) so multiple
-    /// concurrent or nested callers — one per milestone, for instance — don't collide. Returns
+    /// concurrent or nested callers — one per milestone, for instance — don't collide. `variant`
+    /// selects which crate directory the quality gate builds against (see
+    /// `Workspace::v2_dir`) — `None` for the default shared/sequential directory, `Some(id)`
+    /// when this call is one participant in an explicit parallel fan-out wave and needs its
+    /// own isolated workspace so its `cargo build` doesn't race a sibling's. Returns
     /// `(code, passed)`: `passed` is false when the iteration budget ran out before the quality
     /// gate and review both passed, so a caller can tell "this is done" from "this is a
     /// best-effort result I gave up on" and react differently (e.g. escalate for a finer split)
@@ -73,6 +77,7 @@ impl<'a> Manager<'a> {
         worker_system: &str,
         base_task: &str,
         max_iter: usize,
+        variant: Option<&str>,
     ) -> Result<(String, bool), Box<dyn std::error::Error>> {
         enum NextCall {
             Full(String),
@@ -96,7 +101,7 @@ impl<'a> Manager<'a> {
                     ),
                 }
             })?;
-            let (clean, quality_errors) = self.quality_gate(&raw);
+            let (clean, quality_errors) = self.quality_gate(&raw, variant);
             last_output = clean.clone();
 
             if !quality_errors.is_empty() {
@@ -351,7 +356,7 @@ impl<'a> Manager<'a> {
         })?;
 
         // Quality gate on merged output — one repair pass if it fails
-        let (merged_clean, merge_quality_errors) = self.quality_gate(&merged_raw);
+        let (merged_clean, merge_quality_errors) = self.quality_gate(&merged_raw, None);
         let merged = if merge_quality_errors.is_empty() {
             merged_clean
         } else {
@@ -374,7 +379,7 @@ impl<'a> Manager<'a> {
                     "merge repair",
                 )
             })?;
-            let (repaired_clean, repair_errors) = self.quality_gate(&repaired_raw);
+            let (repaired_clean, repair_errors) = self.quality_gate(&repaired_raw, None);
             if !repair_errors.is_empty() {
                 self.ws.log_deviation(
                     "TargetImplementer-Repair",
@@ -463,15 +468,29 @@ impl<'a> Manager<'a> {
         root_task: &str,
         max_iter: usize,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let mut sections =
-            self.implement_milestones("root", root_task, worker_system, contract, schema, max_iter, 0)?;
+        let mut sections = self.implement_milestones(
+            "root", root_task, worker_system, contract, schema, max_iter, 0, None,
+        )?;
         ensure_module_declarations(&mut sections);
         Ok(Self::format_multi_file(&sections))
     }
 
     /// Ask MilestonePlanner to break `task` into milestones estimated to fit `max_iter` each,
-    /// then implement every milestone — recursing on any the planner still calls HARD, or that
-    /// actually failed to converge within its budget, up to `MAX_SPLIT_DEPTH`.
+    /// schedule them into dependency-respecting waves (see `schedule_waves`), and implement
+    /// each wave — recursing on any milestone the planner still calls HARD, or that actually
+    /// failed to converge within its budget, up to `MAX_SPLIT_DEPTH`.
+    ///
+    /// `variant` is the crate workspace this whole call operates in (see `Workspace::v2_dir`):
+    /// `None` at the root, or `Some(id)` when this call is itself running inside one
+    /// milestone's isolated workspace from an enclosing parallel wave. A wave with exactly one
+    /// milestone runs inline in that same workspace — the default, and what an unmodified plan
+    /// (or a planner that never writes `DEPENDS_ON`) always gets, matching the old fully
+    /// sequential behavior exactly. A wave with more than one milestone is an explicit,
+    /// planner-declared fan-out: those milestones have no dependency relationship in either
+    /// direction, so they run at the same time, each seeded into its own fresh isolated
+    /// workspace first (`Workspace::seed_variant_workspace`) so their concurrent `cargo build`
+    /// runs — and the quality gate's stale-file cleanup — can't race each other or the shared
+    /// directory.
     fn implement_milestones(
         &self,
         id_prefix: &str,
@@ -481,107 +500,190 @@ impl<'a> Manager<'a> {
         schema: &str,
         max_iter: usize,
         depth: usize,
+        variant: Option<&str>,
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let plan_task = format!("{task}\n\n# Iteration Budget\nN = {max_iter}");
         let plan_text = self.ws.checkpoint(&format!("{id_prefix}/plan"), || {
             self.run("MilestonePlanner", MILESTONE_PLANNER, &plan_task)
         })?;
         let milestones = parse_milestone_plan(&plan_text);
+        let waves = schedule_waves(&milestones);
+
+        eprintln!(
+            "  [milestones] '{id_prefix}': {} milestone(s) scheduled into {} wave(s) \
+             (critical path length {}): {}",
+            milestones.len(),
+            waves.len(),
+            waves.len(),
+            waves
+                .iter()
+                .map(|w| if w.len() == 1 {
+                    milestones[w[0]].name.clone()
+                } else {
+                    format!(
+                        "[fan-out: {}]",
+                        w.iter().map(|&i| milestones[i].name.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        );
 
         let mut sections = HashMap::new();
-        for milestone in milestones {
-            let ms_id = format!("{id_prefix}/{}", milestone.name);
-
-            if milestone.risk == Risk::Hard && depth < Self::MAX_SPLIT_DEPTH {
-                eprintln!(
-                    "  [milestones] '{}' planned HARD at depth {depth} — splitting further",
-                    milestone.name
-                );
-                self.ws.log_deviation(
-                    "MilestonePlanner",
-                    &format!(
-                        "Milestone '{}' estimated HARD for a {max_iter}-iteration budget — \
-                         splitting into sub-milestones (depth {depth})",
-                        milestone.name
-                    ),
-                )?;
-                let sub = self.implement_milestones(
-                    &ms_id,
-                    &milestone.task,
+        for wave in &waves {
+            if wave.len() == 1 {
+                let sub = self.implement_one_milestone(
+                    id_prefix,
+                    &milestones[wave[0]],
                     worker_system,
                     contract,
                     schema,
                     max_iter,
-                    depth + 1,
+                    depth,
+                    variant,
                 )?;
                 sections.extend(sub);
                 continue;
             }
 
-            let base_task = format!(
-                "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
-                 # Milestone: {}\n{}\n\n\
-                 # Scope\nImplement only the file(s) this milestone owns. Do not add or edit a \
-                 `mod` declaration for this milestone's own module in `main.rs`/`lib.rs` — that \
-                 wiring is added automatically after every milestone is done, specifically so \
-                 that milestones implemented independently never collide by both editing the \
-                 same shared entry file.",
-                milestone.name, milestone.task
+            eprintln!(
+                "  [milestones] fan-out: running {} independent milestones in parallel, \
+                 each in its own isolated workspace",
+                wave.len()
             );
-            let (code, passed) = self.run_with_dual_review(
-                &ms_id,
-                "TargetImplementer",
-                worker_system,
-                &base_task,
-                max_iter,
-            )?;
-
-            if !passed && depth < Self::MAX_SPLIT_DEPTH {
-                eprintln!(
-                    "  [milestones] '{}' did not converge in {max_iter} iterations — \
-                     escalating for a finer split",
-                    milestone.name
-                );
-                self.ws.log_deviation(
-                    "MilestonePlanner",
-                    &format!(
-                        "Milestone '{}' did not pass its quality gate within {max_iter} \
-                         iterations as a single unit — splitting further (depth {depth})",
-                        milestone.name
-                    ),
-                )?;
-                let retry_task = format!(
-                    "{}\n\n# Why This Needs Splitting\nA previous attempt implemented this as \
-                     one unit and did not pass its quality gate within {max_iter} iterations. \
-                     Split it into two or more smaller, independently-implementable pieces.",
-                    milestone.task
-                );
-                let sub = self.implement_milestones(
-                    &ms_id,
-                    &retry_task,
-                    worker_system,
-                    contract,
-                    schema,
-                    max_iter,
-                    depth + 1,
-                )?;
-                sections.extend(sub);
-                continue;
+            let mut ms_variants: Vec<String> = Vec::with_capacity(wave.len());
+            for &i in wave {
+                let ms_variant = format!("{id_prefix}/{}", milestones[i].name);
+                self.ws.seed_variant_workspace(variant, &ms_variant)?;
+                ms_variants.push(ms_variant);
             }
 
-            if !passed {
-                self.ws.log_agent_decision(
-                    "MilestonePlanner",
-                    &format!(
-                        "Milestone '{}' still failing its quality gate at max split depth \
-                         {depth} — accepting best effort",
-                        milestone.name
-                    ),
-                )?;
+            let results: Vec<Result<HashMap<String, String>, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .zip(ms_variants.iter())
+                    .map(|(&i, ms_variant)| {
+                        let milestone = &milestones[i];
+                        s.spawn(move || {
+                            self.implement_one_milestone(
+                                id_prefix,
+                                milestone,
+                                worker_system,
+                                contract,
+                                schema,
+                                max_iter,
+                                depth,
+                                Some(ms_variant.as_str()),
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err("thread panicked".into())))
+                    .collect()
+            });
+
+            for r in results {
+                sections.extend(r.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
             }
-            sections.extend(Self::parse_file_sections(&code));
         }
         Ok(sections)
+    }
+
+    /// Implement (or split, or escalate) a single milestone. Factored out of
+    /// `implement_milestones` so the exact same logic runs whether this milestone is the
+    /// lone member of a sequential wave or one of several running concurrently in a fan-out
+    /// wave — `variant` is the only thing that differs between those two calling contexts.
+    fn implement_one_milestone(
+        &self,
+        id_prefix: &str,
+        milestone: &Milestone,
+        worker_system: &str,
+        contract: &str,
+        schema: &str,
+        max_iter: usize,
+        depth: usize,
+        variant: Option<&str>,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        let ms_id = format!("{id_prefix}/{}", milestone.name);
+
+        if milestone.risk == Risk::Hard && depth < Self::MAX_SPLIT_DEPTH {
+            eprintln!(
+                "  [milestones] '{}' planned HARD at depth {depth} — splitting further",
+                milestone.name
+            );
+            self.ws.log_deviation(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' estimated HARD for a {max_iter}-iteration budget — \
+                     splitting into sub-milestones (depth {depth})",
+                    milestone.name
+                ),
+            )?;
+            return self.implement_milestones(
+                &ms_id, &milestone.task, worker_system, contract, schema, max_iter, depth + 1,
+                variant,
+            );
+        }
+
+        let base_task = format!(
+            "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+             # Milestone: {}\n{}\n\n\
+             # Scope\nImplement only the file(s) this milestone owns. Do not add or edit a \
+             `mod` declaration for this milestone's own module in `main.rs`/`lib.rs` — that \
+             wiring is added automatically after every milestone is done, specifically so \
+             that milestones implemented independently never collide by both editing the \
+             same shared entry file.",
+            milestone.name, milestone.task
+        );
+        let (code, passed) = self.run_with_dual_review(
+            &ms_id,
+            "TargetImplementer",
+            worker_system,
+            &base_task,
+            max_iter,
+            variant,
+        )?;
+
+        if !passed && depth < Self::MAX_SPLIT_DEPTH {
+            eprintln!(
+                "  [milestones] '{}' did not converge in {max_iter} iterations — \
+                 escalating for a finer split",
+                milestone.name
+            );
+            self.ws.log_deviation(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' did not pass its quality gate within {max_iter} \
+                     iterations as a single unit — splitting further (depth {depth})",
+                    milestone.name
+                ),
+            )?;
+            let retry_task = format!(
+                "{}\n\n# Why This Needs Splitting\nA previous attempt implemented this as \
+                 one unit and did not pass its quality gate within {max_iter} iterations. \
+                 Split it into two or more smaller, independently-implementable pieces.",
+                milestone.task
+            );
+            return self.implement_milestones(
+                &ms_id, &retry_task, worker_system, contract, schema, max_iter, depth + 1,
+                variant,
+            );
+        }
+
+        if !passed {
+            self.ws.log_agent_decision(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' still failing its quality gate at max split depth \
+                     {depth} — accepting best effort",
+                    milestone.name
+                ),
+            )?;
+        }
+        Ok(Self::parse_file_sections(&code))
     }
 }
 
@@ -596,6 +698,57 @@ struct Milestone {
     name: String,
     risk: Risk,
     task: String,
+    /// Names of milestones (from the same plan) that must finish before this one starts.
+    /// Empty means this milestone can start immediately — either because the plan explicitly
+    /// said `DEPENDS_ON: none`, or (only for the very first milestone in a plan) because there
+    /// was nothing before it to default to.
+    depends_on: Vec<String>,
+}
+
+/// Group milestone indices into dependency-respecting waves (Kahn's algorithm topological
+/// layering): every milestone in a wave has all of its dependencies satisfied by an earlier
+/// wave, so same-wave milestones are guaranteed to have no dependency relationship in either
+/// direction and are safe to build at the same time. The number of waves is the plan's
+/// critical path length — the longest chain of milestones that must happen strictly in order,
+/// regardless of how much fan-out the other waves have.
+///
+/// A milestone with no `DEPENDS_ON` line defaults (during parsing, see `parse_milestone_plan`)
+/// to depending on the one immediately before it in plan order — so a plan that never uses the
+/// field schedules into exactly one milestone per wave, in order, identical to the old
+/// unconditionally-sequential behavior. Fan-out only happens where the plan explicitly says
+/// two or more milestones don't depend on each other.
+///
+/// An unresolvable dependency name (a typo, or a genuine cycle) can never be satisfied; rather
+/// than deadlock, any milestones left over once no further wave can be formed are force-
+/// scheduled one at a time, in plan order, as their own single-milestone wave.
+fn schedule_waves(milestones: &[Milestone]) -> Vec<Vec<usize>> {
+    let name_to_idx: HashMap<&str, usize> =
+        milestones.iter().enumerate().map(|(i, m)| (m.name.as_str(), i)).collect();
+    let deps: Vec<Vec<usize>> = milestones
+        .iter()
+        .map(|m| m.depends_on.iter().filter_map(|n| name_to_idx.get(n.as_str()).copied()).collect())
+        .collect();
+
+    let mut scheduled = vec![false; milestones.len()];
+    let mut waves = Vec::new();
+
+    while scheduled.iter().any(|&s| !s) {
+        let wave: Vec<usize> = (0..milestones.len())
+            .filter(|&i| !scheduled[i] && deps[i].iter().all(|&d| scheduled[d]))
+            .collect();
+
+        if wave.is_empty() {
+            let stuck = (0..milestones.len()).find(|&i| !scheduled[i]).unwrap();
+            scheduled[stuck] = true;
+            waves.push(vec![stuck]);
+            continue;
+        }
+        for &i in &wave {
+            scheduled[i] = true;
+        }
+        waves.push(wave);
+    }
+    waves
 }
 
 /// Parse MilestonePlanner's `## MILESTONE: <name>` / `RISK: EASY|HARD` / `TASK: ...` blocks.
@@ -648,15 +801,36 @@ fn ensure_module_declarations(sections: &mut HashMap<String, String>) {
     }
 }
 
+/// One milestone as parsed before dependency defaults are resolved. `depends_on` is `None`
+/// when the block had no `DEPENDS_ON:` line at all, distinct from `Some(vec![])` (an explicit
+/// `DEPENDS_ON: none`) — only the former falls back to the "depends on the previous milestone"
+/// default; the latter is a deliberate, explicit declaration of independence.
+struct RawMilestone {
+    name: String,
+    risk: Risk,
+    task: String,
+    depends_on: Option<Vec<String>>,
+}
+
 fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
-    let mut milestones = Vec::new();
+    let mut raw: Vec<RawMilestone> = Vec::new();
     let mut name: Option<String> = None;
     let mut risk = Risk::Hard;
     let mut task = String::new();
+    let mut depends_on: Option<Vec<String>> = None;
 
-    let flush = |name: &mut Option<String>, risk: &mut Risk, task: &mut String, out: &mut Vec<Milestone>| {
+    let flush = |name: &mut Option<String>,
+                 risk: &mut Risk,
+                 task: &mut String,
+                 depends_on: &mut Option<Vec<String>>,
+                 out: &mut Vec<RawMilestone>| {
         if let Some(n) = name.take() {
-            out.push(Milestone { name: n, risk: risk.clone(), task: task.trim().to_string() });
+            out.push(RawMilestone {
+                name: n,
+                risk: risk.clone(),
+                task: task.trim().to_string(),
+                depends_on: depends_on.take(),
+            });
         }
         *risk = Risk::Hard;
         task.clear();
@@ -673,11 +847,18 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("## MILESTONE:") {
-            flush(&mut name, &mut risk, &mut task, &mut milestones);
+            flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut raw);
             name = Some(rest.trim().to_string());
             suppressed = false;
         } else if let Some(rest) = trimmed.strip_prefix("RISK:") {
             risk = if rest.trim().eq_ignore_ascii_case("EASY") { Risk::Easy } else { Risk::Hard };
+        } else if let Some(rest) = trimmed.strip_prefix("DEPENDS_ON:") {
+            let val = rest.trim();
+            depends_on = Some(if val.is_empty() || val.eq_ignore_ascii_case("none") {
+                Vec::new()
+            } else {
+                val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            });
         } else if let Some(rest) = trimmed.strip_prefix("TASK:") {
             task.push_str(rest.trim());
             task.push('\n');
@@ -690,8 +871,23 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
             task.push('\n');
         }
     }
-    flush(&mut name, &mut risk, &mut task, &mut milestones);
-    milestones
+    flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut raw);
+
+    // Resolve the sequential default now that we know the full plan order: a milestone with
+    // no DEPENDS_ON line depends on exactly the one before it, so an unmodified plan (or a
+    // planner that never writes the field) schedules one-at-a-time, in order — identical to
+    // the pre-fan-out behavior.
+    raw.iter()
+        .enumerate()
+        .map(|(i, rm)| Milestone {
+            name: rm.name.clone(),
+            risk: rm.risk.clone(),
+            task: rm.task.clone(),
+            depends_on: rm.depends_on.clone().unwrap_or_else(|| {
+                if i == 0 { Vec::new() } else { vec![raw[i - 1].name.clone()] }
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -864,5 +1060,93 @@ TASK: Do the last thing.\n\
             "trailing summary prose leaked into last milestone: {}",
             milestones[9].task
         );
+        // No DEPENDS_ON line anywhere in this real response — must default to a strict chain.
+        assert!(milestones[0].depends_on.is_empty());
+        for i in 1..milestones.len() {
+            assert_eq!(milestones[i].depends_on, vec![milestones[i - 1].name.clone()]);
+        }
+    }
+
+    #[test]
+    fn omitted_depends_on_defaults_to_the_previous_milestone() {
+        let text = "\
+## MILESTONE: first\nRISK: EASY\nTASK: First thing.\n\n\
+## MILESTONE: second\nRISK: EASY\nTASK: Second thing.\n";
+        let milestones = parse_milestone_plan(text);
+        assert!(milestones[0].depends_on.is_empty());
+        assert_eq!(milestones[1].depends_on, vec!["first".to_string()]);
+    }
+
+    #[test]
+    fn depends_on_none_is_explicit_independence_not_the_default_chain() {
+        let text = "\
+## MILESTONE: first\nRISK: EASY\nTASK: First thing.\n\n\
+## MILESTONE: second\nRISK: EASY\nDEPENDS_ON: none\nTASK: Second thing.\n";
+        let milestones = parse_milestone_plan(text);
+        assert!(milestones[1].depends_on.is_empty());
+    }
+
+    #[test]
+    fn depends_on_parses_a_comma_separated_list_of_named_milestones() {
+        let text = "\
+## MILESTONE: a\nRISK: EASY\nDEPENDS_ON: none\nTASK: A.\n\n\
+## MILESTONE: b\nRISK: EASY\nDEPENDS_ON: none\nTASK: B.\n\n\
+## MILESTONE: c\nRISK: EASY\nDEPENDS_ON: a, b\nTASK: C needs both a and b.\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones[2].depends_on, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    fn milestone(name: &str, depends_on: &[&str]) -> Milestone {
+        Milestone {
+            name: name.to_string(),
+            risk: Risk::Easy,
+            task: String::new(),
+            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn no_dependencies_at_all_schedules_one_wave_per_milestone_by_default() {
+        // This is the shape parse_milestone_plan actually produces for an unmodified plan:
+        // each milestone (after the first) explicitly depends on the one before it.
+        let ms = [milestone("a", &[]), milestone("b", &["a"]), milestone("c", &["b"])];
+        let waves = schedule_waves(&ms);
+        assert_eq!(waves, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn independent_milestones_with_no_dependency_relationship_share_one_wave() {
+        let ms = [milestone("a", &[]), milestone("b", &[]), milestone("c", &[])];
+        let waves = schedule_waves(&ms);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].len(), 3);
+    }
+
+    #[test]
+    fn a_milestone_depending_on_two_independent_ones_waits_for_both() {
+        // a and b are independent (wave 1, parallel); c depends on both (wave 2, alone).
+        let ms = [milestone("a", &[]), milestone("b", &[]), milestone("c", &["a", "b"])];
+        let waves = schedule_waves(&ms);
+        assert_eq!(waves.len(), 2);
+        let mut first = waves[0].clone();
+        first.sort();
+        assert_eq!(first, vec![0, 1]);
+        assert_eq!(waves[1], vec![2]);
+    }
+
+    #[test]
+    fn an_unresolvable_dependency_name_does_not_deadlock_scheduling() {
+        // "typo-name" doesn't match any milestone -- must not block "a" forever.
+        let ms = [milestone("a", &["typo-name"])];
+        let waves = schedule_waves(&ms);
+        assert_eq!(waves, vec![vec![0]]);
+    }
+
+    #[test]
+    fn a_genuine_dependency_cycle_still_terminates_and_schedules_everything() {
+        let ms = [milestone("a", &["b"]), milestone("b", &["a"])];
+        let waves = schedule_waves(&ms);
+        let scheduled: Vec<usize> = waves.iter().flatten().copied().collect();
+        assert_eq!(scheduled.len(), 2);
     }
 }
