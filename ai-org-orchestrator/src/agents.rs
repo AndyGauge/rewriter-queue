@@ -9,10 +9,10 @@ pub fn agent_tier(name: &str) -> ModelTier {
     let base = name.split('-').next().unwrap_or(name);
     match base {
         // Only the agents that generate large code artifacts need the top tier
-        "TargetImplementer" | "MergeAgent" => ModelTier::Heavy,
+        "TargetImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
-        | "TestEngineer" => ModelTier::Light,
+        | "TestEngineer" | "AcceptanceCriteria" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
         // Verdict-only agents: APPROVED/REJECTED, COMPLIANT/NON_COMPLIANT
@@ -28,7 +28,7 @@ pub fn agent_hora_depth(name: &str) -> u8 {
         "MissionArchitect" | "InductiveReasoner" => 3,
         "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" => 2,
         "TargetImplementer" | "ContractReviewer" | "TestEngineer" | "MaintenanceReviewer"
-        | "ProductionReadinessReviewer" => 1,
+        | "ProductionReadinessReviewer" | "AcceptanceCriteria" | "SystemTestWriter" => 1,
         _ => 0,
     }
 }
@@ -49,6 +49,8 @@ pub const FORMAL_METHODS_REVIEWER: &str = include_str!("../../skills/formal-meth
 pub const PRODUCTION_READINESS_REVIEWER: &str =
     include_str!("../../skills/production-readiness-reviewer.md");
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
+pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
+pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
 
 /// One optional, domain-specific pattern TargetImplementer can be given on top of its core
 /// skill — only when a milestone actually needs it. Keeps the always-loaded system prompt

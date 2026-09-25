@@ -7,12 +7,12 @@ fn tools() -> Value {
     json!([
         {
             "name": "queue_submit",
-            "description": "Queue a synthesis run. Jobs run one at a time in submission order. Paths are on this machine; with a queue server configured, both directories are uploaded to it.",
+            "description": "Queue a synthesis run. Jobs run one at a time in submission order. Paths are on this machine; with a queue server configured, both directories are uploaded to it. The workspace must already contain artifacts/mission.md (a short statement of what V2 should actually do) before submitting -- the run fails immediately without one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "source": { "type": "string", "description": "Source directory to rewrite" },
-                    "workspace": { "type": "string", "description": "Workspace directory for the run" },
+                    "workspace": { "type": "string", "description": "Workspace directory for the run. Must contain artifacts/mission.md before submitting -- the pipeline fails fast if that artifact is missing or blank." },
                     "max_iter": { "type": "integer", "description": "Max review iterations per stage" },
                     "inherit_env": { "type": "boolean", "description": "Also use providers from the queue worker's shell environment (API keys); default is its config file only" }
                 },

@@ -85,9 +85,18 @@ Grab a prebuilt binary for your platform from the
    skip the server entirely — every `rewriter-queue` subcommand falls back
    to a local, file-backed queue when no `[queue] url` is configured.
 
-3. **Submit a job:**
+3. **Submit a job.** First write the mission — a required artifact, a short
+   statement of what V2 should actually do, not just "port this file." It
+   lives at `<workspace>/artifacts/mission.md`, the same place every other
+   artifact this pipeline produces lives; the run refuses to start without
+   one, since there's no sensible default for "what is this system for":
 
    ```sh
+   mkdir -p /path/to/a/fresh/empty/dir/artifacts
+   echo "# Mission
+
+   <what V2 should actually do>" > /path/to/a/fresh/empty/dir/artifacts/mission.md
+
    ./target/release/rewriter-queue submit \
      --source /path/to/the/code/to/rewrite \
      --workspace /path/to/a/fresh/empty/dir \

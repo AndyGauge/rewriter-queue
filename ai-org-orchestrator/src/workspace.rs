@@ -21,10 +21,6 @@ impl Workspace {
         fs::write(path, content)
     }
 
-    fn read(&self, rel: &str) -> std::io::Result<String> {
-        fs::read_to_string(self.root.join(rel))
-    }
-
     fn append(&self, rel: &str, content: &str) -> std::io::Result<()> {
         let path = self.root.join(rel);
         if let Some(p) = path.parent() {
@@ -36,11 +32,6 @@ impl Workspace {
             String::new()
         };
         fs::write(path, format!("{existing}{content}"))
-    }
-
-    pub fn get_mission(&self) -> String {
-        self.read("mission.md")
-            .unwrap_or_else(|_| "*(no mission set)*".into())
     }
 
     pub fn set_agent_task(&self, agent: &str, task: &str) -> std::io::Result<()> {

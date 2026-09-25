@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0]
+
+### Added
+
+- Gherkin acceptance criteria and real system tests. A new stage, `AcceptanceCriteria`,
+  runs right after the ObjectiveContract and turns it into real Gherkin — `Feature`/
+  `Scenario`/`Given`/`When`/`Then` covering the contract's stated behaviors, named edge
+  cases, and explicit exclusions — saved as a new artifact, `acceptance.feature`. A
+  second new step, `SystemTestWriter`, turns those scenarios into real `#[test]`
+  functions against the finished crate's actual public API (`tests/system_tests.rs`),
+  written in before the existing integration gate runs — so a crate that compiles but
+  doesn't actually do what the contract's own scenarios say fails the same hard gate a
+  non-compiling crate already did, with no second gate to keep in sync.
+
+### Changed
+
+- **Breaking**: the mission is now a pipeline artifact like any other, not a
+  special-cased file. It lives at `<workspace>/artifacts/mission.md` (was
+  `<workspace>/mission.md`) and is read the same way as `objective_contract.md` or
+  `schema.rs` — including being readable via the `read_artifact` tool every agentic
+  stage already has. A run refuses to start at all without one, printing exactly what
+  to create and where, instead of silently proceeding with no stated intent. Existing
+  workspaces need their `mission.md` moved under `artifacts/` before resubmitting.
+
 ## [0.3.2]
 
 ### Added

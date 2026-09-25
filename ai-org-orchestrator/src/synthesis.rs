@@ -209,6 +209,41 @@ impl<'a> Manager<'a> {
         }
     }
 
+    /// Turn Gherkin acceptance criteria (produced right after the ObjectiveContract, from the
+    /// contract itself) into real `#[test]` functions against the finished crate, and fold
+    /// them into `sections` as `tests/system_tests.rs`. A no-op (returns `sections` unchanged,
+    /// no agent call) if `gherkin` is blank -- an older workspace with no acceptance-criteria
+    /// artifact, or a caller that genuinely has none, shouldn't fail synthesis over it.
+    ///
+    /// Deliberately not its own gate: the file this produces is just another file in the
+    /// crate as far as `cargo test` is concerned, and the caller runs `integration_check_and_
+    /// repair` right after this, so a scenario that doesn't actually hold becomes an ordinary
+    /// test failure that gate already treats as a hard failure with repair attempts -- the
+    /// same standard "compiles" already gets held to, now extended to "does what the contract
+    /// says," without inventing a second, parallel gate mechanism to keep in sync with it.
+    fn write_system_tests(
+        &self,
+        mut sections: HashMap<String, String>,
+        contract: &str,
+        gherkin: &str,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+        if gherkin.trim().is_empty() {
+            return Ok(sections);
+        }
+
+        let current = Self::format_multi_file(&sections);
+        let task = format!(
+            "# ObjectiveContract\n{contract}\n\n\
+             # Acceptance Criteria (Gherkin)\n```gherkin\n{gherkin}\n```\n\n\
+             # Current V2 Implementation\n```rust\n{current}\n```"
+        );
+        let raw = self.ws.checkpoint("system_tests/write", || {
+            self.run("SystemTestWriter", crate::agents::SYSTEM_TEST_WRITER, &task)
+        })?;
+        sections.extend(Self::parse_file_sections(Self::strip_fences(&raw)));
+        Ok(sections)
+    }
+
     /// Build, lint, and test the *fully assembled* crate — every milestone's sections
     /// merged together, module declarations wired up, the works — and repair it against its
     /// own errors if it fails, up to `max_repair_attempts` times. Every milestone (and every
@@ -440,6 +475,7 @@ impl<'a> Manager<'a> {
         v1_source: &str,
         test_matrix: &str,
         inductive: &str,
+        gherkin: &str,
         max_iter: usize,
         toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -469,7 +505,9 @@ impl<'a> Manager<'a> {
             // synthesize_by_milestones already runs the fully-assembled crate through
             // integration_check_and_repair before returning, so `code` here is guaranteed to
             // build/lint/test clean — the review panel below only ever sees code that works.
-            let code = self.synthesize_by_milestones(worker_system, contract, schema, &full_task, max_iter, toolbox)?;
+            let code = self.synthesize_by_milestones(
+                worker_system, contract, schema, &full_task, gherkin, max_iter, toolbox,
+            )?;
             let code = self.run_review_panel(code, contract, schema, worker_system, max_iter)?;
             return Ok(code);
         }
@@ -539,9 +577,15 @@ impl<'a> Manager<'a> {
             self.run("MergeAgent", MERGE_AGENT, &merge_task)
         })?;
 
+        let with_system_tests = self.write_system_tests(
+            Self::parse_file_sections(Self::strip_fences(&merged_raw)),
+            contract,
+            gherkin,
+        )?;
+
         eprintln!("  final integration check (build + clippy + test on the merged crate)");
         let merged_sections = self.integration_check_and_repair(
-            Self::parse_file_sections(Self::strip_fences(&merged_raw)),
+            with_system_tests,
             contract,
             schema,
             worker_system,
@@ -633,6 +677,7 @@ impl<'a> Manager<'a> {
         contract: &str,
         schema: &str,
         root_task: &str,
+        gherkin: &str,
         max_iter: usize,
         toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -643,6 +688,13 @@ impl<'a> Manager<'a> {
 
         let sections =
             self.fill_scope_gaps(sections, contract, schema, worker_system, max_iter, toolbox)?;
+
+        // Written before the integration gate, not after: a scenario test is just another
+        // file in the crate as far as `cargo test` is concerned, so folding it in here means
+        // the existing hard gate below -- build, lint, test, repair-or-fail -- automatically
+        // covers "does this actually satisfy the contract's own behavioral scenarios," with no
+        // separate gate needed.
+        let sections = self.write_system_tests(sections, contract, gherkin)?;
 
         eprintln!(
             "==> Final integration check (build + clippy + test on the fully assembled crate)"
@@ -2175,5 +2227,152 @@ mod pattern_prescription_tests {
 
         let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
         assert!(deviations.contains("unknown pattern"));
+    }
+}
+
+#[cfg(test)]
+mod system_test_writer_tests {
+    use super::*;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct FixedReply {
+        text: String,
+        models: Vec<ModelInfo>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Provider for FixedReply {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, _req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(InferenceResponse {
+                text: self.text.clone(),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-system-tests-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn blank_gherkin_is_a_no_op_with_zero_provider_calls() {
+        let ws = temp_ws("blank");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: "should never be called".into(),
+            models: vec![mock_model()],
+            calls: calls.clone(),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let original = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
+        let result = mgr.write_system_tests(original.clone(), "contract", "   \n").unwrap();
+
+        assert_eq!(result, original);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn non_blank_gherkin_merges_the_returned_test_file() {
+        let ws = temp_ws("merge");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let test_file = "// === tests/system_tests.rs ===\n#[test]\nfn it_works() {\n    assert!(true);\n}\n";
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: test_file.into(),
+            models: vec![mock_model()],
+            calls: calls.clone(),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let original = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
+        let gherkin = "Feature: hello\n  Scenario: it works\n    Given nothing\n    When hello() is called\n    Then it does not panic\n";
+        let result = mgr.write_system_tests(original, "contract", gherkin).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(result.contains_key("tests/system_tests.rs"));
+        assert!(result["tests/system_tests.rs"].contains("fn it_works"));
+        // The implementation file must be untouched.
+        assert_eq!(result["src/lib.rs"], "pub fn hello() {}\n");
+    }
+
+    #[test]
+    fn a_passing_system_test_lets_the_integration_gate_succeed() {
+        let ws = temp_ws("passing");
+        let test_file = "// === tests/system_tests.rs ===\n#[test]\nfn increments_from_zero() {\n    assert_eq!(1 + 1, 2);\n}\n";
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: test_file.into(),
+            models: vec![mock_model()],
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let sections = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
+        let with_tests = mgr.write_system_tests(sections, "contract", "Feature: x\n").unwrap();
+        let result = mgr.integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1);
+
+        assert!(result.is_ok(), "expected success, got: {result:?}");
+    }
+
+    #[test]
+    fn a_failing_system_test_fails_the_run_the_same_as_a_build_failure() {
+        // This is the actual point of folding system tests in before the integration gate:
+        // a crate that compiles fine but doesn't satisfy its own acceptance scenario must be
+        // treated as a failed run, not a successful one.
+        let ws = temp_ws("failing");
+        let test_file = "// === tests/system_tests.rs ===\n#[test]\nfn wrong_expectation() {\n    assert_eq!(1 + 1, 3);\n}\n";
+        let provider: Box<dyn Provider> = Box::new(FixedReply {
+            text: test_file.into(),
+            models: vec![mock_model()],
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let sections = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
+        let with_tests = mgr.write_system_tests(sections, "contract", "Feature: x\n").unwrap();
+        let err = mgr
+            .integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1)
+            .expect_err("a failing system test must fail the run");
+
+        assert!(err.to_string().contains("does not build"), "got: {err}");
     }
 }

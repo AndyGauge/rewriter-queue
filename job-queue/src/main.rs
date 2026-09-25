@@ -19,7 +19,9 @@ fn usage() -> ! {
 
 Commands:
   submit --source <dir> --workspace <dir> [--max-iter <n>] [--inherit-env]
-                    Queue a synthesis run
+                    Queue a synthesis run. <workspace>/artifacts/mission.md must
+                    already exist (a short statement of what V2 should do) --
+                    the run fails immediately without it.
   list              Show all jobs
   status <id>       Show one job with the tail of its log
   cancel <id>       Cancel a queued or running job

@@ -181,7 +181,24 @@ fn main() {
 
     let mgr = Manager::new(&ws, &registry);
 
-    let mission = ws.get_mission();
+    // The mission is itself a pipeline artifact -- read the same way as objective_contract.md,
+    // schema.rs, and everything else, and just as uniformly readable via the `read_artifact`
+    // tool. There is no sensible default for "what should this system even do": a missing or
+    // blank mission means MissionArchitect infers the whole ObjectiveContract from raw source
+    // with no stated intent, which is worse than refusing to start.
+    let mission = match ws.get_artifact("mission.md") {
+        Ok(m) if !m.trim().is_empty() => m,
+        _ => {
+            eprintln!(
+                "error: no mission set. Write a short statement of what V2 should actually do \
+                 (not just \"port this file\") to {}/artifacts/mission.md before submitting -- \
+                 the mission is itself a required artifact, the same as every other pipeline \
+                 artifact, not optional scaffolding.",
+                args.workspace
+            );
+            std::process::exit(1);
+        }
+    };
     eprintln!("Mission: {} bytes", mission.len());
 
     if !tools::source_dir_has_readable_files(Path::new(&args.source)) {
@@ -249,7 +266,32 @@ fn main() {
     };
     eprintln!("    contract done");
 
-    // ── 2. Test matrix refinement ─────────────────────────────────────────────
+    // ── 2. Acceptance criteria (Gherkin) ──────────────────────────────────────
+    let gherkin = if let Ok(cached) = ws.get_artifact("acceptance.feature") {
+        eprintln!("==> Acceptance criteria (resuming from checkpoint)");
+        cached
+    } else {
+        eprintln!("==> Acceptance criteria");
+        let ac_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
+             then write Gherkin acceptance criteria covering its key behaviors and edge cases. \
+             Read V1 source with list_files/read_file only if you need to confirm a concrete \
+             detail the contract doesn't spell out.";
+        let toolbox = toolbox_for("AcceptanceCriteria", ACCEPTANCE_CRITERIA);
+        let g = mgr
+            .run_agentic(
+                "AcceptanceCriteria",
+                ACCEPTANCE_CRITERIA,
+                ac_task,
+                &toolbox,
+                manager::AGENTIC_MAX_TURNS,
+            )
+            .expect("acceptance criteria phase failed");
+        ws.emit_artifact("acceptance.feature", &g).unwrap();
+        g
+    };
+    eprintln!("    acceptance criteria done");
+
+    // ── 3. Test matrix refinement ─────────────────────────────────────────────
     let refined = if let Ok(cached) = ws.get_artifact("refined_test_matrix.json") {
         eprintln!("==> Test matrix refinement (resuming from checkpoint)");
         cached
@@ -272,7 +314,7 @@ fn main() {
     eprintln!("    test matrix refined");
     let _ = refined; // consumed via read_test_matrix below
 
-    // ── 3. Inductive analysis ─────────────────────────────────────────────────
+    // ── 4. Inductive analysis ─────────────────────────────────────────────────
     let inductive = if let Ok(cached) = ws.get_artifact("inductive_analysis.md") {
         eprintln!("==> Inductive analysis (resuming from checkpoint)");
         cached
@@ -292,7 +334,7 @@ fn main() {
     };
     eprintln!("    inductive analysis done");
 
-    // ── 4. Schema ─────────────────────────────────────────────────────────────
+    // ── 5. Schema ─────────────────────────────────────────────────────────────
     let schema = if let Ok(cached) = ws.get_artifact("schema.rs") {
         eprintln!("==> Schema (resuming from checkpoint)");
         cached
@@ -312,7 +354,7 @@ fn main() {
     };
     eprintln!("    schema done");
 
-    // ── 5. V2 synthesis (hourglass: fan-out → merge → review) ────────────────
+    // ── 6. V2 synthesis (hourglass: fan-out → merge → review) ────────────────
     let v2 = if let Ok(cached) = ws.get_artifact("v2.rs") {
         eprintln!("==> V2 synthesis (resuming from checkpoint)");
         cached
@@ -332,6 +374,7 @@ fn main() {
                 &v1_source,
                 &test_matrix,
                 &inductive,
+                &gherkin,
                 args.max_iter,
                 &toolbox,
             )

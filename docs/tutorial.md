@@ -51,11 +51,27 @@ This tutorial uses local mode — nothing extra to start.
 
 Pick a small, real piece of code you want rewritten or reviewed — a single
 source file or a small directory is a better first run than a whole
-project. You need an empty directory for the workspace; the tool writes its
-working state there as it goes.
+project. The workspace directory holds the tool's working state as it goes,
+plus one thing you provide before submitting: the **mission**.
+
+The mission is a required artifact — a short statement of what V2 should
+actually do, not just "port this file." Without it, the first agent in the
+pipeline has to guess your intent from raw source alone, which shows up
+later as a contract that's technically correct but not what you meant. It's
+stored the same way as every other artifact this pipeline produces
+(`objective_contract.md`, `schema.rs`, ...), at `<workspace>/artifacts/mission.md`,
+and the run refuses to start without one:
 
 ```sh
-mkdir /tmp/my-first-run
+mkdir -p /tmp/my-first-run/artifacts
+cat > /tmp/my-first-run/artifacts/mission.md <<'EOF'
+# Mission
+
+V1 is a small in-memory counter store. Rebuild it as V2 with identical
+behavior: increment a key's count, and read a key's current count (0 for
+an unseen key).
+EOF
+
 rewriter-queue submit \
   --source /path/to/the/code \
   --workspace /tmp/my-first-run \
