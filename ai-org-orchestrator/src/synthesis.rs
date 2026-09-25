@@ -244,20 +244,35 @@ impl<'a> Manager<'a> {
         Ok(sections)
     }
 
+    /// Cap on how many times the integration gate can escalate to MilestonePlanner for a
+    /// targeted fix plan once patch-based repair alone has stopped clearing errors — the same
+    /// "ask the architect instead of hammering the same repair strategy" principle
+    /// `implement_one_milestone`'s own convergence-failure escalation and `fill_scope_gaps`
+    /// already follow, applied here too. Kept low relative to those: each escalation round
+    /// costs a full `implement_milestones` cycle (potentially several fix-milestones, each
+    /// with its own up-to-`max_repair_attempts` inner loop), not one extra patch call.
+    const MAX_INTEGRATION_ESCALATIONS: usize = 2;
+
     /// Build, lint, and test the *fully assembled* crate — every milestone's sections
     /// merged together, module declarations wired up, the works — and repair it against its
-    /// own errors if it fails, up to `max_repair_attempts` times. Every milestone (and every
-    /// chunk in the legacy fan-out path) only ever gets its own quality gate run against its
-    /// own slice in an isolated or scratch directory (see `Workspace::v2_dir`); this is the
-    /// first and only point where the whole crate as it will actually ship gets built and
-    /// tested together, so it's the only place a cross-milestone problem — two milestones
-    /// each writing their own version of the crate root, a module one file expects that
-    /// another never produced — can even be seen, let alone fixed.
+    /// own errors if it fails, up to `max_repair_attempts` times. If patch-based repair alone
+    /// can't clear it, escalate back to MilestonePlanner with the specific remaining errors
+    /// for a targeted fix plan (up to `MAX_INTEGRATION_ESCALATIONS` times) before giving up —
+    /// the same escalation-to-the-architect pattern used everywhere else a bounded repair
+    /// strategy proves insufficient, rather than this one gate being the exception that just
+    /// fails outright. Every milestone (and every chunk in the legacy fan-out path) only ever
+    /// gets its own quality gate run against its own slice in an isolated or scratch directory
+    /// (see `Workspace::v2_dir`); this is the first and only point where the whole crate as it
+    /// will actually ship gets built and tested together, so it's the only place a
+    /// cross-milestone problem — two milestones each writing their own version of the crate
+    /// root, a module one file expects that another never produced — can even be seen, let
+    /// alone fixed.
     ///
     /// This is a hard gate, not a deviation: a crate that still doesn't build or pass its
-    /// own tests after every repair attempt is a failed run, returned as `Err` rather than
-    /// silently handed back as if it were a finished V2. Delivering something that doesn't
-    /// compile as a "success" is exactly the failure mode this closes.
+    /// own tests after every repair attempt *and* every escalation below is a failed run,
+    /// returned as `Err` rather than silently handed back as if it were a finished V2.
+    /// Delivering something that doesn't compile as a "success" is exactly the failure mode
+    /// this closes.
     fn integration_check_and_repair(
         &self,
         mut sections: HashMap<String, String>,
@@ -265,6 +280,8 @@ impl<'a> Manager<'a> {
         schema: &str,
         worker_system: &str,
         max_repair_attempts: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
+        escalation_depth: usize,
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let base_task = format!(
             "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
@@ -318,19 +335,64 @@ impl<'a> Manager<'a> {
             return Ok(Self::parse_file_sections(&clean));
         }
 
-        self.ws.log_agent_decision(
-            "TargetImplementer-Integration",
+        if escalation_depth >= Self::MAX_INTEGRATION_ESCALATIONS {
+            self.ws.log_agent_decision(
+                "TargetImplementer-Integration",
+                &format!(
+                    "Fully assembled crate still fails its quality gate after \
+                     {max_repair_attempts} integration repair attempts and {escalation_depth} \
+                     escalation(s) to MilestonePlanner — failing the run instead of delivering \
+                     a crate that does not build:\n{errors}"
+                ),
+            )?;
+            return Err(format!(
+                "V2 crate does not build/pass tests after {max_repair_attempts} integration \
+                 repair attempts and {escalation_depth} escalation(s) to \
+                 MilestonePlanner:\n{errors}"
+            )
+            .into());
+        }
+
+        // Patch-based repair alone couldn't clear it after every attempt -- go back to the
+        // architect with the specific remaining errors instead of continuing to hammer the
+        // same repair strategy that's already proven insufficient `max_repair_attempts` times.
+        eprintln!(
+            "  [integration] still failing after {max_repair_attempts} repair attempts — \
+             escalating to MilestonePlanner for a targeted fix plan (escalation {escalation_depth})"
+        );
+        self.ws.log_deviation(
+            "MilestonePlanner",
             &format!(
-                "Fully assembled crate still fails its quality gate after \
-                 {max_repair_attempts} integration repair attempts — failing the run instead \
-                 of delivering a crate that does not build:\n{errors}"
+                "Integration escalation {escalation_depth}: patch-based repair did not clear \
+                 these failures after {max_repair_attempts} attempts:\n{errors}"
             ),
         )?;
-        Err(format!(
-            "V2 crate does not build/pass tests after {max_repair_attempts} integration \
-             repair attempts:\n{errors}"
+
+        let fix_task = format!(
+            "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+             # Current V2 Implementation\n```rust\n{clean}\n```\n\n\
+             # Build/Test Failures Repeated Patch Attempts Could Not Fix\n{errors}\n\n\
+             Plan milestones to fix EXACTLY these failures. Do not redesign, re-implement, or \
+             re-describe anything the failures above don't implicate."
+        );
+        let id_prefix = format!("integration-fix/{escalation_depth}");
+        let fix_sections = self.implement_milestones(
+            &id_prefix, &fix_task, worker_system, contract, schema, max_repair_attempts, 0, None,
+            toolbox,
+        )?;
+        let mut sections = Self::parse_file_sections(&clean);
+        sections.extend(fix_sections);
+        ensure_module_declarations(&mut sections);
+
+        self.integration_check_and_repair(
+            sections,
+            contract,
+            schema,
+            worker_system,
+            max_repair_attempts,
+            toolbox,
+            escalation_depth + 1,
         )
-        .into())
     }
 
     /// Run IP Counsel, the (hard-gated) Formal Methods soundness check, and Production
@@ -345,6 +407,7 @@ impl<'a> Manager<'a> {
         schema: &str,
         worker_system: &str,
         max_repair_attempts: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
         let review_task = |c: &str| {
             format!("# ObjectiveContract\n{contract}\n\n# V2 Implementation\n```rust\n{c}\n```")
@@ -358,8 +421,9 @@ impl<'a> Manager<'a> {
                 .log_deviation("IpCounsel", &format!("IP concerns (deferred):\n{ip}"))?;
         }
 
-        let code =
-            self.enforce_soundness(code, contract, schema, worker_system, max_repair_attempts)?;
+        let code = self.enforce_soundness(
+            code, contract, schema, worker_system, max_repair_attempts, toolbox,
+        )?;
 
         let readiness = self.ws.checkpoint("review_panel/production_readiness", || {
             self.run("ProductionReadinessReviewer", PRODUCTION_READINESS_REVIEWER, &review_task(&code))
@@ -392,6 +456,7 @@ impl<'a> Manager<'a> {
         schema: &str,
         worker_system: &str,
         max_repair_attempts: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
         let review_task = |c: &str| {
             format!("# ObjectiveContract\n{contract}\n\n# V2 Implementation\n```rust\n{c}\n```")
@@ -441,6 +506,8 @@ impl<'a> Manager<'a> {
                 schema,
                 worker_system,
                 max_repair_attempts,
+                toolbox,
+                0,
             )?;
             code = Self::format_multi_file(&repaired_sections);
         }
@@ -508,7 +575,7 @@ impl<'a> Manager<'a> {
             let code = self.synthesize_by_milestones(
                 worker_system, contract, schema, &full_task, gherkin, max_iter, toolbox,
             )?;
-            let code = self.run_review_panel(code, contract, schema, worker_system, max_iter)?;
+            let code = self.run_review_panel(code, contract, schema, worker_system, max_iter, toolbox)?;
             return Ok(code);
         }
 
@@ -590,6 +657,8 @@ impl<'a> Manager<'a> {
             schema,
             worker_system,
             max_iter,
+            toolbox,
+            0,
         )?;
         let merged = Self::format_multi_file(&merged_sections);
 
@@ -646,7 +715,7 @@ impl<'a> Manager<'a> {
             )?;
         }
 
-        let merged = self.run_review_panel(merged, contract, schema, worker_system, max_iter)?;
+        let merged = self.run_review_panel(merged, contract, schema, worker_system, max_iter, toolbox)?;
 
         Ok(merged)
     }
@@ -699,8 +768,9 @@ impl<'a> Manager<'a> {
         eprintln!(
             "==> Final integration check (build + clippy + test on the fully assembled crate)"
         );
-        let sections =
-            self.integration_check_and_repair(sections, contract, schema, worker_system, max_iter)?;
+        let sections = self.integration_check_and_repair(
+            sections, contract, schema, worker_system, max_iter, toolbox, 0,
+        )?;
         Ok(Self::format_multi_file(&sections))
     }
 
@@ -1704,6 +1774,16 @@ mod integration_gate_tests {
         ws
     }
 
+    /// Offers no tools -- these tests exercise the repair loop with a crate the mock can
+    /// actually fix (or can't) within the ordinary patch attempts, never reaching escalation.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
     fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -1725,7 +1805,7 @@ mod integration_gate_tests {
 
         let broken = sections(&[("src/main.rs", "fn main() {\n    undefined_fn();\n}\n")]);
         let fixed = mgr
-            .integration_check_and_repair(broken, "contract", "schema", "worker system", 3)
+            .integration_check_and_repair(broken, "contract", "schema", "worker system", 3, &NullToolbox, 0)
             .expect("an assembled crate the model can actually fix should succeed");
 
         assert!(fixed["src/main.rs"].contains("println!(\"fixed\")"));
@@ -1750,7 +1830,7 @@ mod integration_gate_tests {
 
         let broken = sections(&[("src/main.rs", broken_src)]);
         let err = mgr
-            .integration_check_and_repair(broken, "contract", "schema", "worker system", 2)
+            .integration_check_and_repair(broken, "contract", "schema", "worker system", 2, &NullToolbox, 0)
             .expect_err("a crate that can never be fixed must fail the run, not succeed");
 
         assert!(
@@ -1852,6 +1932,15 @@ mod soundness_gate_tests {
         ws
     }
 
+    /// Offers no tools -- these tests never reach the integration gate's escalation path.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
     #[test]
     fn repairs_an_unsound_program_and_confirms_soundness_before_returning() {
         let ws = temp_ws("repair-ok");
@@ -1869,7 +1958,7 @@ mod soundness_gate_tests {
 
         let code = "// === src/main.rs ===\nfn main() {\n    println!(\"unsound\");\n}\n".to_string();
         let result = mgr
-            .enforce_soundness(code, "contract", "schema", "worker system", 2)
+            .enforce_soundness(code, "contract", "schema", "worker system", 2, &NullToolbox)
             .expect("a soundness violation the model can fix should succeed");
 
         assert!(result.contains("println!(\"sound\")"));
@@ -1893,7 +1982,7 @@ mod soundness_gate_tests {
 
         let code = "// === src/main.rs ===\nfn main() {\n    println!(\"v1\");\n}\n".to_string();
         let err = mgr
-            .enforce_soundness(code, "contract", "schema", "worker system", 1)
+            .enforce_soundness(code, "contract", "schema", "worker system", 1, &NullToolbox)
             .expect_err("a soundness violation that never resolves must fail the run");
 
         assert!(
@@ -2286,6 +2375,15 @@ mod system_test_writer_tests {
         ws
     }
 
+    /// Offers no tools -- these tests never reach the integration gate's escalation path.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
     fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -2347,7 +2445,7 @@ mod system_test_writer_tests {
 
         let sections = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
         let with_tests = mgr.write_system_tests(sections, "contract", "Feature: x\n").unwrap();
-        let result = mgr.integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1);
+        let result = mgr.integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1, &NullToolbox, 0);
 
         assert!(result.is_ok(), "expected success, got: {result:?}");
     }
@@ -2370,7 +2468,7 @@ mod system_test_writer_tests {
         let sections = sections(&[("src/lib.rs", "pub fn hello() {}\n")]);
         let with_tests = mgr.write_system_tests(sections, "contract", "Feature: x\n").unwrap();
         let err = mgr
-            .integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1)
+            .integration_check_and_repair(with_tests, "contract", "schema", "worker system", 1, &NullToolbox, 0)
             .expect_err("a failing system test must fail the run");
 
         assert!(err.to_string().contains("does not build"), "got: {err}");

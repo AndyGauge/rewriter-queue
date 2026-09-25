@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1]
+
+### Fixed
+
+- The integration gate now escalates to MilestonePlanner instead of just failing. Every
+  other bounded-retry point in this pipeline — a milestone that won't converge, a plan
+  that didn't cover the full scope — goes back to the architect for a smarter fix once
+  its own repair budget is exhausted; the integration gate was the one exception, just
+  giving up after `max_repair_attempts` patch attempts. It now does the same thing: once
+  patch-based repair alone can't clear the remaining errors, MilestonePlanner is handed
+  the specific compiler/test failures and asked to plan targeted fix milestones — not a
+  redesign, just exactly what the failures implicate — implemented through the same
+  milestone machinery, merged in, and re-checked. Bounded at 2 escalation rounds, since
+  each one costs a full milestone-implementation cycle, not one extra patch call.
+
 ## [0.4.0]
 
 ### Added
