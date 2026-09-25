@@ -15,10 +15,18 @@ pub(crate) const CHUNK_TARGET: usize = 8_000;
 /// agentic call can make before it must produce a final answer. A real run found this the hard
 /// way -- with `max_turns` wired to a `max_iter` of 2, MissionArchitect's first two turns were
 /// both legitimate exploration (`list_files` then `read_file`), leaving zero turns to actually
-/// answer, and the whole run failed despite the tool loop itself working perfectly. Exploring a
-/// real source tree can reasonably take several reads (and a `fan_out` call, which recurses
-/// with this same budget) before there's enough context to answer at all.
-pub(crate) const AGENTIC_MAX_TURNS: usize = 20;
+/// answer, and the whole run failed despite the tool loop itself working perfectly.
+///
+/// 20 turned out to still be too tight once decoupled: a second real run against a 14-file
+/// source tree burned all 20 without ever answering, and reading the actual tool-call log
+/// showed why -- `objective_contract.md` read three times, `schema.rs` three times, one source
+/// file three times, `list_files` five times, one call per turn throughout even though a turn
+/// can request several at once. The turn-batching reminder in `run_agentic` targets that
+/// waste directly; this higher ceiling is the safety margin for whatever a model still doesn't
+/// follow -- exploring a real source tree can legitimately take a couple dozen reads (and a
+/// `fan_out` call, which recurses with this same budget) before there's enough context to
+/// answer at all.
+pub(crate) const AGENTIC_MAX_TURNS: usize = 40;
 
 pub struct Manager<'a> {
     pub ws: &'a Workspace,
@@ -124,13 +132,33 @@ impl<'a> Manager<'a> {
     ) -> Result<String, Box<dyn std::error::Error>> {
         self.ws.set_agent_task(agent, task)?;
         let tool_defs = toolbox.tool_defs();
+
+        // A real run burned 27 of a 20-turn budget this way: the model asked for one file at
+        // a time even though a turn can request several tool calls at once, and re-requested
+        // things (the same artifact three times, the same source file three times) it already
+        // had sitting in its own history a few turns back. Neither is a wire-protocol limit --
+        // `run_agentic` already executes every call in one turn's `tool_calls` before the next
+        // turn -- it's purely that nothing ever told the model it could, so every stage that
+        // reads more than a couple of files pays for it turn-by-turn instead of once.
+        let user = if tool_defs.is_empty() {
+            task.to_string()
+        } else {
+            format!(
+                "{task}\n\n\
+                 (Tool use: if you already know you need several independent pieces of \
+                 information — multiple files, multiple artifacts — request all of those tool \
+                 calls together in the same turn rather than one at a time; you're not limited \
+                 to one call per turn. Don't re-request something you've already read earlier \
+                 in this conversation — it's still there in your own history above.)"
+            )
+        };
         let mut history: Vec<Turn> = Vec::new();
         let mut pinned_provider: Option<String> = None;
 
         for turn in 0..max_turns {
             let req = InferenceRequest {
                 system: system.to_string(),
-                user: task.to_string(),
+                user: user.clone(),
                 max_tokens: 16000,
                 tier: agent_tier(agent),
                 hora_depth: agent_hora_depth(agent),
@@ -529,5 +557,67 @@ mod agentic_tests {
 
         let result = mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 5).unwrap();
         assert_eq!(result, "done-from-first");
+    }
+
+    struct NoTools;
+    impl Toolbox for NoTools {
+        fn tool_defs(&self) -> Vec<ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
+    /// Finishes immediately (no tool calls) and records the exact `user` text it was sent, so
+    /// tests can check what `run_agentic` actually put in the request.
+    struct CapturesUser {
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+        models: Vec<ModelInfo>,
+    }
+    impl Provider for CapturesUser {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            *self.seen.lock().unwrap() = Some(req.user.clone());
+            Ok(InferenceResponse {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+                input_tokens: 1,
+                output_tokens: 1,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn a_tool_capable_call_gets_the_batching_and_no_re_read_reminder_appended() {
+        let ws = temp_ws("reminder-with-tools");
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let provider: Box<dyn Provider> = Box::new(CapturesUser { seen: seen.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        mgr.run_agentic("TestAgent", "system", "the actual task", &EchoToolbox, 5).unwrap();
+
+        let user = seen.lock().unwrap().clone().unwrap();
+        assert!(user.starts_with("the actual task"), "got: {user}");
+        assert!(user.contains("same turn"), "expected the batching reminder, got: {user}");
+        assert!(user.contains("Don't re-request"), "expected the no-re-read reminder, got: {user}");
+    }
+
+    #[test]
+    fn a_call_with_no_tools_gets_the_task_verbatim_with_no_reminder() {
+        let ws = temp_ws("reminder-no-tools");
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let provider: Box<dyn Provider> = Box::new(CapturesUser { seen: seen.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        mgr.run_agentic("TestAgent", "system", "the actual task", &NoTools, 5).unwrap();
+
+        assert_eq!(seen.lock().unwrap().clone().unwrap(), "the actual task");
     }
 }

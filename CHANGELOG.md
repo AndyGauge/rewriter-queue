@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.2]
+
+### Fixed
+
+- Agentic calls could exhaust their whole turn budget without ever answering, on a
+  source tree with more than a handful of files. Root-caused against a real run's tool-
+  call log: `objective_contract.md` read three times, `schema.rs` three times, one
+  source file three times, `list_files` called five times — every single call one at a
+  time, even though a turn can request several tool calls at once and `run_agentic`
+  already executes all of them before the next turn. Nothing had ever told the model
+  that. `run_agentic` now appends a one-time reminder whenever tools are offered:
+  batch independent reads into the same turn, and don't re-request something already
+  in your own history. Turn budget (`AGENTIC_MAX_TURNS`) also raised from 20 to 40 as a
+  safety margin regardless.
+
 ## [0.4.1]
 
 ### Fixed
