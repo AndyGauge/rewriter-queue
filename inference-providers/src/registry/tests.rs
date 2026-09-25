@@ -10,6 +10,7 @@ struct Mock {
     name: String,
     models: Vec<ModelInfo>,
     available: bool,
+    supports_tools: bool,
     calls: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<String>>>,
     handler: Handler,
@@ -19,6 +20,7 @@ impl Provider for Mock {
     fn name(&self) -> &str { &self.name }
     fn models(&self) -> &[ModelInfo] { &self.models }
     fn is_available(&self) -> bool { self.available }
+    fn supports_tools(&self) -> bool { self.supports_tools }
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.log.lock().unwrap().push(self.name.clone());
@@ -40,6 +42,7 @@ fn model(tier: ModelTier, cost_in: f64, cost_out: f64) -> ModelInfo {
 fn reply(text: &str, latency_ms: u64) -> Result<InferenceResponse, ProviderError> {
     Ok(InferenceResponse {
         text: text.into(),
+        tool_calls: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
         provider: "mock".into(),
@@ -72,6 +75,30 @@ impl Builder {
             name: name.into(),
             models,
             available,
+            supports_tools: false,
+            calls,
+            log: self.log.clone(),
+            handler: Box::new(handler),
+        }));
+        self
+    }
+
+    /// Same as `add`, but the provider reports `supports_tools() == true` -- for tests of the
+    /// tool-calling eligibility filter and `complete_pinned`.
+    fn add_tool_capable(
+        mut self,
+        name: &str,
+        models: Vec<ModelInfo>,
+        available: bool,
+        handler: impl Fn(&InferenceRequest) -> Result<InferenceResponse, ProviderError> + Send + Sync + 'static,
+    ) -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        self.calls.push(calls.clone());
+        self.providers.push(Box::new(Mock {
+            name: name.into(),
+            models,
+            available,
+            supports_tools: true,
             calls,
             log: self.log.clone(),
             handler: Box::new(handler),
@@ -623,4 +650,85 @@ fn qq_non_rate_limit_failure_is_penalised() {
     let m = r.slots[0].metrics.lock().unwrap();
     assert!(!m.context_ok);
     assert_eq!(m.quality_score, 0.0);
+}
+
+fn req_with_tools(tier: ModelTier, depth: u8) -> InferenceRequest {
+    let mut r = req(tier, 0, depth);
+    r.tools = vec![crate::types::ToolDef {
+        name: "read_file".into(),
+        description: "read a file".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    r
+}
+
+#[test]
+fn a_request_with_tools_never_routes_to_a_provider_that_does_not_support_them() {
+    let (r, calls, _) = Builder::new()
+        .ok("no-tools", ModelTier::Heavy, 0.0) // cheaper, would normally win on score
+        .add_tool_capable("tool-capable", vec![model(ModelTier::Heavy, 0.0, 1.0)], true, |_| reply("ok", 2000))
+        .build();
+
+    r.complete(&req_with_tools(ModelTier::Heavy, 0)).unwrap();
+    assert_eq!(calls[0].load(Ordering::SeqCst), 0, "no-tools provider must never be called");
+    assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_request_with_no_tools_can_still_use_a_tool_incapable_provider() {
+    let (r, calls, _) = Builder::new().ok("plain", ModelTier::Heavy, 0.0).build();
+    r.complete(&req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn no_eligible_tool_capable_provider_is_a_clear_unavailable_error() {
+    let (r, _, _) = Builder::new().ok("no-tools", ModelTier::Heavy, 0.0).build();
+    let err = r.complete(&req_with_tools(ModelTier::Heavy, 0)).unwrap_err();
+    assert!(matches!(err, ProviderError::Unavailable(_)));
+}
+
+#[test]
+fn complete_pinned_calls_only_the_named_provider() {
+    let (r, calls, _) = Builder::new()
+        .ok("a", ModelTier::Heavy, 0.0)
+        .ok("b", ModelTier::Heavy, 0.0)
+        .build();
+
+    let resp = r.complete_pinned("b", &req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(resp.provider, "mock"); // reply() hardcodes this; call routing is what's tested
+    assert_eq!(calls[0].load(Ordering::SeqCst), 0, "provider a must not be called");
+    assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn complete_pinned_records_success_metrics_on_the_pinned_slot() {
+    let (r, _, _) = Builder::new().ok("a", ModelTier::Heavy, 0.0).build();
+    r.complete_pinned("a", &req(ModelTier::Heavy, 0, 0)).unwrap();
+    let now = Instant::now();
+    let m = r.slots[0].metrics.lock().unwrap();
+    assert_eq!(m.error_rate(now), 0.0);
+    assert!(!m.latency_samples.is_empty());
+}
+
+#[test]
+fn complete_pinned_errors_clearly_on_an_unknown_provider_name() {
+    let (r, _, _) = Builder::new().ok("a", ModelTier::Heavy, 0.0).build();
+    let err = r.complete_pinned("does-not-exist", &req(ModelTier::Heavy, 0, 0)).unwrap_err();
+    assert!(matches!(err, ProviderError::Unavailable(_)));
+}
+
+#[test]
+fn complete_pinned_never_falls_through_to_a_different_provider_on_failure() {
+    let (r, calls, _) = Builder::new()
+        .add("broken", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, |_| {
+            Err(ProviderError::Unavailable("500".into()))
+        })
+        .ok("healthy", ModelTier::Heavy, 0.0)
+        .build();
+
+    let err = r.complete_pinned("broken", &req(ModelTier::Heavy, 0, 0)).unwrap_err();
+    assert!(matches!(err, ProviderError::Unavailable(_)));
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1, "the pinned (broken) provider was tried");
+    assert_eq!(calls[1].load(Ordering::SeqCst), 0, "must not fall through to the healthy one");
 }

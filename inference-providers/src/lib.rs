@@ -5,4 +5,7 @@ pub mod registry;
 pub mod types;
 
 pub use registry::{ProviderSnapshot, Registry};
-pub use types::{InferenceRequest, InferenceResponse, ModelTier, ProviderError};
+pub use types::{
+    InferenceRequest, InferenceResponse, ModelTier, ProviderError, ToolCall, ToolDef, ToolResult,
+    Turn,
+};

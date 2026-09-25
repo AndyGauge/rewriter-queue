@@ -83,6 +83,7 @@ impl Provider for Instant0 {
     fn complete(&self, _: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         Ok(InferenceResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
             provider: "instant".into(),

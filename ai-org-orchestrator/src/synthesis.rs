@@ -441,12 +441,17 @@ impl<'a> Manager<'a> {
         test_matrix: &str,
         inductive: &str,
         max_iter: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // No `# V1 Source` section here on purpose: the milestone path below runs
+        // MilestonePlanner agentically (`toolbox`), so it reads whatever source it actually
+        // needs via `list_files`/`read_file` instead of getting the whole tree pasted in. The
+        // legacy chunk fan-out path below still needs the raw `v1_source` text for splitting,
+        // which is why the parameter itself is unchanged.
         let full_task = format!(
             "# ObjectiveContract\n{contract}\n\n\
              # Inductive Analysis\n{inductive}\n\n\
              # Schema\n```rust\n{schema}\n```\n\n\
-             # V1 Source\n```rust\n{v1_source}\n```\n\n\
              # Test Matrix\n{test_matrix}"
         );
 
@@ -464,7 +469,7 @@ impl<'a> Manager<'a> {
             // synthesize_by_milestones already runs the fully-assembled crate through
             // integration_check_and_repair before returning, so `code` here is guaranteed to
             // build/lint/test clean — the review panel below only ever sees code that works.
-            let code = self.synthesize_by_milestones(worker_system, contract, schema, &full_task, max_iter)?;
+            let code = self.synthesize_by_milestones(worker_system, contract, schema, &full_task, max_iter, toolbox)?;
             let code = self.run_review_panel(code, contract, schema, worker_system, max_iter)?;
             return Ok(code);
         }
@@ -629,13 +634,15 @@ impl<'a> Manager<'a> {
         schema: &str,
         root_task: &str,
         max_iter: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
         let mut sections = self.implement_milestones(
-            "root", root_task, worker_system, contract, schema, max_iter, 0, None,
+            "root", root_task, worker_system, contract, schema, max_iter, 0, None, toolbox,
         )?;
         ensure_module_declarations(&mut sections);
 
-        let sections = self.fill_scope_gaps(sections, contract, schema, worker_system, max_iter)?;
+        let sections =
+            self.fill_scope_gaps(sections, contract, schema, worker_system, max_iter, toolbox)?;
 
         eprintln!(
             "==> Final integration check (build + clippy + test on the fully assembled crate)"
@@ -667,6 +674,7 @@ impl<'a> Manager<'a> {
         schema: &str,
         worker_system: &str,
         max_iter: usize,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         for round in 0..Self::MAX_GAP_FILL_ROUNDS {
             let implemented = Self::format_multi_file(&sections);
@@ -683,7 +691,7 @@ impl<'a> Manager<'a> {
 
             let id_prefix = format!("root/gap-fill-{round}");
             let added = self.implement_milestones(
-                &id_prefix, &gap_task, worker_system, contract, schema, max_iter, 0, None,
+                &id_prefix, &gap_task, worker_system, contract, schema, max_iter, 0, None, toolbox,
             )?;
 
             if added.is_empty() {
@@ -749,10 +757,31 @@ impl<'a> Manager<'a> {
         max_iter: usize,
         depth: usize,
         variant: Option<&str>,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-        let plan_task = format!("{task}\n\n# Iteration Budget\nN = {max_iter}");
+        let plan_task = format!(
+            "{task}\n\n# Iteration Budget\nN = {max_iter}\n\n\
+             # Available Implementer Patterns\nFor each milestone, if its work genuinely \
+             touches one of these domains, prescribe it with a `PATTERNS:` line (comma-\
+             separated names, or omit the line entirely — most milestones need none of \
+             these beyond the implementer's core rules):\n{}\n\n\
+             # Source Access\nV1 source has not been pasted in — read whatever files you \
+             need with list_files/read_file, and read prior artifacts (objective_contract.md, \
+             schema.rs, inductive_analysis.md) with read_artifact rather than assuming their \
+             content. For a large source tree, use fan_out to analyze independent subsystems \
+             concurrently before planning.",
+            crate::agents::implementer_pattern_catalog()
+        );
+        // Agentic: reads V1 source and prior artifacts (schema, contract, inductive analysis)
+        // on demand instead of needing them pasted in -- see `tools::PipelineToolbox`.
         let plan_text = self.ws.checkpoint(&format!("{id_prefix}/plan"), || {
-            self.run("MilestonePlanner", MILESTONE_PLANNER, &plan_task)
+            self.run_agentic(
+                "MilestonePlanner",
+                MILESTONE_PLANNER,
+                &plan_task,
+                toolbox,
+                crate::manager::AGENTIC_MAX_TURNS,
+            )
         })?;
         let milestones = parse_milestone_plan(&plan_text);
         let waves = schedule_waves(&milestones);
@@ -789,6 +818,7 @@ impl<'a> Manager<'a> {
                     max_iter,
                     depth,
                     variant,
+                    toolbox,
                 )?;
                 sections.extend(sub);
                 continue;
@@ -822,6 +852,7 @@ impl<'a> Manager<'a> {
                                 max_iter,
                                 depth,
                                 Some(ms_variant.as_str()),
+                                toolbox,
                             )
                             .map_err(|e| e.to_string())
                         })
@@ -854,6 +885,7 @@ impl<'a> Manager<'a> {
         max_iter: usize,
         depth: usize,
         variant: Option<&str>,
+        toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let ms_id = format!("{id_prefix}/{}", milestone.name);
 
@@ -872,7 +904,7 @@ impl<'a> Manager<'a> {
             )?;
             return self.implement_milestones(
                 &ms_id, &milestone.task, worker_system, contract, schema, max_iter, depth + 1,
-                variant,
+                variant, toolbox,
             );
         }
 
@@ -886,10 +918,39 @@ impl<'a> Manager<'a> {
              same shared entry file.",
             milestone.name, milestone.task
         );
+
+        // MilestonePlanner may have prescribed domain-specific patterns for this milestone
+        // (see `agents::IMPLEMENTER_PATTERNS`) -- only those get appended to the core skill,
+        // so a milestone that doesn't touch e.g. trait objects never pays for that guidance.
+        // An unresolvable name is dropped (not fatal) but recorded, since it likely means the
+        // planner typo'd a pattern name from the catalog it was shown.
+        let implementer_system = if milestone.patterns.is_empty() {
+            worker_system.to_string()
+        } else {
+            let known: Vec<&str> =
+                crate::agents::IMPLEMENTER_PATTERNS.iter().map(|p| p.name).collect();
+            let unknown: Vec<&String> =
+                milestone.patterns.iter().filter(|p| !known.contains(&p.as_str())).collect();
+            if !unknown.is_empty() {
+                self.ws.log_deviation(
+                    "MilestonePlanner",
+                    &format!(
+                        "Milestone '{}' prescribed unknown pattern name(s) {:?} — ignored \
+                         (known patterns: {known:?})",
+                        milestone.name, unknown
+                    ),
+                )?;
+            }
+            format!(
+                "{worker_system}\n\n# Additional Guidance for This Milestone\n{}",
+                crate::agents::resolve_implementer_patterns(&milestone.patterns)
+            )
+        };
+
         let (code, passed) = self.run_with_dual_review(
             &ms_id,
             "TargetImplementer",
-            worker_system,
+            &implementer_system,
             &base_task,
             max_iter,
             variant,
@@ -917,7 +978,7 @@ impl<'a> Manager<'a> {
             );
             return self.implement_milestones(
                 &ms_id, &retry_task, worker_system, contract, schema, max_iter, depth + 1,
-                variant,
+                variant, toolbox,
             );
         }
 
@@ -951,6 +1012,12 @@ struct Milestone {
     /// said `DEPENDS_ON: none`, or (only for the very first milestone in a plan) because there
     /// was nothing before it to default to.
     depends_on: Vec<String>,
+    /// Names of `agents::IMPLEMENTER_PATTERNS` entries MilestonePlanner prescribed for this
+    /// milestone specifically — e.g. a milestone that touches `Box<dyn Trait>` fields gets
+    /// `trait-objects`. Empty (the default; most milestones need nothing beyond the core
+    /// skill) means TargetImplementer runs with just its core system prompt, unpolluted by
+    /// guidance for domains this milestone doesn't touch.
+    patterns: Vec<String>,
 }
 
 /// Group milestone indices into dependency-respecting waves (Kahn's algorithm topological
@@ -1004,15 +1071,32 @@ fn schedule_waves(milestones: &[Milestone]) -> Vec<Vec<usize>> {
 /// silently trusting an ambiguous plan) and of TASK spanning multiple lines up to the next
 /// milestone marker.
 /// Register every top-level `src/*.rs` module in the crate's entry file (`src/main.rs`,
-/// falling back to `src/lib.rs`), inserting only the `mod <name>;` lines that aren't already
-/// present. This is deliberately mechanical, not an implementer's job: two milestones that each
-/// need their own module registered are otherwise both trying to hand-edit the same shared
-/// file, and since each milestone's `run_with_dual_review` loop only tracks its own in-memory
-/// copy of what it last wrote, one milestone's edit to that file can silently diverge from what
-/// another milestone (or this same file's own owning milestone, on a later iteration) has
-/// since put on disk -- surfacing as "SEARCH text not found" patch failures with no single
-/// milestone at fault. Doing this once, after every milestone's own file(s) are settled,
-/// removes the shared file from contention entirely.
+/// falling back to `src/lib.rs`): a `mod <name>;` line, plus a `pub use <name>::*;` re-export
+/// of that module's public items at the crate root. Only the lines that aren't already present
+/// get inserted.
+///
+/// This is deliberately mechanical, not an implementer's job, for two separate reasons:
+///
+/// - **The `mod` declarations.** Two milestones that each need their own module registered are
+///   otherwise both trying to hand-edit the same shared file, and since each milestone's
+///   `run_with_dual_review` loop only tracks its own in-memory copy of what it last wrote, one
+///   milestone's edit to that file can silently diverge from what another milestone (or this
+///   same file's own owning milestone, on a later iteration) has since put on disk -- surfacing
+///   as "SEARCH text not found" patch failures with no single milestone at fault.
+/// - **The `pub use` re-exports.** A milestone writes its own file with no visibility into the
+///   final module layout, so it (reasonably) writes `use crate::{Error, ResearchFinding}` as if
+///   the whole schema lived in one flat namespace -- which is exactly how the schema itself
+///   presents those types. If `Error` actually ends up defined in a sibling milestone's module,
+///   nothing makes it resolve at the crate root unless something re-exports it there. A real run
+///   hit exactly this: `crate::Error`/`crate::ResearchFinding`/`crate::VerificationStatus` used
+///   across four files, defined in none of them at the root, and the integration gate correctly
+///   failed the whole run over it rather than shipping broken code -- catching the symptom
+///   perfectly, but the actual fix is this mechanical re-export, done once here rather than
+///   hoping every milestone happens to guess the eventual file layout right.
+///
+/// Doing both once, after every milestone's own file(s) are settled, removes the shared entry
+/// file from contention and gives every module's public surface a single, predictable place to
+/// resolve from, regardless of which file ultimately defines it.
 fn ensure_module_declarations(sections: &mut HashMap<String, String>) {
     let entry_path = if sections.contains_key("src/main.rs") {
         "src/main.rs"
@@ -1033,20 +1117,32 @@ fn ensure_module_declarations(sections: &mut HashMap<String, String>) {
         .collect();
 
     let entry = sections.get_mut(entry_path).unwrap();
-    let mut missing: Vec<String> = module_names
-        .into_iter()
+
+    let mut missing_mod: Vec<String> = module_names
+        .iter()
         .filter(|name| {
             let declared = format!("mod {name};");
             let declared_pub = format!("pub mod {name};");
             !entry.contains(&declared) && !entry.contains(&declared_pub)
         })
+        .cloned()
         .collect();
-    missing.sort();
+    missing_mod.sort();
 
-    if !missing.is_empty() {
-        let decls: String = missing.iter().map(|n| format!("mod {n};\n")).collect();
-        *entry = format!("{decls}{entry}");
+    let mut missing_reexport: Vec<String> = module_names
+        .into_iter()
+        .filter(|name| !entry.contains(&format!("pub use {name}::*;")))
+        .collect();
+    missing_reexport.sort();
+
+    if missing_mod.is_empty() && missing_reexport.is_empty() {
+        return;
     }
+
+    let mod_decls: String = missing_mod.iter().map(|n| format!("mod {n};\n")).collect();
+    let reexports: String =
+        missing_reexport.iter().map(|n| format!("pub use {n}::*;\n")).collect();
+    *entry = format!("{mod_decls}{reexports}{entry}");
 }
 
 /// One milestone as parsed before dependency defaults are resolved. `depends_on` is `None`
@@ -1058,6 +1154,7 @@ struct RawMilestone {
     risk: Risk,
     task: String,
     depends_on: Option<Vec<String>>,
+    patterns: Vec<String>,
 }
 
 fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
@@ -1066,11 +1163,13 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     let mut risk = Risk::Hard;
     let mut task = String::new();
     let mut depends_on: Option<Vec<String>> = None;
+    let mut patterns: Vec<String> = Vec::new();
 
     let flush = |name: &mut Option<String>,
                  risk: &mut Risk,
                  task: &mut String,
                  depends_on: &mut Option<Vec<String>>,
+                 patterns: &mut Vec<String>,
                  out: &mut Vec<RawMilestone>| {
         if let Some(n) = name.take() {
             out.push(RawMilestone {
@@ -1078,6 +1177,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
                 risk: risk.clone(),
                 task: task.trim().to_string(),
                 depends_on: depends_on.take(),
+                patterns: std::mem::take(patterns),
             });
         }
         *risk = Risk::Hard;
@@ -1095,7 +1195,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("## MILESTONE:") {
-            flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut raw);
+            flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut raw);
             name = Some(rest.trim().to_string());
             suppressed = false;
         } else if let Some(rest) = trimmed.strip_prefix("RISK:") {
@@ -1107,6 +1207,13 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
             } else {
                 val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             });
+        } else if let Some(rest) = trimmed.strip_prefix("PATTERNS:") {
+            let val = rest.trim();
+            patterns = if val.is_empty() || val.eq_ignore_ascii_case("none") {
+                Vec::new()
+            } else {
+                val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            };
         } else if let Some(rest) = trimmed.strip_prefix("TASK:") {
             task.push_str(rest.trim());
             task.push('\n');
@@ -1119,7 +1226,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
             task.push('\n');
         }
     }
-    flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut raw);
+    flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut raw);
 
     // Resolve the sequential default now that we know the full plan order: a milestone with
     // no DEPENDS_ON line depends on exactly the one before it, so an unmodified plan (or a
@@ -1134,6 +1241,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
             depends_on: rm.depends_on.clone().unwrap_or_else(|| {
                 if i == 0 { Vec::new() } else { vec![raw[i - 1].name.clone()] }
             }),
+            patterns: rm.patterns.clone(),
         })
         .collect()
 }
@@ -1195,6 +1303,55 @@ mod wiring_tests {
         ]);
         ensure_module_declarations(&mut s);
         assert!(s["src/lib.rs"].contains("mod collector;"));
+    }
+
+    #[test]
+    fn adds_pub_use_reexports_for_every_other_top_level_file() {
+        let mut s = sections(&[
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+            ("src/database.rs", "pub struct Database;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        let main = &s["src/main.rs"];
+        assert!(main.contains("pub use collector::*;"), "{main}");
+        assert!(main.contains("pub use database::*;"), "{main}");
+    }
+
+    #[test]
+    fn does_not_duplicate_an_already_present_reexport() {
+        let mut s = sections(&[
+            ("src/main.rs", "mod collector;\npub use collector::*;\nfn main() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        assert_eq!(s["src/main.rs"].matches("pub use collector::*;").count(), 1);
+    }
+
+    #[test]
+    fn a_module_with_the_mod_line_already_present_still_gets_its_reexport_added() {
+        // The exact real-world gap this fix closes: an earlier iteration (or a milestone that
+        // wrote its own mod line) declared the module but never re-exported it, so
+        // `crate::TypeName` -- written by a sibling milestone that assumed a flat namespace --
+        // still wouldn't resolve without this.
+        let mut s = sections(&[
+            ("src/main.rs", "mod collector;\nfn main() {}\n"),
+            ("src/collector.rs", "pub struct Error;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        let main = &s["src/main.rs"];
+        assert_eq!(main.matches("mod collector;").count(), 1, "{main}");
+        assert!(main.contains("pub use collector::*;"), "{main}");
+    }
+
+    #[test]
+    fn falls_back_to_lib_rs_reexports_when_there_is_no_main_rs() {
+        let mut s = sections(&[
+            ("src/lib.rs", "pub fn hello() {}\n"),
+            ("src/collector.rs", "pub struct Collector;\n"),
+        ]);
+        ensure_module_declarations(&mut s);
+        assert!(s["src/lib.rs"].contains("pub use collector::*;"));
     }
 }
 
@@ -1344,12 +1501,48 @@ TASK: Do the last thing.\n\
         assert_eq!(milestones[2].depends_on, vec!["a".to_string(), "b".to_string()]);
     }
 
+    #[test]
+    fn patterns_line_parses_a_comma_separated_list() {
+        let text = "\
+## MILESTONE: a\nRISK: EASY\nPATTERNS: trait-objects, error-handling\nTASK: A.\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(
+            milestones[0].patterns,
+            vec!["trait-objects".to_string(), "error-handling".to_string()]
+        );
+    }
+
+    #[test]
+    fn patterns_line_is_absent_by_default() {
+        let text = "## MILESTONE: a\nRISK: EASY\nTASK: A.\n";
+        let milestones = parse_milestone_plan(text);
+        assert!(milestones[0].patterns.is_empty());
+    }
+
+    #[test]
+    fn patterns_none_is_explicitly_empty() {
+        let text = "## MILESTONE: a\nRISK: EASY\nPATTERNS: none\nTASK: A.\n";
+        let milestones = parse_milestone_plan(text);
+        assert!(milestones[0].patterns.is_empty());
+    }
+
+    #[test]
+    fn patterns_do_not_leak_between_milestones() {
+        let text = "\
+## MILESTONE: a\nRISK: EASY\nPATTERNS: trait-objects\nTASK: A.\n\n\
+## MILESTONE: b\nRISK: EASY\nTASK: B.\n";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones[0].patterns, vec!["trait-objects".to_string()]);
+        assert!(milestones[1].patterns.is_empty());
+    }
+
     fn milestone(name: &str, depends_on: &[&str]) -> Milestone {
         Milestone {
             name: name.to_string(),
             risk: Risk::Easy,
             task: String::new(),
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            patterns: Vec::new(),
         }
     }
 
@@ -1426,6 +1619,7 @@ mod integration_gate_tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(InferenceResponse {
                 text: self.text.clone(),
+                tool_calls: Vec::new(),
                 input_tokens: 0,
                 output_tokens: 0,
                 provider: "mock".into(),
@@ -1512,6 +1706,31 @@ mod integration_gate_tests {
             "expected a build-failure message, got: {err}"
         );
     }
+
+    #[test]
+    fn ensure_module_declarations_plus_the_gate_resolves_a_real_cross_milestone_type_reference() {
+        // Reproduces a real production failure: one milestone's file uses a type by its flat
+        // crate-root path (`crate::Error`), matching how the schema presents it, while another
+        // milestone actually defines that type in its own module. Before the `pub use`
+        // re-export fix in `ensure_module_declarations`, `cargo build` failed here with "no
+        // `Error` in the root" even though every milestone's own slice built fine alone.
+        let ws = temp_ws("reexport-fix");
+        let registry = Registry::with_providers(Vec::new(), (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let mut merged = sections(&[
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/error.rs", "#[derive(Debug)]\npub struct Error;\n"),
+            (
+                "src/collector.rs",
+                "use crate::Error;\n\npub fn fails() -> Result<(), Error> {\n    Ok(())\n}\n",
+            ),
+        ]);
+        ensure_module_declarations(&mut merged);
+
+        let (_, errors) = mgr.quality_gate(&Manager::format_multi_file(&merged), None);
+        assert!(errors.is_empty(), "expected the crate to build cleanly, got:\n{errors}");
+    }
 }
 
 #[cfg(test)]
@@ -1548,6 +1767,7 @@ mod soundness_gate_tests {
             };
             Ok(InferenceResponse {
                 text,
+                tool_calls: Vec::new(),
                 input_tokens: 0,
                 output_tokens: 0,
                 provider: "mock".into(),
@@ -1672,6 +1892,7 @@ mod gap_fill_tests {
             };
             Ok(InferenceResponse {
                 text,
+                tool_calls: Vec::new(),
                 input_tokens: 0,
                 output_tokens: 0,
                 provider: "mock".into(),
@@ -1704,6 +1925,17 @@ mod gap_fill_tests {
         ws
     }
 
+    /// Offers no tools -- `implement_milestones`'s MilestonePlanner call runs agentically now,
+    /// but with zero tools offered it behaves exactly like the old single-turn call: the
+    /// mock's first reply always has no tool calls, so the loop returns immediately.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
     fn sections(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -1725,7 +1957,7 @@ mod gap_fill_tests {
 
         let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
         let result = mgr
-            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3)
+            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3, &NullToolbox)
             .expect("a fixable gap should resolve, not error");
 
         assert!(result.contains_key("src/extra.rs"));
@@ -1752,7 +1984,7 @@ mod gap_fill_tests {
 
         let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
         let result = mgr
-            .fill_scope_gaps(initial.clone(), "contract", "schema", "worker system", 3)
+            .fill_scope_gaps(initial.clone(), "contract", "schema", "worker system", 3, &NullToolbox)
             .expect("an already-complete plan must not error");
 
         assert_eq!(result, initial);
@@ -1774,7 +2006,7 @@ mod gap_fill_tests {
 
         let initial = sections(&[("src/main.rs", "fn main() {}\n")]);
         let result = mgr
-            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3)
+            .fill_scope_gaps(initial, "contract", "schema", "worker system", 3, &NullToolbox)
             .expect("exhausting gap-fill rounds must not fail the whole run");
 
         assert!(result.contains_key("src/extra.rs"));
@@ -1782,5 +2014,166 @@ mod gap_fill_tests {
 
         let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
         assert!(deviations.contains("may still be incomplete"));
+    }
+}
+
+#[cfg(test)]
+mod pattern_prescription_tests {
+    use super::*;
+    use crate::agents::TARGET_IMPLEMENTER;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::{Arc, Mutex};
+
+    /// Logs every system prompt it's called with, then answers just well enough to keep
+    /// `run_with_dual_review`'s loop moving: SecurityReviewer/MaintenanceReviewer always
+    /// approve, anything else (TargetImplementer) gets a trivial, self-contained crate.
+    struct SystemLogger {
+        log: Arc<Mutex<Vec<String>>>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for SystemLogger {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            self.log.lock().unwrap().push(req.system.clone());
+            let text = if req.system == SECURITY_REVIEWER {
+                "COMPLIANT"
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE"
+            } else {
+                "fn main() {}\n"
+            };
+            Ok(InferenceResponse {
+                text: text.to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-patterns-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    /// Offers no tools -- none of these tests trigger the HARD-split/escalation path that
+    /// would recurse into a MilestonePlanner call, so it's never actually exercised.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
+    fn find_implementer_system(log: &[String]) -> &str {
+        log.iter()
+            .map(String::as_str)
+            .find(|s| *s != SECURITY_REVIEWER && *s != MAINTENANCE_REVIEWER)
+            .expect("expected at least one TargetImplementer call")
+    }
+
+    #[test]
+    fn a_prescribed_pattern_is_appended_to_the_implementer_system_prompt() {
+        let ws = temp_ws("prescribed");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider: Box<dyn Provider> =
+            Box::new(SystemLogger { log: log.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let ms = Milestone {
+            name: "needs-trait-objects".to_string(),
+            risk: Risk::Easy,
+            task: "Do the thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: vec!["trait-objects".to_string()],
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("milestone should implement cleanly");
+
+        let log = log.lock().unwrap();
+        let sent = find_implementer_system(&log);
+        let trait_objects_pattern =
+            crate::agents::IMPLEMENTER_PATTERNS.iter().find(|p| p.name == "trait-objects").unwrap();
+        assert!(sent.contains(trait_objects_pattern.content));
+        // A pattern that wasn't prescribed must not ride along for free.
+        let move_semantics_pattern =
+            crate::agents::IMPLEMENTER_PATTERNS.iter().find(|p| p.name == "move-semantics").unwrap();
+        assert!(!sent.contains(move_semantics_pattern.content));
+    }
+
+    #[test]
+    fn no_prescribed_patterns_means_just_the_core_skill() {
+        let ws = temp_ws("unprescribed");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider: Box<dyn Provider> =
+            Box::new(SystemLogger { log: log.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let ms = Milestone {
+            name: "plain".to_string(),
+            risk: Risk::Easy,
+            task: "Do the thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("milestone should implement cleanly");
+
+        let log = log.lock().unwrap();
+        let sent = find_implementer_system(&log);
+        assert_eq!(sent, TARGET_IMPLEMENTER);
+    }
+
+    #[test]
+    fn an_unrecognized_pattern_name_is_dropped_and_logged_as_a_deviation() {
+        let ws = temp_ws("unknown-pattern");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider: Box<dyn Provider> =
+            Box::new(SystemLogger { log: log.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let ms = Milestone {
+            name: "typo".to_string(),
+            risk: Risk::Easy,
+            task: "Do the thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: vec!["trait-object".to_string()], // missing the trailing 's'
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("an unknown pattern name must not fail the milestone");
+
+        let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
+        assert!(deviations.contains("unknown pattern"));
     }
 }

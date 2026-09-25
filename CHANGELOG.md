@@ -2,6 +2,42 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2]
+
+### Added
+
+- Agentic tool-calling. Every pipeline stage that used to get the whole V1 source tree
+  (and every upstream artifact) pasted directly into its prompt — ObjectiveContract,
+  test-matrix refinement, inductive analysis, schema design, and MilestonePlanner's own
+  planning call — now reads what it actually needs on demand instead: `list_files`,
+  `read_file`, `read_artifact`/`write_artifact`, and `fan_out` for delegating genuinely
+  independent sub-questions to concurrent copies of itself. Implemented as real tool
+  calling in `inference-providers` (Anthropic and OpenAI-compatible backends — the two
+  paths actually in use — with the registry refusing to route a tool-bearing request to
+  a provider that can't handle it, and pinning a multi-turn conversation to whichever
+  provider served its first turn). `main.rs`'s stage sequence is unchanged; each stage
+  just gets a source-directory path and a toolbox instead of a pre-read blob.
+- Implementer pattern library. `TargetImplementer`'s core skill was becoming an
+  ever-growing dumping ground for every domain-specific gotcha found in this project's
+  history. Domain patterns (path handling, move semantics, error handling, trait
+  objects) are now separate, optional files MilestonePlanner can prescribe per milestone
+  by name — most milestones need none of them, so most calls stay small.
+
+### Fixed
+
+- Validated the tool-calling loop against a live backend and found a real bug before it
+  shipped: the agentic turn budget was wired to the same `--max-iter` used for the
+  review-revision loop, so two turns of legitimate file exploration could exhaust the
+  entire budget before the model ever got to answer, failing the whole run. Turn budget
+  is now a separate, more generous constant.
+- `ensure_module_declarations` only ever added `mod` lines, never `pub use` re-exports.
+  A milestone writes its file assuming a flat namespace (`crate::Error`, matching how
+  the schema presents it) with no visibility into which sibling module will actually
+  define that type — without a re-export, that reference doesn't resolve. Root-caused
+  against a real run that failed the (now working) integration gate for exactly this
+  reason; fixed by re-exporting every module's public items at the crate root, not just
+  declaring the module.
+
 ## [0.3.1]
 
 ### Added

@@ -89,6 +89,7 @@ impl Provider for OllamaProvider {
 
         Ok(InferenceResponse {
             text,
+            tool_calls: Vec::new(),
             input_tokens: json["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
             output_tokens: json["eval_count"].as_u64().unwrap_or(0) as u32,
             provider: "ollama".into(),

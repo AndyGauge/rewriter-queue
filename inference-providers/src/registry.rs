@@ -317,6 +317,50 @@ impl Registry {
         Err(ProviderError::RateLimit)
     }
 
+    /// Continue a multi-turn tool-calling conversation on the SAME provider that served an
+    /// earlier turn. Conversation history (prior tool calls/results) is encoded in each
+    /// backend's own wire format, so it can't be replayed against a different provider that
+    /// never saw the earlier turns -- unlike `complete`, this never falls through to another
+    /// provider on failure; a mid-conversation failure has to restart the whole conversation,
+    /// not silently continue somewhere that doesn't share its history.
+    pub fn complete_pinned(
+        &self,
+        provider_name: &str,
+        req: &InferenceRequest,
+    ) -> Result<InferenceResponse, ProviderError> {
+        const MAX_GLOBAL_RETRIES: u32 = 4;
+        let slot = self
+            .slots
+            .iter()
+            .find(|s| s.provider.name() == provider_name)
+            .ok_or_else(|| ProviderError::Unavailable(format!("provider \"{provider_name}\" not found")))?;
+
+        for attempt in 0..=MAX_GLOBAL_RETRIES {
+            match slot.provider.complete(req) {
+                Ok(resp) => {
+                    let mut m = slot.metrics.lock().unwrap();
+                    m.record_latency(resp.latency_ms);
+                    m.record_success(Instant::now());
+                    return Ok(resp);
+                }
+                Err(ProviderError::RateLimit) if attempt < MAX_GLOBAL_RETRIES => {
+                    slot.metrics.lock().unwrap().record_rate_limit(Instant::now());
+                    eprintln!(
+                        "    [{provider_name}] rate limited (pinned conversation) — waiting 65s \
+                         (attempt {}/{MAX_GLOBAL_RETRIES})...",
+                        attempt + 1
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(65));
+                }
+                Err(e) => {
+                    slot.metrics.lock().unwrap().push_error_sample(true, Instant::now());
+                    return Err(e);
+                }
+            }
+        }
+        Err(ProviderError::RateLimit)
+    }
+
     fn try_complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let hora_depth = req.hora_depth;
         let est_input = (req.user.len() + req.system.len()) as u32 / 4;
@@ -330,6 +374,12 @@ impl Registry {
             .filter(|s| {
                 // Filter by tier capability
                 s.provider.models().iter().any(|m| tier_compatible(m.tier, req.tier))
+            })
+            .filter(|s| {
+                // A tool-calling conversation can't run on a provider that doesn't implement
+                // tool calling -- it would either reject the request or silently ignore
+                // `tools`, answering as if it had never been offered them.
+                req.tools.is_empty() || s.provider.supports_tools()
             })
             .collect();
 

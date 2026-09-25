@@ -1,5 +1,5 @@
 use super::Provider;
-use crate::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+use crate::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError, Turn};
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -32,19 +32,55 @@ impl Provider for OpenAiCompatProvider {
 
     fn is_available(&self) -> bool { !self.base_url.is_empty() }
 
+    fn supports_tools(&self) -> bool { true }
+
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let model = self.models.first()
             .map(|m| m.model.as_str())
             .unwrap_or("gpt-4o");
 
-        let body = json!({
+        let mut messages = vec![
+            json!({"role": "system", "content": req.system}),
+            json!({"role": "user", "content": req.user}),
+        ];
+        for turn in &req.history {
+            match turn {
+                Turn::Assistant { text, tool_calls } if tool_calls.is_empty() => {
+                    messages.push(json!({"role": "assistant", "content": text}));
+                }
+                Turn::Assistant { text, tool_calls } => {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": if text.is_empty() { Value::Null } else { Value::String(text.clone()) },
+                        "tool_calls": tool_calls.iter().map(|c| json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.arguments.to_string()},
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+                Turn::ToolResults(results) => {
+                    for r in results {
+                        messages.push(json!({
+                            "role": "tool", "tool_call_id": r.id, "content": r.content,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let mut body = json!({
             "model": model,
             "max_tokens": req.max_tokens,
-            "messages": [
-                {"role": "system", "content": req.system},
-                {"role": "user",   "content": req.user}
-            ]
+            "messages": messages,
         });
+        if !req.tools.is_empty() {
+            let tools: Vec<Value> = req.tools.iter().map(|t| json!({
+                "type": "function",
+                "function": {"name": t.name, "description": t.description, "parameters": t.parameters},
+            })).collect();
+            body["tools"] = Value::Array(tools);
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let start = Instant::now();
@@ -70,16 +106,37 @@ impl Provider for OpenAiCompatProvider {
         let json: Value = resp.into_json()
             .map_err(|e| ProviderError::BadResponse(e.to_string()))?;
 
-        let text = json["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| ProviderError::BadResponse(format!("unexpected: {json}")))?
-            .to_string();
+        let message = &json["choices"][0]["message"];
+        let tool_calls: Vec<crate::types::ToolCall> = message["tool_calls"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        let id = tc["id"].as_str()?.to_string();
+                        let name = tc["function"]["name"].as_str()?.to_string();
+                        let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                        let arguments = serde_json::from_str(args_str).unwrap_or(Value::Null);
+                        Some(crate::types::ToolCall { id, name, arguments })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let text = if tool_calls.is_empty() {
+            message["content"]
+                .as_str()
+                .ok_or_else(|| ProviderError::BadResponse(format!("unexpected: {json}")))?
+                .to_string()
+        } else {
+            message["content"].as_str().unwrap_or("").to_string()
+        };
 
         let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
         let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
 
         Ok(InferenceResponse {
             text,
+            tool_calls,
             input_tokens,
             output_tokens,
             provider: self.name.clone(),

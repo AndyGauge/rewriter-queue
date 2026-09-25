@@ -15,6 +15,7 @@ Respond with one block per milestone, in implementation order (earlier milestone
 ## MILESTONE: <short kebab-case name, e.g. research-database>
 RISK: EASY
 DEPENDS_ON: <see below>
+PATTERNS: <see below>
 TASK: <a self-contained paragraph telling an implementer exactly what this milestone
 covers — which struct/trait/module, which contract behaviors and edge cases apply to
 it, and which V1 logic it corresponds to. An implementer given only this paragraph,
@@ -56,3 +57,19 @@ calling something independent when it isn't. When in doubt, leave the default
 (sequential) and let it depend on the previous milestone; fan-out is an optimization
 for genuinely separable work (two unrelated modules that only share types the schema
 already nailed down), not something to reach for by default.
+
+## PATTERNS: prescribe deeper guidance only where it's actually needed
+
+The task context you're given includes a catalog of available implementer patterns —
+short name plus one-line description each, e.g. `trait-objects: Box<dyn Trait> field
+ergonomics...`. These are optional, domain-specific rules the implementer can be handed
+on top of its core skill. Most milestones need none of them; the core skill alone is
+enough for straightforward struct/method work.
+
+Write `PATTERNS: <name>, <name>` only when this specific milestone's task genuinely
+touches that domain — for example, a milestone whose schema has a `Box<dyn Trait>`
+field gets `PATTERNS: trait-objects`; a milestone that's just plain data collection
+methods gets no `PATTERNS` line at all. Naming a pattern that doesn't apply wastes
+the implementer's attention on irrelevant guidance for that milestone's task, the same
+problem this exists to solve in reverse — be as targeted prescribing patterns as you
+are decomposing the work itself.

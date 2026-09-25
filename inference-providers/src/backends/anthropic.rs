@@ -1,5 +1,5 @@
 use super::Provider;
-use crate::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+use crate::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError, Turn};
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -24,17 +24,49 @@ impl Provider for AnthropicProvider {
 
     fn is_available(&self) -> bool { !self.api_key.is_empty() }
 
+    fn supports_tools(&self) -> bool { true }
+
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let model = self.models.first()
             .map(|m| m.model.as_str())
             .unwrap_or("claude-sonnet-4-6");
 
-        let body = json!({
+        let mut messages = vec![json!({"role": "user", "content": req.user})];
+        for turn in &req.history {
+            match turn {
+                Turn::Assistant { text, tool_calls } => {
+                    let mut content: Vec<Value> = Vec::new();
+                    if !text.is_empty() {
+                        content.push(json!({"type": "text", "text": text}));
+                    }
+                    for c in tool_calls {
+                        content.push(json!({
+                            "type": "tool_use", "id": c.id, "name": c.name, "input": c.arguments,
+                        }));
+                    }
+                    messages.push(json!({"role": "assistant", "content": content}));
+                }
+                Turn::ToolResults(results) => {
+                    let content: Vec<Value> = results.iter().map(|r| json!({
+                        "type": "tool_result", "tool_use_id": r.id, "content": r.content,
+                    })).collect();
+                    messages.push(json!({"role": "user", "content": content}));
+                }
+            }
+        }
+
+        let mut body = json!({
             "model": model,
             "max_tokens": req.max_tokens,
             "system": req.system,
-            "messages": [{"role": "user", "content": req.user}]
+            "messages": messages,
         });
+        if !req.tools.is_empty() {
+            let tools: Vec<Value> = req.tools.iter().map(|t| json!({
+                "name": t.name, "description": t.description, "input_schema": t.parameters,
+            })).collect();
+            body["tools"] = Value::Array(tools);
+        }
 
         let start = Instant::now();
 
@@ -57,13 +89,35 @@ impl Provider for AnthropicProvider {
         let json: Value = resp.into_json()
             .map_err(|e| ProviderError::BadResponse(e.to_string()))?;
 
-        let text = json["content"][0]["text"]
-            .as_str()
-            .ok_or_else(|| ProviderError::BadResponse(format!("unexpected: {json}")))?
-            .to_string();
+        let blocks = json["content"].as_array().cloned().unwrap_or_default();
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for block in &blocks {
+            match block["type"].as_str() {
+                Some("text") => {
+                    if let Some(t) = block["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
+                        tool_calls.push(crate::types::ToolCall {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments: block["input"].clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if text.is_empty() && tool_calls.is_empty() {
+            return Err(ProviderError::BadResponse(format!("unexpected: {json}")));
+        }
 
         Ok(InferenceResponse {
             text,
+            tool_calls,
             input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
             provider: "anthropic".into(),

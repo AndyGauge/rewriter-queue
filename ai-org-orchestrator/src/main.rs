@@ -3,6 +3,7 @@ mod manager;
 mod patch;
 mod quality;
 mod synthesis;
+mod tools;
 mod workspace;
 
 use agents::*;
@@ -10,6 +11,7 @@ use inference_providers::Registry;
 use manager::Manager;
 use std::collections::HashMap;
 use std::path::Path;
+use tools::PipelineToolbox;
 use workspace::{read_source_dir, Workspace};
 
 struct Args {
@@ -182,16 +184,13 @@ fn main() {
     let mission = ws.get_mission();
     eprintln!("Mission: {} bytes", mission.len());
 
-    let v1_source =
-        read_source_dir(Path::new(&args.source)).expect("cannot read source dir");
-    if v1_source.trim().is_empty() {
+    if !tools::source_dir_has_readable_files(Path::new(&args.source)) {
         eprintln!(
             "error: no readable source files found under {} (empty dir, or every file is binary/non-UTF-8)",
             args.source
         );
         std::process::exit(1);
     }
-    eprintln!("V1 source: {} bytes across all files", v1_source.len());
 
     // Emit V2 Cargo.toml now so the quality gate can run cargo during synthesis.
     let source_cargo = std::fs::read_to_string(Path::new(&args.source).join("Cargo.toml"))
@@ -212,6 +211,14 @@ fn main() {
     };
     ws.emit_artifact("v2/Cargo.toml", &v2_cargo).unwrap();
 
+    // Every early stage below reads V1 source and prior artifacts on demand instead of
+    // having them pasted into its prompt (see `tools::PipelineToolbox`) -- a fresh toolbox
+    // per stage, since `fan_out` sub-tasks are answered by "the same role" as whichever
+    // stage spawned them.
+    let toolbox_for = |agent: &str, system: &str| {
+        PipelineToolbox::new(&args.source, &ws, &mgr, agent, system, manager::AGENTIC_MAX_TURNS)
+    };
+
     // ── 1. ObjectiveContract ──────────────────────────────────────────────────
     let contract = if let Ok(cached) = ws.get_artifact("objective_contract.md") {
         eprintln!("==> ObjectiveContract (resuming from checkpoint)");
@@ -220,9 +227,11 @@ fn main() {
         eprintln!("==> ObjectiveContract");
         let contract_task = format!(
             "# Mission\n{mission}\n\n\
-             # V1 Source\n```rust\n{v1_source}\n```\n\n\
-             Produce the ObjectiveContract. Record deviations you observe — do not implement them."
+             Produce the ObjectiveContract. V1 source has not been pasted in — read whatever \
+             files you actually need with your tools (list_files/read_file). Record \
+             deviations you observe — do not implement them."
         );
+        let toolbox = toolbox_for("MissionArchitect", MISSION_ARCHITECT);
         let c = mgr
             .run_with_review(
                 "MissionArchitect",
@@ -232,6 +241,7 @@ fn main() {
                 &contract_task,
                 "APPROVED",
                 args.max_iter,
+                &toolbox,
             )
             .expect("contract phase failed");
         ws.emit_artifact("objective_contract.md", &c).unwrap();
@@ -247,13 +257,14 @@ fn main() {
         eprintln!("==> Test matrix refinement");
         let raw_matrix = ws.read_test_matrix().unwrap_or_default();
         let te_task = format!(
-            "# ObjectiveContract\n{contract}\n\n\
-             # V1 Source\n```rust\n{v1_source}\n```\n\n\
-             # Raw Test Matrix\n{raw_matrix}\n\n\
-             For each test case, determine concrete inputs and expected V1 outputs."
+            "# Raw Test Matrix\n{raw_matrix}\n\n\
+             Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), then \
+             read whatever V1 source files you need with list_files/read_file. For each test \
+             case, determine concrete inputs and expected V1 outputs."
         );
+        let toolbox = toolbox_for("TestEngineer", TEST_ENGINEER);
         let r = mgr
-            .run("TestEngineer", TEST_ENGINEER, &te_task)
+            .run_agentic("TestEngineer", TEST_ENGINEER, &te_task, &toolbox, manager::AGENTIC_MAX_TURNS)
             .expect("test engineer failed");
         ws.emit_artifact("refined_test_matrix.json", &r).unwrap();
         r
@@ -267,14 +278,14 @@ fn main() {
         cached
     } else {
         eprintln!("==> Inductive analysis");
-        let ir_task = format!(
-            "# ObjectiveContract\n{contract}\n\n\
-             # V1 Source\n```rust\n{v1_source}\n```\n\n\
-             Analyze V1 as a system. Surface implicit invariants, systemic patterns, \
-             architectural analogies, and risk zones."
-        );
+        let ir_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
+             then analyze V1 as a system using list_files/read_file. Surface implicit \
+             invariants, systemic patterns, architectural analogies, and risk zones. For a \
+             large source tree, use fan_out to analyze independent subsystems concurrently, \
+             then weave the results together yourself.";
+        let toolbox = toolbox_for("InductiveReasoner", INDUCTIVE_REASONER);
         let i = mgr
-            .run("InductiveReasoner", INDUCTIVE_REASONER, &ir_task)
+            .run_agentic("InductiveReasoner", INDUCTIVE_REASONER, ir_task, &toolbox, manager::AGENTIC_MAX_TURNS)
             .expect("inductive reasoner failed");
         ws.emit_artifact("inductive_analysis.md", &i).unwrap();
         i
@@ -287,15 +298,14 @@ fn main() {
         cached
     } else {
         eprintln!("==> Schema");
-        let schema_task = format!(
-            "# ObjectiveContract\n{contract}\n\n\
-             # Inductive Analysis\n{inductive}\n\n\
-             # V1 Source\n```rust\n{v1_source}\n```\n\n\
-             Design the Rust type system and public API stubs for V2. \
-             Preserve the implicit invariants identified in the Inductive Analysis."
-        );
+        let schema_task = "Read the ObjectiveContract (read_artifact(\"objective_contract.md\")) \
+             and the Inductive Analysis (read_artifact(\"inductive_analysis.md\")), then read \
+             whatever V1 source you need with list_files/read_file. Design the Rust type \
+             system and public API stubs for V2. Preserve the implicit invariants identified \
+             in the Inductive Analysis.";
+        let toolbox = toolbox_for("SchemaArchitect", SCHEMA_ARCHITECT);
         let s = mgr
-            .run("SchemaArchitect", SCHEMA_ARCHITECT, &schema_task)
+            .run_agentic("SchemaArchitect", SCHEMA_ARCHITECT, schema_task, &toolbox, manager::AGENTIC_MAX_TURNS)
             .expect("schema phase failed");
         ws.emit_artifact("schema.rs", &s).unwrap();
         s
@@ -308,7 +318,12 @@ fn main() {
         cached
     } else {
         eprintln!("==> V2 synthesis");
+        // Only the legacy byte-size chunk fan-out path (large source, multiple heavy
+        // providers) still needs the literal concatenated text, for splitting -- the
+        // milestone path above reads source on demand via `toolbox` instead.
+        let v1_source = read_source_dir(Path::new(&args.source)).expect("cannot read source dir");
         let test_matrix = ws.read_test_matrix().unwrap_or_default();
+        let toolbox = toolbox_for("MilestonePlanner", MILESTONE_PLANNER);
         let v = mgr
             .synthesize(
                 TARGET_IMPLEMENTER,
@@ -318,6 +333,7 @@ fn main() {
                 &test_matrix,
                 &inductive,
                 args.max_iter,
+                &toolbox,
             )
             .expect("synthesis failed");
         ws.emit_artifact("v2.rs", &v).unwrap();

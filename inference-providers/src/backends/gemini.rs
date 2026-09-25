@@ -88,6 +88,7 @@ impl Provider for GeminiProvider {
 
         Ok(InferenceResponse {
             text,
+            tool_calls: Vec::new(),
             input_tokens,
             output_tokens,
             provider: "gemini".into(),
