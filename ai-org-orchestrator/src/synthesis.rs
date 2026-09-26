@@ -997,6 +997,17 @@ impl<'a> Manager<'a> {
     /// `implement_milestones` so the exact same logic runs whether this milestone is the
     /// lone member of a sequential wave or one of several running concurrently in a fan-out
     /// wave — `variant` is the only thing that differs between those two calling contexts.
+    ///
+    /// Both escalation paths below (HARD-risk, and convergence-failure) fall back rather than
+    /// trusting the recursive re-split unconditionally: a real run found MilestonePlanner
+    /// declining to split further (or producing a response `parse_milestone_plan` couldn't
+    /// read into any milestones), and the escalation branches used to just `return` that empty
+    /// result directly — silently dropping the milestone's work rather than falling back to
+    /// something. Now an empty re-split falls through instead: a HARD-risk milestone that got
+    /// no usable split just gets attempted directly (it was never attempted before escalating,
+    /// so there's nothing else to fall back to), and a convergence-failure milestone that got
+    /// no usable split keeps its own pre-escalation best-effort attempt instead of discarding
+    /// it for nothing.
     fn implement_one_milestone(
         &self,
         id_prefix: &str,
@@ -1024,10 +1035,32 @@ impl<'a> Manager<'a> {
                     milestone.name
                 ),
             )?;
-            return self.implement_milestones(
+            let sub = self.implement_milestones(
                 &ms_id, &milestone.task, worker_system, contract, schema, max_iter, depth + 1,
                 variant, toolbox,
+            )?;
+            if !sub.is_empty() {
+                return Ok(sub);
+            }
+            // MilestonePlanner declined to split it further, or its response didn't parse into
+            // any milestones -- either way there's nothing to fall back to but attempting the
+            // milestone directly, since a HARD-risk milestone is never attempted before it
+            // escalates. Falls through to the ordinary implementation path below rather than
+            // returning the empty result and silently dropping this milestone's work.
+            eprintln!(
+                "  [milestones] '{}' escalation produced no usable sub-milestones — \
+                 attempting it directly instead of dropping its work entirely",
+                milestone.name
             );
+            self.ws.log_deviation(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' was flagged HARD and escalated for a split, but \
+                     MilestonePlanner's response produced no usable milestones — attempting \
+                     it directly instead of silently dropping its work.",
+                    milestone.name
+                ),
+            )?;
         }
 
         let base_task = format!(
@@ -1098,10 +1131,32 @@ impl<'a> Manager<'a> {
                  Split it into two or more smaller, independently-implementable pieces.",
                 milestone.task
             );
-            return self.implement_milestones(
+            let sub = self.implement_milestones(
                 &ms_id, &retry_task, worker_system, contract, schema, max_iter, depth + 1,
                 variant, toolbox,
+            )?;
+            if !sub.is_empty() {
+                return Ok(sub);
+            }
+            // MilestonePlanner declined to split it further, or its response didn't parse into
+            // any milestones. Falls through to the acceptance path below with the ORIGINAL
+            // `code`/`passed` from the attempt just above, instead of returning the empty
+            // result and discarding that best-effort work for nothing.
+            eprintln!(
+                "  [milestones] '{}' escalation produced no usable sub-milestones — accepting \
+                 the pre-escalation best-effort attempt instead of dropping its work entirely",
+                milestone.name
             );
+            self.ws.log_deviation(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' did not converge and was escalated for a split, but \
+                     MilestonePlanner's response produced no usable milestones — accepting \
+                     the pre-escalation best-effort attempt instead of silently dropping its \
+                     work.",
+                    milestone.name
+                ),
+            )?;
         }
 
         if !passed {
@@ -2472,5 +2527,167 @@ mod system_test_writer_tests {
             .expect_err("a failing system test must fail the run");
 
         assert!(err.to_string().contains("does not build"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod escalation_fallback_tests {
+    use super::*;
+    use crate::agents::TARGET_IMPLEMENTER;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Answers MilestonePlanner with plain prose that `parse_milestone_plan` reads as zero
+    /// milestones -- reproducing a real run (job #14) where the escalation call declined to
+    /// split further. TargetImplementer always gets the same canned `implementer_reply`;
+    /// SecurityReviewer/MaintenanceReviewer always approve, so whatever `implementer_reply`
+    /// says is what decides whether the milestone's quality gate passes.
+    struct DecliningPlanner {
+        implementer_reply: String,
+        planner_calls: Arc<AtomicUsize>,
+        implementer_calls: Arc<AtomicUsize>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for DecliningPlanner {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            let text = if req.system == MILESTONE_PLANNER {
+                self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                "This milestone is already as small as it can usefully get -- no further split \
+                 is warranted."
+                    .to_string()
+            } else if req.system == SECURITY_REVIEWER {
+                "COMPLIANT".to_string()
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE".to_string()
+            } else {
+                self.implementer_calls.fetch_add(1, Ordering::SeqCst);
+                self.implementer_reply.clone()
+            };
+            Ok(InferenceResponse {
+                text,
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-escalation-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    /// Offers no tools -- `DecliningPlanner` answers from plain text alone, never a tool call.
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
+    #[test]
+    fn hard_risk_milestone_is_attempted_directly_when_escalation_returns_no_milestones() {
+        let ws = temp_ws("hard");
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let implementer_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn Provider> = Box::new(DecliningPlanner {
+            implementer_reply: "fn main() {}\n".to_string(),
+            planner_calls: planner_calls.clone(),
+            implementer_calls: implementer_calls.clone(),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let ms = Milestone {
+            name: "hard-one".to_string(),
+            risk: Risk::Hard,
+            task: "Do something hard.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+        };
+        let result = mgr
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("a HARD milestone must still be attempted when its escalation splits into nothing");
+
+        assert_eq!(planner_calls.load(Ordering::SeqCst), 1, "the HARD-risk escalation must have been tried");
+        assert_eq!(
+            implementer_calls.load(Ordering::SeqCst),
+            1,
+            "must fall through to a direct attempt instead of returning the empty re-split"
+        );
+        assert_eq!(result.get("src/main.rs").map(String::as_str), Some("fn main() {}\n"));
+
+        let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
+        assert!(deviations.contains("attempting it directly instead of silently dropping its work"));
+    }
+
+    #[test]
+    fn convergence_failure_keeps_the_best_effort_attempt_when_escalation_returns_no_milestones() {
+        let ws = temp_ws("converge");
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let implementer_calls = Arc::new(AtomicUsize::new(0));
+        // Syntactically valid but never buildable (unresolved name) -- `run_with_dual_review`
+        // never converges within the 2-iteration budget below, so `implement_one_milestone`
+        // escalates; `DecliningPlanner` then declines the split and this reply is all there is
+        // to fall back to.
+        let broken = "fn main() {\n    undefined_fn();\n}\n";
+        let provider: Box<dyn Provider> = Box::new(DecliningPlanner {
+            implementer_reply: broken.to_string(),
+            planner_calls: planner_calls.clone(),
+            implementer_calls: implementer_calls.clone(),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        let ms = Milestone {
+            name: "flaky-one".to_string(),
+            risk: Risk::Easy,
+            task: "Do something that never converges.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+        };
+        let result = mgr
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 2, 0, None, &NullToolbox)
+            .expect("a non-converging milestone whose escalation splits into nothing must still return its best effort");
+
+        assert_eq!(planner_calls.load(Ordering::SeqCst), 1, "the convergence-failure escalation must have been tried");
+        assert!(implementer_calls.load(Ordering::SeqCst) >= 1);
+        let got = result.get("src/main.rs").expect("the pre-escalation best-effort attempt must not be dropped");
+        assert!(got.contains("undefined_fn"), "must be the actual best-effort content, not empty: {got}");
+
+        let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
+        assert!(deviations.contains("accepting the pre-escalation best-effort attempt instead of silently dropping its work"));
     }
 }

@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.3]
+
+### Fixed
+
+- Escalating a milestone to MilestonePlanner for a re-split could silently discard that
+  milestone's work entirely. Both escalation paths in `implement_one_milestone` (a
+  HARD-risk milestone, and one that didn't converge in its iteration budget) `return`ed
+  the recursive re-split's result directly and unconditionally — but MilestonePlanner
+  can decline to split further, or answer with something `parse_milestone_plan` can't
+  read into any milestones, either of which comes back as an empty map. Root-caused
+  against a real run (job #14: "0 milestone(s) scheduled into 0 waves"). An empty
+  re-split now falls through instead of being returned as-is: the HARD-risk path
+  attempts the milestone directly (it was never attempted before escalating, so
+  there's nothing else to fall back to), and the convergence-failure path keeps its own
+  pre-escalation best-effort attempt rather than discarding it for nothing.
+
 ## [0.4.2]
 
 ### Fixed
