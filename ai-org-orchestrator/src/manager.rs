@@ -322,11 +322,11 @@ impl<'a> Manager<'a> {
 
         let patch_task = format!(
             "{base_task}\n\n\
-             # Current Output (line numbers shown for reference — not part of the document)\n{}\n\n\
+             # Current Output\n{}\n\n\
              # Review Feedback ({label})\n{review_feedback}\n\n\
              Address the feedback above with a minimal patch instead of rewriting the whole \
              document. {}",
-            crate::patch::format_multi_file_numbered(&sections),
+            Self::format_multi_file(&sections),
             crate::patch::PATCH_FORMAT_INSTRUCTIONS,
         );
         let patch_text = self.run(worker_name, worker_system, &patch_task)?;

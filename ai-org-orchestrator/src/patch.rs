@@ -1,358 +1,251 @@
+//! Unified-diff patching (the same format `git diff`/`diff -u` produce). Replaced two earlier,
+//! bespoke formats (a custom SEARCH/REPLACE block, and an even more bespoke 1-indexed
+//! line-range block) that real jobs kept getting wrong in the same handful of ways: mixing the
+//! two formats' closing markers, miscounting line ranges, and not knowing a brand-new file
+//! needed a third convention entirely (`// === path ===`) instead of either patch form. Unified
+//! diff collapses all three into one format that's almost certainly the single most-represented
+//! "here is a code change" pattern in any model's training data (every `git diff`, every GitHub
+//! PR, endless tutorials), and it has its own standard convention for a new file
+//! (`--- /dev/null`) instead of needing a separate marker style layered on top.
+//!
+//! Deliberately not a byte-for-byte implementation of `patch`/`git apply`: hunk headers
+//! (`@@ -a,b +c,d @@`) are parsed only as a boundary between hunks, never trusted for where a
+//! hunk applies -- that's resolved the same way the old SEARCH/REPLACE format did it, by
+//! requiring the hunk's own context/removed lines to match the current file's content exactly
+//! once. A model that gets its line-count arithmetic wrong (a real, recurring failure with the
+//! old line-range format) still produces a hunk that applies correctly here, because the
+//! numbers were never load-bearing in the first place.
+
 use std::collections::HashMap;
 
-/// SEARCH/REPLACE patching: best for a short, uniquely-identifiable snippet. Self-contained —
-/// its `Edit` type, parser, and applier live only here, so it can be reused or dropped without
-/// touching `line_range`.
-mod search_replace {
-    /// `## FILE: <path>\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE`
-    pub struct Edit {
-        pub file: String,
-        pub search: String,
-        pub replace: String,
-    }
-
-    /// Parses one block's body. The caller has already consumed `## FILE: <path>` and
-    /// confirmed the next line is `<<<<<<< SEARCH`.
-    pub fn parse_body(
-        file: String,
-        lines: &mut std::iter::Peekable<std::str::Lines>,
-    ) -> Result<Edit, String> {
-        let mut search_lines = Vec::new();
-        let mut replace_lines = Vec::new();
-        let mut in_replace = false;
-        let mut closed = false;
-        for l in lines.by_ref() {
-            match l.trim() {
-                "=======" => {
-                    in_replace = true;
-                    continue;
-                }
-                ">>>>>>> REPLACE" => {
-                    closed = true;
-                    break;
-                }
-                _ => {}
-            }
-            if in_replace {
-                replace_lines.push(l);
-            } else {
-                search_lines.push(l);
-            }
-        }
-        if !closed {
-            return Err(format!("unterminated SEARCH/REPLACE block for {file}"));
-        }
-        Ok(Edit { file, search: search_lines.join("\n"), replace: replace_lines.join("\n") })
-    }
-
-    /// Apply one file's SEARCH/REPLACE edits, in order, against `content`. Every SEARCH
-    /// snippet must match exactly once — zero matches means the model didn't copy the
-    /// existing text correctly, more than one means it needs more surrounding context to be
-    /// unambiguous. Both are reported as errors rather than guessed at.
-    pub fn apply(file: &str, mut content: String, edits: &[Edit]) -> Result<String, String> {
-        for edit in edits {
-            let occurrences = content.matches(edit.search.as_str()).count();
-            if occurrences == 0 {
-                return Err(format!(
-                    "SEARCH text not found in {file} — it must match the current file content \
-                     exactly, including whitespace:\n{}",
-                    edit.search
-                ));
-            }
-            if occurrences > 1 {
-                return Err(format!(
-                    "SEARCH text in {file} matches {occurrences} places — include more \
-                     surrounding context to make it unique:\n{}",
-                    edit.search
-                ));
-            }
-            content = content.replacen(&edit.search, &edit.replace, 1);
-        }
-        Ok(content)
-    }
+/// One hunk's before/after content, derived from its `-`/`+`/` `-prefixed lines. `old_block` is
+/// what must exist in the current file to locate this hunk (context + removed lines, in order);
+/// `new_block` is what it becomes (context + added lines, in order). Both are joined with `\n`
+/// so they can be matched/substituted as one contiguous block, the same technique the old
+/// SEARCH/REPLACE format used -- unified diff just derives the two blocks from `-`/`+`/` `
+/// prefixes instead of separate `<<<<<<< SEARCH`/`=======`/`>>>>>>> REPLACE` sections.
+struct Hunk {
+    old_block: String,
+    new_block: String,
 }
 
-/// Line-range patching: best for swapping out a whole method/block, or anywhere counting
-/// exact lines is easier than reproducing exact text. Self-contained, same reasoning as
-/// `search_replace`.
-mod line_range {
-    /// `## FILE: <path>:<start>-<end>\n<<<<<<< NEW\n...\n>>>>>>> NEW`. 1-indexed, inclusive.
-    /// `end + 1 == start` (e.g. `12-11`) marks a pure insertion before line `start`, adding
-    /// `content_lines` without removing anything.
-    pub struct Edit {
-        pub file: String,
-        pub start: usize,
-        pub end: usize,
-        pub content_lines: Vec<String>,
-    }
-
-    impl Edit {
-        fn is_insert(&self) -> bool {
-            self.end + 1 == self.start
-        }
-    }
-
-    /// Parses one block's body. The caller has already split `<path>:<start>-<end>` and
-    /// confirmed the next line is `<<<<<<< NEW`.
-    pub fn parse_body(
-        file: String,
-        start: usize,
-        end: usize,
-        lines: &mut std::iter::Peekable<std::str::Lines>,
-    ) -> Result<Edit, String> {
-        let mut content_lines = Vec::new();
-        let mut closed = false;
-        for l in lines.by_ref() {
-            if l.trim() == ">>>>>>> NEW" {
-                closed = true;
-                break;
-            }
-            content_lines.push(l.to_string());
-        }
-        if !closed {
-            return Err(format!("unterminated `<<<<<<< NEW` block for {file}:{start}-{end}"));
-        }
-        Ok(Edit { file, start, end, content_lines })
-    }
-
-    /// Apply one file's line-range edits together. Edits are applied from the bottom up
-    /// (highest `start` first) so an earlier edit's line numbers — computed against the
-    /// file's original content — are never shifted by a later one having already changed the
-    /// line count above it. Two edits that touch the same line, or share a start line, are
-    /// rejected as ambiguous rather than guessed at.
-    pub fn apply(file: &str, content: &str, mut edits: Vec<Edit>) -> Result<String, String> {
-        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-        let total = lines.len();
-
-        edits.sort_by_key(|e| e.start);
-        for w in edits.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            if a.start == b.start || a.end + 1 > b.start {
-                return Err(format!(
-                    "overlapping or ambiguous edits in {file}: {}-{} and {}-{} both touch the \
-                     same line(s) — combine them into a single edit",
-                    a.start, a.end, b.start, b.end
-                ));
-            }
-        }
-        for edit in &edits {
-            if edit.is_insert() {
-                if edit.start > total + 1 {
-                    return Err(format!(
-                        "{file}:{}-{} is out of range as an insertion point — file has {total} \
-                         line(s), so it must be between 1 and {}",
-                        edit.start,
-                        edit.end,
-                        total + 1
-                    ));
-                }
-            } else if edit.end < edit.start {
-                return Err(format!(
-                    "{file}:{}-{} is invalid — end must be >= start for a replace, or exactly \
-                     start-1 for an insertion before start",
-                    edit.start, edit.end
-                ));
-            } else if edit.end > total {
-                return Err(format!(
-                    "{file}:{}-{} is out of range — file only has {total} line(s)",
-                    edit.start, edit.end
-                ));
-            }
-        }
-
-        for edit in edits.into_iter().rev() {
-            if edit.is_insert() {
-                lines.splice(edit.start - 1..edit.start - 1, edit.content_lines);
-            } else {
-                lines.splice(edit.start - 1..edit.end, edit.content_lines);
-            }
-        }
-        let mut updated = lines.join("\n");
-        updated.push('\n');
-        Ok(updated)
-    }
+/// One file's diff: zero or more hunks under a `--- `/`+++ ` header pair. `is_new_file` is true
+/// when the old side is `/dev/null` -- unified diff's own standard convention for file creation,
+/// used here instead of a separate bespoke "new file" marker.
+struct FileDiff {
+    file: String,
+    is_new_file: bool,
+    hunks: Vec<Hunk>,
 }
 
-enum AnyEdit {
-    SearchReplace(search_replace::Edit),
-    LineRange(line_range::Edit),
+fn is_dev_null(spec: &str) -> bool {
+    let s = spec.trim();
+    s == "/dev/null" || s.ends_with("/dev/null")
 }
 
-impl AnyEdit {
-    fn file(&self) -> &str {
-        match self {
-            AnyEdit::SearchReplace(e) => &e.file,
-            AnyEdit::LineRange(e) => &e.file,
+/// Strip a leading `a/` or `b/` (the conventional prefix `git diff` uses to distinguish the two
+/// sides) if present; a model that omits it and writes the bare path is just as valid.
+fn strip_diff_prefix(spec: &str) -> String {
+    let s = spec.split('\t').next().unwrap_or(spec).trim();
+    s.strip_prefix("a/").or_else(|| s.strip_prefix("b/")).unwrap_or(s).to_string()
+}
+
+/// Parse one hunk's body: every line up to (but not including) the next `@@` hunk marker or
+/// `--- ` file header, or end of input. Tolerant of a context line missing its leading space
+/// (some models drop it on blank lines) and of a trailing `\ No newline at end of file` marker.
+fn parse_hunk_body(lines: &mut std::iter::Peekable<std::str::Lines>) -> Result<Hunk, String> {
+    let mut old_lines = Vec::new();
+    let mut new_lines = Vec::new();
+    let mut any = false;
+
+    while let Some(&peeked) = lines.peek() {
+        if peeked.starts_with("@@") || peeked.starts_with("--- ") {
+            break;
+        }
+        let line = lines.next().unwrap();
+        any = true;
+        if let Some(rest) = line.strip_prefix('-') {
+            old_lines.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix('+') {
+            new_lines.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            old_lines.push(rest.to_string());
+            new_lines.push(rest.to_string());
+        } else if line.starts_with('\\') {
+            continue; // `\ No newline at end of file` and similar -- not content
+        } else if line.trim().is_empty() {
+            old_lines.push(String::new());
+            new_lines.push(String::new());
+        } else {
+            // No recognized prefix on a non-empty line -- ambiguous, but treating it as
+            // unchanged context is a safer default than silently dropping or misfiling it.
+            old_lines.push(line.to_string());
+            new_lines.push(line.to_string());
         }
     }
+
+    if !any {
+        return Err("empty hunk — a `@@ ... @@` line with no content after it".to_string());
+    }
+    Ok(Hunk { old_block: old_lines.join("\n"), new_block: new_lines.join("\n") })
 }
 
-/// Parse a patch made of any mix of the two block forms, one `## FILE:` marker per edit:
-///
-/// - `## FILE: <path>:<start>-<end>` (or `## FILE: <path>:<n>` for one line) followed by
-///   `<<<<<<< NEW` / `>>>>>>> NEW` — a line-range edit.
-/// - `## FILE: <path>` (no trailing `:<range>`) followed by `<<<<<<< SEARCH` / `=======` /
-///   `>>>>>>> REPLACE` — a SEARCH/REPLACE edit.
-///
-/// Both forms are always available and can be mixed freely across, or even within, a single
-/// patch response — whichever fits a given change best.
-fn parse_patch(text: &str) -> Result<Vec<AnyEdit>, String> {
-    let mut edits = Vec::new();
+/// Parse a patch made of one or more unified diffs, one `--- `/`+++ ` header pair per file
+/// followed by one or more `@@ ... @@` hunks.
+fn parse_patch(text: &str) -> Result<Vec<FileDiff>, String> {
+    let mut diffs = Vec::new();
     let mut lines = text.lines().peekable();
 
     while let Some(line) = lines.next() {
-        let Some(rest) = line.trim().strip_prefix("## FILE:") else { continue };
-        let spec = rest.trim();
+        let Some(old_spec) = line.strip_prefix("--- ") else { continue };
+        let Some(new_line) = lines.next() else {
+            return Err(format!(
+                "expected `+++ <path>` right after `--- {}`, got end of input",
+                old_spec.trim()
+            ));
+        };
+        let Some(new_spec) = new_line.strip_prefix("+++ ") else {
+            return Err(format!(
+                "expected `+++ <path>` right after `--- {}`, got {:?}",
+                old_spec.trim(),
+                new_line.trim()
+            ));
+        };
 
-        // A trailing `:<start>-<end>` or `:<n>` makes this a line-range edit; anything else
-        // (a bare path, no such suffix) is a SEARCH/REPLACE edit.
-        let range_spec = spec.rsplit_once(':').and_then(|(path, range)| {
-            let parsed = match range.split_once('-') {
-                Some((a, b)) => {
-                    a.trim().parse::<usize>().ok().zip(b.trim().parse::<usize>().ok())
-                }
-                None => range.trim().parse::<usize>().ok().map(|n| (n, n)),
-            };
-            parsed.map(|(start, end)| (path.to_string(), start, end))
-        });
-
-        if let Some((file, start, end)) = range_spec {
-            if start == 0 {
-                return Err(format!("line numbers are 1-indexed, got start=0 in \"{spec}\""));
-            }
-            let opening = lines.next().map(str::trim);
-            if opening != Some("<<<<<<< NEW") {
-                return Err(format!(
-                    "expected `<<<<<<< NEW` right after `## FILE: {spec}`, got {:?}",
-                    opening.unwrap_or("end of input")
-                ));
-            }
-            edits.push(AnyEdit::LineRange(line_range::parse_body(file, start, end, &mut lines)?));
-        } else {
-            let file = spec.to_string();
-            let opening = lines.next().map(str::trim);
-            if opening != Some("<<<<<<< SEARCH") {
-                return Err(format!(
-                    "expected `<<<<<<< SEARCH` (or a `:<start>-<end>` line range on the \
-                     `## FILE:` line followed by `<<<<<<< NEW`) right after `## FILE: {spec}`, \
-                     got {:?}",
-                    opening.unwrap_or("end of input")
-                ));
-            }
-            edits.push(AnyEdit::SearchReplace(search_replace::parse_body(file, &mut lines)?));
+        let is_new_file = is_dev_null(old_spec);
+        let file = strip_diff_prefix(new_spec);
+        if file.is_empty() {
+            return Err(format!("could not read a file path from `+++ {}`", new_spec.trim()));
         }
+
+        let mut hunks = Vec::new();
+        while let Some(&peeked) = lines.peek() {
+            if !peeked.starts_with("@@") {
+                break;
+            }
+            lines.next();
+            hunks.push(parse_hunk_body(&mut lines)?);
+        }
+        if hunks.is_empty() {
+            return Err(format!("diff for \"{file}\" has no `@@ ... @@` hunks"));
+        }
+        diffs.push(FileDiff { file, is_new_file, hunks });
     }
 
-    if edits.is_empty() {
+    if diffs.is_empty() {
         return Err(
-            "no edits found — expected `## FILE: <path>` + `<<<<<<< SEARCH`/`=======`/\
-             `>>>>>>> REPLACE`, or `## FILE: <path>:<start>-<end>` + `<<<<<<< NEW`/`>>>>>>> NEW`"
+            "no diffs found — expected unified diff format: `--- a/<path>` / `+++ b/<path>` \
+             (or `--- /dev/null` for a brand-new file), each followed by one or more \
+             `@@ ... @@` hunks"
                 .into(),
         );
     }
-    Ok(edits)
+    Ok(diffs)
 }
 
-/// Apply a patch's edits to `sections` (path -> full file content), returning the updated map.
+/// Apply one file's hunks in order against its current content. Each hunk's `old_block` must
+/// match exactly once — zero matches means the model didn't copy the existing context/removed
+/// lines exactly, more than one means it needs more surrounding context to be unambiguous. Both
+/// are reported as errors rather than guessed at, the same contract the old SEARCH/REPLACE
+/// format had.
+fn apply_hunks(file: &str, mut content: String, hunks: &[Hunk]) -> Result<String, String> {
+    for hunk in hunks {
+        if hunk.old_block.is_empty() {
+            return Err(format!(
+                "a hunk for \"{file}\" has no context or removed lines to locate it in the \
+                 existing file — for a brand-new file, diff it against `--- /dev/null` instead"
+            ));
+        }
+        let occurrences = content.matches(hunk.old_block.as_str()).count();
+        if occurrences == 0 {
+            return Err(format!(
+                "hunk context/removed lines not found in {file} — they must match the current \
+                 file content exactly, including whitespace:\n{}",
+                hunk.old_block
+            ));
+        }
+        if occurrences > 1 {
+            return Err(format!(
+                "hunk context in {file} matches {occurrences} places — include more \
+                 surrounding context lines to make it unique:\n{}",
+                hunk.old_block
+            ));
+        }
+        content = content.replacen(&hunk.old_block, &hunk.new_block, 1);
+    }
+    Ok(content)
+}
+
+/// Apply a patch's diffs to `sections` (path -> full file content), returning the updated map.
 /// Every call site (quality-gate repair, integration repair, soundness repair, the single-
-/// document repair in `manager.rs`) shares this one entry point, so both patch styles are
-/// always available everywhere a patch can be applied — never a subset per agent.
-///
-/// When a file has edits of both kinds, line-range edits are applied first (against the
-/// file's original line numbering), then SEARCH/REPLACE edits against whatever that leaves —
-/// a deterministic order for the rare case one patch response mixes both styles on one file.
+/// document repair in `manager.rs`) shares this one entry point.
 pub(crate) fn apply_patch(
     sections: &HashMap<String, String>,
     patch_text: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let edits = parse_patch(patch_text)?;
-
-    let mut by_file: HashMap<String, Vec<AnyEdit>> = HashMap::new();
-    for edit in edits {
-        by_file.entry(edit.file().to_string()).or_default().push(edit);
-    }
-
+    let diffs = parse_patch(patch_text)?;
     let mut out = sections.clone();
-    for (file, file_edits) in by_file {
-        let Some(mut content) = out.get(&file).cloned() else {
-            return Err(format!(
-                "patch targets \"{file}\", which doesn't exist yet — a brand-new file must be \
-                 emitted in full with a `// === {file} ===` marker, not patched"
-            ));
-        };
 
-        let (line_range_edits, search_replace_edits): (Vec<_>, Vec<_>) =
-            file_edits.into_iter().partition(|e| matches!(e, AnyEdit::LineRange(_)));
-
-        if !line_range_edits.is_empty() {
-            let edits: Vec<line_range::Edit> = line_range_edits
-                .into_iter()
-                .map(|e| match e {
-                    AnyEdit::LineRange(e) => e,
-                    AnyEdit::SearchReplace(_) => unreachable!("partitioned above"),
-                })
-                .collect();
-            content = line_range::apply(&file, &content, edits)?;
+    for diff in diffs {
+        if diff.is_new_file {
+            if out.contains_key(&diff.file) {
+                return Err(format!(
+                    "diff for \"{}\" is against `--- /dev/null` (a new file), but that file \
+                     already exists — diff it against its current content instead",
+                    diff.file
+                ));
+            }
+            let mut content =
+                diff.hunks.iter().map(|h| h.new_block.as_str()).collect::<Vec<_>>().join("\n");
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            out.insert(diff.file, content);
+        } else {
+            let Some(content) = out.get(&diff.file).cloned() else {
+                return Err(format!(
+                    "diff targets \"{}\", which doesn't exist yet — for a brand-new file, diff \
+                     it against `--- /dev/null` instead",
+                    diff.file
+                ));
+            };
+            let updated = apply_hunks(&diff.file, content, &diff.hunks)?;
+            out.insert(diff.file, updated);
         }
-        if !search_replace_edits.is_empty() {
-            let edits: Vec<search_replace::Edit> = search_replace_edits
-                .into_iter()
-                .map(|e| match e {
-                    AnyEdit::SearchReplace(e) => e,
-                    AnyEdit::LineRange(_) => unreachable!("partitioned above"),
-                })
-                .collect();
-            content = search_replace::apply(&file, content, &edits)?;
-        }
-
-        out.insert(file, content);
     }
 
     Ok(out)
 }
 
-/// Shared prompt text describing both patch forms, so every call site that asks a model for a
+/// Shared prompt text describing the diff format, so every call site that asks a model for a
 /// patch (the quality-gate repair loop, integration repair, soundness repair, the single-
-/// document repair in `manager.rs`) offers the identical two options rather than each
-/// call site drifting its own description over time.
+/// document repair in `manager.rs`) offers identical instructions rather than each call site
+/// drifting its own description over time.
 pub(crate) const PATCH_FORMAT_INSTRUCTIONS: &str = "\
-Use whichever of these two forms fits best per change — both are always available, pick \
-per-edit, and a response may mix them freely:\n\n\
-Line-range replace (best for swapping out a whole method/block, or anywhere counting exact \
-lines is easier than reproducing exact text) — line numbers are 1-indexed against the \
-numbered listing above:\n\
-## FILE: <path exactly as shown above>:<start>-<end>\n\
-<<<<<<< NEW\n\
-<replacement lines for lines start..end inclusive>\n\
->>>>>>> NEW\n\
-(a single number, e.g. `:12`, is shorthand for replacing just that one line; end one less \
-than start, e.g. `12-11`, inserts before line 12 without removing anything; an empty block \
-between the markers deletes start..end.)\n\n\
-Search/replace (best for a short, uniquely-identifiable snippet):\n\
-## FILE: <path exactly as shown above>\n\
-<<<<<<< SEARCH\n\
-<exact existing text, including whitespace, that appears exactly once and pinpoints the change>\n\
-=======\n\
-<replacement text>\n\
->>>>>>> REPLACE\n\n\
-One block per change — do not repeat unchanged code. Only emit a full `// === path ===` file \
-if you are adding a brand-new file not shown above.";
-
-/// Render `sections` with a 1-indexed line number on every content line, matching what a
-/// line-range edit's `<start>-<end>` counts against. Used only in prompts that offer a patch —
-/// never for the canonical crate content that actually gets built.
-pub(crate) fn format_multi_file_numbered(sections: &HashMap<String, String>) -> String {
-    let mut paths: Vec<&String> = sections.keys().collect();
-    paths.sort();
-    let mut out = String::new();
-    for path in paths {
-        out.push_str(&format!("// === {path} ===\n"));
-        for (i, line) in sections[path].lines().enumerate() {
-            out.push_str(&format!("{:>5}| {}\n", i + 1, line));
-        }
-    }
-    out
-}
+Respond with a unified diff (the same format `git diff`/`diff -u` produce) — one `--- `/`+++ ` \
+header pair per file, one or more `@@ ... @@` hunks each:\n\
+--- a/<path exactly as shown above>\n\
++++ b/<same path>\n\
+@@ ... @@\n\
+ <context line, unchanged, copied exactly as shown above>\n\
+-<line to remove, copied exactly as shown above>\n\
++<line to add>\n\
+ <context line, unchanged>\n\n\
+Rules:\n\
+- Every removed/context line must match the current content exactly, including whitespace — \
+  the leading ` `/`-`/`+` column is the diff marker, not part of the line's own content.\n\
+- Include a line or two of unchanged context (space-prefixed) around each change so the hunk \
+  can be located unambiguously. The numbers on `@@ -a,b +c,d @@` are only a hunk separator and \
+  are never checked — write `@@ ... @@` if you're not sure of them, exact counts are not \
+  required.\n\
+- For a brand-new file, diff it against `/dev/null` instead of patching a file that doesn't \
+  exist yet:\n\
+--- /dev/null\n\
++++ b/<new path>\n\
+@@ ... @@\n\
++<full content of the new file, one line per `+`>\n\n\
+One diff per file — do not repeat unchanged files. Multiple edits to the same file can be \
+multiple `@@` hunks under one header pair, or separate header pairs; both work.";
 
 #[cfg(test)]
 mod tests {
@@ -363,182 +256,177 @@ mod tests {
     }
 
     #[test]
-    fn applies_a_single_unique_search_replace_match() {
+    fn applies_a_single_hunk_with_context() {
         let before = sections(&[("src/main.rs", "fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n")]);
-        let patch = "## FILE: src/main.rs\n<<<<<<< SEARCH\n    a - b\n=======\n    a + b\n>>>>>>> REPLACE\n";
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ ... @@
+ fn add(a: i32, b: i32) -> i32 {
+-    a - b
++    a + b
+ }
+";
         let after = apply_patch(&before, patch).unwrap();
         assert_eq!(after["src/main.rs"], "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
     }
 
     #[test]
-    fn rejects_a_search_replace_missing_file() {
-        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
-        let patch = "## FILE: src/lib.rs\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n";
-        let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("doesn't exist yet"));
-    }
-
-    #[test]
-    fn rejects_a_search_that_does_not_match() {
-        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
-        let patch = "## FILE: src/main.rs\n<<<<<<< SEARCH\nfn g() {}\n=======\nfn h() {}\n>>>>>>> REPLACE\n";
-        let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("not found"));
-    }
-
-    #[test]
-    fn rejects_an_ambiguous_search() {
-        let before = sections(&[("src/main.rs", "let x = 1;\nlet x = 1;\n")]);
-        let patch = "## FILE: src/main.rs\n<<<<<<< SEARCH\nlet x = 1;\n=======\nlet x = 2;\n>>>>>>> REPLACE\n";
-        let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("2 places"));
-    }
-
-    #[test]
-    fn applies_multiple_search_replace_edits_across_files() {
+    fn applies_edits_across_multiple_files() {
         let before = sections(&[
             ("src/main.rs", "fn a() -> i32 { 1 }\n"),
             ("src/lib.rs", "fn b() -> i32 { 2 }\n"),
         ]);
-        let patch = "## FILE: src/main.rs\n<<<<<<< SEARCH\n{ 1 }\n=======\n{ 10 }\n>>>>>>> REPLACE\n\n\
-                     ## FILE: src/lib.rs\n<<<<<<< SEARCH\n{ 2 }\n=======\n{ 20 }\n>>>>>>> REPLACE\n";
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ ... @@
+-fn a() -> i32 { 1 }
++fn a() -> i32 { 10 }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ ... @@
+-fn b() -> i32 { 2 }
++fn b() -> i32 { 20 }
+";
         let after = apply_patch(&before, patch).unwrap();
         assert_eq!(after["src/main.rs"], "fn a() -> i32 { 10 }\n");
         assert_eq!(after["src/lib.rs"], "fn b() -> i32 { 20 }\n");
     }
 
     #[test]
-    fn line_range_replaces_a_single_line() {
-        let before = sections(&[("src/main.rs", "fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n")]);
-        let patch = "## FILE: src/main.rs:2-2\n<<<<<<< NEW\n    a + b\n>>>>>>> NEW\n";
+    fn applies_multiple_hunks_in_one_file() {
+        let before = sections(&[("src/main.rs", "1\n2\n3\n4\n5\n")]);
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ ... @@
+-2
++TWO
+@@ ... @@
+-4
++FOUR
+";
         let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
+        assert_eq!(after["src/main.rs"], "1\nTWO\n3\nFOUR\n5\n");
     }
 
     #[test]
-    fn line_range_single_number_is_shorthand_for_one_line() {
-        let before = sections(&[("src/main.rs", "fn f() {}\nfn g() {}\n")]);
-        let patch = "## FILE: src/main.rs:1\n<<<<<<< NEW\nfn f2() {}\n>>>>>>> NEW\n";
-        let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn f2() {}\nfn g() {}\n");
-    }
-
-    #[test]
-    fn line_range_swaps_out_a_whole_method() {
-        let before = sections(&[(
-            "src/main.rs",
-            "struct S;\nimpl S {\n    fn old(&self) -> i32 {\n        1\n    }\n}\n",
-        )]);
-        let patch = "## FILE: src/main.rs:3-5\n<<<<<<< NEW\n    fn new(&self) -> i32 {\n        2\n    }\n>>>>>>> NEW\n";
-        let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(
-            after["src/main.rs"],
-            "struct S;\nimpl S {\n    fn new(&self) -> i32 {\n        2\n    }\n}\n"
-        );
-    }
-
-    #[test]
-    fn line_range_empty_replacement_deletes_the_range() {
-        let before = sections(&[("src/main.rs", "fn a() {}\nfn dead() {}\nfn b() {}\n")]);
-        let patch = "## FILE: src/main.rs:2-2\n<<<<<<< NEW\n>>>>>>> NEW\n";
-        let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn a() {}\nfn b() {}\n");
-    }
-
-    #[test]
-    fn line_range_end_one_less_than_start_inserts_without_removing_anything() {
+    fn a_pure_insertion_hunk_adds_without_removing() {
         let before = sections(&[("src/main.rs", "fn a() {}\nfn c() {}\n")]);
-        let patch = "## FILE: src/main.rs:2-1\n<<<<<<< NEW\nfn b() {}\n>>>>>>> NEW\n";
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ ... @@
+ fn a() {}
++fn b() {}
+ fn c() {}
+";
         let after = apply_patch(&before, patch).unwrap();
         assert_eq!(after["src/main.rs"], "fn a() {}\nfn b() {}\nfn c() {}\n");
     }
 
     #[test]
-    fn line_range_can_append_past_the_last_line() {
-        let before = sections(&[("src/main.rs", "fn a() {}\n")]);
-        let patch = "## FILE: src/main.rs:2-1\n<<<<<<< NEW\nfn b() {}\n>>>>>>> NEW\n";
+    fn a_pure_deletion_hunk_removes_without_adding() {
+        let before = sections(&[("src/main.rs", "fn a() {}\nfn dead() {}\nfn b() {}\n")]);
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ ... @@
+ fn a() {}
+-fn dead() {}
+ fn b() {}
+";
         let after = apply_patch(&before, patch).unwrap();
         assert_eq!(after["src/main.rs"], "fn a() {}\nfn b() {}\n");
     }
 
     #[test]
-    fn line_range_rejects_a_missing_file() {
+    fn creates_a_brand_new_file_diffed_against_dev_null() {
+        let before = sections(&[("src/main.rs", "fn main() {}\n")]);
+        let patch = "\
+--- /dev/null
++++ b/src/helper.rs
+@@ ... @@
++pub fn helper() -> i32 {
++    42
++}
+";
+        let after = apply_patch(&before, patch).unwrap();
+        assert_eq!(after["src/helper.rs"], "pub fn helper() -> i32 {\n    42\n}\n");
+        assert_eq!(after["src/main.rs"], "fn main() {}\n"); // untouched
+    }
+
+    #[test]
+    fn rejects_a_dev_null_diff_for_a_file_that_already_exists() {
+        let before = sections(&[("src/main.rs", "fn main() {}\n")]);
+        let patch = "--- /dev/null\n+++ b/src/main.rs\n@@ ... @@\n+fn main() {}\n";
+        let err = apply_patch(&before, patch).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_patch_targeting_a_missing_file() {
         let before = sections(&[("src/main.rs", "fn f() {}\n")]);
-        let patch = "## FILE: src/lib.rs:1-1\n<<<<<<< NEW\nfn g() {}\n>>>>>>> NEW\n";
+        let patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ ... @@\n-fn f() {}\n+fn g() {}\n";
         let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("doesn't exist yet"));
+        assert!(err.contains("doesn't exist yet"), "got: {err}");
+        assert!(err.contains("/dev/null"), "got: {err}");
     }
 
     #[test]
-    fn line_range_rejects_a_range_past_the_end_of_the_file() {
+    fn rejects_context_that_does_not_match() {
         let before = sections(&[("src/main.rs", "fn f() {}\n")]);
-        let patch = "## FILE: src/main.rs:5-6\n<<<<<<< NEW\nx\n>>>>>>> NEW\n";
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n-fn g() {}\n+fn h() {}\n";
         let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("out of range"), "got: {err}");
+        assert!(err.contains("not found"), "got: {err}");
     }
 
     #[test]
-    fn line_range_rejects_two_edits_that_overlap_in_the_same_file() {
-        let before = sections(&[("src/main.rs", "1\n2\n3\n4\n5\n")]);
-        let patch = "## FILE: src/main.rs:1-3\n<<<<<<< NEW\na\n>>>>>>> NEW\n\n\
-                     ## FILE: src/main.rs:3-4\n<<<<<<< NEW\nb\n>>>>>>> NEW\n";
+    fn rejects_ambiguous_context_matching_more_than_once() {
+        let before = sections(&[("src/main.rs", "let x = 1;\nlet x = 1;\n")]);
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n-let x = 1;\n+let x = 2;\n";
         let err = apply_patch(&before, patch).unwrap_err();
-        assert!(err.contains("overlapping"), "got: {err}");
+        assert!(err.contains("2 places"), "got: {err}");
     }
 
     #[test]
-    fn line_range_applies_multiple_non_overlapping_edits_bottom_up() {
-        // If naively applied top-down, replacing line 2 first would shift line 4 down to 3,
-        // corrupting the second edit's target. Bottom-up avoids that.
-        let before = sections(&[("src/main.rs", "1\n2\n3\n4\n5\n")]);
-        let patch = "## FILE: src/main.rs:2-2\n<<<<<<< NEW\nTWO\nTWO-B\n>>>>>>> NEW\n\n\
-                     ## FILE: src/main.rs:4-4\n<<<<<<< NEW\nFOUR\n>>>>>>> NEW\n";
+    fn rejects_a_hunk_with_no_context_or_removed_lines() {
+        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n+fn g() {}\n";
+        let err = apply_patch(&before, patch).unwrap_err();
+        assert!(err.contains("/dev/null"), "got: {err}");
+    }
+
+    #[test]
+    fn tolerates_a_bare_a_and_b_prefix_being_omitted() {
+        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
+        let patch = "--- src/main.rs\n+++ src/main.rs\n@@ ... @@\n-fn f() {}\n+fn g() {}\n";
         let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "1\nTWO\nTWO-B\n3\nFOUR\n5\n");
+        assert_eq!(after["src/main.rs"], "fn g() {}\n");
     }
 
     #[test]
-    fn applies_multiple_line_range_edits_across_files() {
-        let before = sections(&[
-            ("src/main.rs", "fn a() -> i32 { 1 }\n"),
-            ("src/lib.rs", "fn b() -> i32 { 2 }\n"),
-        ]);
-        let patch = "## FILE: src/main.rs:1\n<<<<<<< NEW\nfn a() -> i32 { 10 }\n>>>>>>> NEW\n\n\
-                     ## FILE: src/lib.rs:1\n<<<<<<< NEW\nfn b() -> i32 { 20 }\n>>>>>>> NEW\n";
+    fn tolerates_a_context_line_missing_its_leading_space() {
+        // Some models drop the leading space on a genuinely blank context line -- the single
+        // blank line here is unchanged context shared by both sides, not doubled.
+        let before = sections(&[("src/main.rs", "fn a() {}\n\nfn b() {}\n")]);
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n-fn a() {}\n+fn a2() {}\n\n fn b() {}\n";
         let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn a() -> i32 { 10 }\n");
-        assert_eq!(after["src/lib.rs"], "fn b() -> i32 { 20 }\n");
+        assert_eq!(after["src/main.rs"], "fn a2() {}\n\nfn b() {}\n");
     }
 
     #[test]
-    fn mixes_both_styles_in_one_patch_on_different_files() {
-        let before = sections(&[
-            ("src/main.rs", "fn a() -> i32 { 1 }\n"),
-            ("src/lib.rs", "fn b() -> i32 { 2 }\n"),
-        ]);
-        let patch = "## FILE: src/main.rs:1\n<<<<<<< NEW\nfn a() -> i32 { 10 }\n>>>>>>> NEW\n\n\
-                     ## FILE: src/lib.rs\n<<<<<<< SEARCH\n{ 2 }\n=======\n{ 20 }\n>>>>>>> REPLACE\n";
-        let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn a() -> i32 { 10 }\n");
-        assert_eq!(after["src/lib.rs"], "fn b() -> i32 { 20 }\n");
+    fn no_diff_markers_at_all_is_a_clear_error() {
+        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
+        let err = apply_patch(&before, "just some prose, no diff here").unwrap_err();
+        assert!(err.contains("no diffs found"), "got: {err}");
     }
 
     #[test]
-    fn mixes_both_styles_on_the_same_file_line_range_applied_first() {
-        let before = sections(&[("src/main.rs", "fn a() {}\nfn b() {}\n")]);
-        // Line-range replaces line 1; SEARCH/REPLACE then targets text that only exists
-        // after that edit, proving the documented apply order (line-range, then search).
-        let patch = "## FILE: src/main.rs:1\n<<<<<<< NEW\nfn a2() { /* marker */ }\n>>>>>>> NEW\n\n\
-                     ## FILE: src/main.rs\n<<<<<<< SEARCH\n/* marker */\n=======\n/* replaced */\n>>>>>>> REPLACE\n";
-        let after = apply_patch(&before, patch).unwrap();
-        assert_eq!(after["src/main.rs"], "fn a2() { /* replaced */ }\nfn b() {}\n");
-    }
-
-    #[test]
-    fn numbered_listing_counts_from_one_per_file() {
-        let s = sections(&[("src/main.rs", "a\nb\n"), ("src/lib.rs", "c\n")]);
-        let out = format_multi_file_numbered(&s);
-        assert!(out.contains("// === src/lib.rs ===\n    1| c\n"));
-        assert!(out.contains("// === src/main.rs ===\n    1| a\n    2| b\n"));
+    fn missing_plus_plus_plus_line_is_a_clear_error() {
+        let before = sections(&[("src/main.rs", "fn f() {}\n")]);
+        let err = apply_patch(&before, "--- a/src/main.rs\nnot a plus plus plus line\n").unwrap_err();
+        assert!(err.contains("expected `+++"), "got: {err}");
     }
 }

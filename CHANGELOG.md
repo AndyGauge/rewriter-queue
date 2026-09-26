@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0]
+
+### Changed
+
+- **Breaking (patch format only, not a user-facing change): replaced both patch formats
+  with real unified diff.** The quality-gate/integration/soundness repair loops asked
+  for one of two bespoke formats — a custom SEARCH/REPLACE block, or an even more
+  bespoke 1-indexed line-range block — plus a *third*, separate convention
+  (`// === path ===`) for a brand-new file. Real jobs (#12, #14, #15) kept getting this
+  wrong in the same handful of ways: mixing the two formats' closing markers, getting
+  line-range counts wrong, or trying to patch a file that didn't exist yet instead of
+  emitting it in full. `patch.rs` now parses/applies a real unified diff (the same
+  format `git diff`/`diff -u` produce) — the single most-represented "here is a code
+  change" pattern in any model's training data — collapsing all three conventions into
+  one, including new-file creation via the format's own standard `--- /dev/null`
+  convention. Hunk headers (`@@ -a,b +c,d @@`) are parsed only as a boundary between
+  hunks and never trusted for placement — a hunk still applies correctly even if a
+  model's line-count arithmetic is off, because placement is resolved by matching the
+  hunk's own context/removed lines against the current file content exactly once, the
+  same robustness principle the old SEARCH/REPLACE format already had.
+
 ## [0.5.0]
 
 ### Added

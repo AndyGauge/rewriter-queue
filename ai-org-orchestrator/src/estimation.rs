@@ -139,7 +139,7 @@ pub fn predict(effort: u8, max_iter: usize, history: &[EstimationRecord]) -> Pre
 
     let xs: Vec<f64> = history.iter().map(|r| r.estimated_effort as f64).collect();
     let fit_against = |extract: &dyn Fn(&EstimationRecord) -> f64| -> (f64, f64) {
-        let ys: Vec<f64> = history.iter().map(|r| extract(r)).collect();
+        let ys: Vec<f64> = history.iter().map(extract).collect();
         linear_regression(&xs, &ys)
     };
 

@@ -183,11 +183,11 @@ impl<'a> Manager<'a> {
         let sections = Self::parse_file_sections(last_output);
         let patch_task = format!(
             "{base_task}\n\n\
-             # Current Implementation (line numbers shown for reference — not part of the file)\n{}\n\n\
+             # Current Implementation\n{}\n\n\
              # Quality Gate Failures ({label})\n{quality_errors}\n\n\
              Fix ALL issues above with a minimal patch instead of rewriting the file(s). \
              {}",
-            crate::patch::format_multi_file_numbered(&sections),
+            Self::format_multi_file(&sections),
             crate::patch::PATCH_FORMAT_INSTRUCTIONS,
         );
         let patch_text = self.run(worker_name, worker_system, &patch_task)?;
@@ -1988,9 +1988,8 @@ mod integration_gate_tests {
     fn repairs_a_broken_assembled_crate_within_the_attempt_budget() {
         let ws = temp_ws("repair-ok");
         let calls = Arc::new(AtomicUsize::new(0));
-        let patch = "## FILE: src/main.rs\n\
-                     <<<<<<< SEARCH\n    undefined_fn();\n=======\n    println!(\"fixed\");\n\
-                     >>>>>>> REPLACE\n";
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n\
+                     -    undefined_fn();\n+    println!(\"fixed\");\n";
         let provider: Box<dyn Provider> = Box::new(FixedReply {
             text: patch.to_string(),
             models: vec![mock_model()],
@@ -2012,9 +2011,9 @@ mod integration_gate_tests {
     #[test]
     fn fails_the_run_after_exhausting_repair_attempts_on_an_unfixable_crate() {
         let ws = temp_ws("repair-exhaust");
-        // No SEARCH/REPLACE markers at all -- apply_patch can never match, so try_patch always
-        // falls back to full regeneration, which this mock also answers with the same broken
-        // source, so the crate can never actually get fixed.
+        // No diff markers at all -- apply_patch can never match, so try_patch always falls
+        // back to full regeneration, which this mock also answers with the same broken source,
+        // so the crate can never actually get fixed.
         let broken_src = "fn main() {\n    undefined_fn();\n}\n";
         let provider: Box<dyn Provider> = Box::new(FixedReply {
             text: broken_src.to_string(),
@@ -2143,9 +2142,8 @@ mod soundness_gate_tests {
         let provider: Box<dyn Provider> = Box::new(SequencedReply {
             formal_calls: Arc::new(AtomicUsize::new(0)),
             formal_replies: vec!["UNSOUND\n\ntotality: panics".into(), "SOUND\n\nno issues".into()],
-            patch_text: "## FILE: src/main.rs\n\
-                         <<<<<<< SEARCH\n    println!(\"unsound\");\n=======\n    println!(\"sound\");\n\
-                         >>>>>>> REPLACE\n"
+            patch_text: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n\
+                         -    println!(\"unsound\");\n+    println!(\"sound\");\n"
                 .into(),
             models: vec![mock_model()],
         });
@@ -2167,9 +2165,8 @@ mod soundness_gate_tests {
             formal_calls: Arc::new(AtomicUsize::new(0)),
             // Always UNSOUND, no matter how many times it's asked.
             formal_replies: vec!["UNSOUND\n\ntotality: still panics".into()],
-            patch_text: "## FILE: src/main.rs\n\
-                         <<<<<<< SEARCH\n    println!(\"v1\");\n=======\n    println!(\"v2\");\n\
-                         >>>>>>> REPLACE\n"
+            patch_text: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ ... @@\n\
+                         -    println!(\"v1\");\n+    println!(\"v2\");\n"
                 .into(),
             models: vec![mock_model()],
         });
