@@ -33,6 +33,13 @@ pub struct Manager<'a> {
     pub registry: &'a Registry,
     total_input_tokens: AtomicU32,
     total_output_tokens: AtomicU32,
+    /// Where per-milestone effort estimates get calibrated against actual outcomes (see
+    /// `estimation.rs`). `None` (the default) disables estimation entirely rather than
+    /// falling back to some machine-wide path picked implicitly -- every existing test
+    /// constructs a `Manager` with `new()` and never opts in, so none of them read or write
+    /// real calibration state; only `main.rs` calls `with_estimation_history` explicitly, and
+    /// tests of the estimation feature itself opt in with their own temp path.
+    pub(crate) estimation_history: Option<std::path::PathBuf>,
 }
 
 impl<'a> Manager<'a> {
@@ -42,7 +49,13 @@ impl<'a> Manager<'a> {
             registry,
             total_input_tokens: AtomicU32::new(0),
             total_output_tokens: AtomicU32::new(0),
+            estimation_history: None,
         }
+    }
+
+    pub fn with_estimation_history(mut self, path: std::path::PathBuf) -> Self {
+        self.estimation_history = Some(path);
+        self
     }
 
     pub fn total_input_tokens(&self) -> u32 {

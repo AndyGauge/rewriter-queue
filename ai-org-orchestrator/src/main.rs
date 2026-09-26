@@ -1,4 +1,5 @@
 mod agents;
+mod estimation;
 mod manager;
 mod patch;
 mod quality;
@@ -179,7 +180,7 @@ fn main() {
     // Probe each provider for context limit and quality before any real work.
     registry.run_qq();
 
-    let mgr = Manager::new(&ws, &registry);
+    let mgr = Manager::new(&ws, &registry).with_estimation_history(estimation::history_path());
 
     // The mission is itself a pipeline artifact -- read the same way as objective_contract.md,
     // schema.rs, and everything else, and just as uniformly readable via the `read_artifact`

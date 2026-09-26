@@ -14,6 +14,7 @@ Respond with one block per milestone, in implementation order (earlier milestone
 ```
 ## MILESTONE: <short kebab-case name, e.g. research-database>
 RISK: EASY
+EFFORT: <see below>
 DEPENDS_ON: <see below>
 PATTERNS: <see below>
 TASK: <a self-contained paragraph telling an implementer exactly what this milestone
@@ -25,6 +26,19 @@ the contract, and the schema should have everything they need.>
 Every milestone you emit must be RISK: EASY. If your first pass at decomposing the
 work produces something you'd call HARD, that means split it further before
 responding — HARD is a signal to keep decomposing, never a final answer.
+
+## EFFORT: a finer-grained difficulty rating, 1-255
+
+RISK only answers "will N iterations be enough" — a coarse yes/no. EFFORT is a
+separate, continuous estimate of how much genuine work this specific milestone is,
+on a scale of 1 (trivial — a single obvious method, a one-line struct) to 255
+(as much as an EASY milestone can be while still fitting the budget). It changes
+nothing about how the milestone is implemented; it exists purely so the system can
+predict how long the plan will actually take, and get better at that prediction
+over time by comparing your past ratings to what milestones at that rating actually
+cost. Rate relative to what a single EASY-sized milestone usually takes, not
+relative to the whole plan — a plan of ten similarly-sized milestones should mostly
+cluster together, not spread across the full range just to look ordered.
 
 ## DEPENDS_ON: build a real graph, default to sequential
 

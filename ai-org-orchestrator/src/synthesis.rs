@@ -70,6 +70,11 @@ impl<'a> Manager<'a> {
     /// gate and review both passed, so a caller can tell "this is done" from "this is a
     /// best-effort result I gave up on" and react differently (e.g. escalate for a finer split)
     /// instead of silently treating both the same way.
+    /// Returns `(code, passed, iterations_used)`. `iterations_used` is the number of
+    /// worker/patch rounds actually run before returning -- 1-indexed, so a milestone that
+    /// converges on its first attempt reports 1, not 0 -- fed to `estimation::record` by the
+    /// one caller (`implement_one_milestone`) so calibration reflects real effort spent, not
+    /// just whether it eventually passed.
     pub fn run_with_dual_review(
         &self,
         id_prefix: &str,
@@ -78,7 +83,7 @@ impl<'a> Manager<'a> {
         base_task: &str,
         max_iter: usize,
         variant: Option<&str>,
-    ) -> Result<(String, bool), Box<dyn std::error::Error>> {
+    ) -> Result<(String, bool, usize), Box<dyn std::error::Error>> {
         enum NextCall {
             Full(String),
             Patch(String), // the quality gate's error text to patch against last_output
@@ -130,7 +135,7 @@ impl<'a> Manager<'a> {
             let maintenance_ok = maintenance.trim_start().to_uppercase().starts_with("APPROVE");
 
             if security_ok && maintenance_ok {
-                return Ok((last_output, true));
+                return Ok((last_output, true, iteration + 1));
             }
 
             let mut feedback_parts = Vec::new();
@@ -159,7 +164,7 @@ impl<'a> Manager<'a> {
             ));
         }
 
-        Ok((last_output, false))
+        Ok((last_output, false, max_iter))
     }
 
     /// Ask for a minimal SEARCH/REPLACE patch against `last_output` that fixes
@@ -928,6 +933,28 @@ impl<'a> Manager<'a> {
                 .join(" -> ")
         );
 
+        if let Some(path) = &self.estimation_history {
+            if !milestones.is_empty() {
+                let history = crate::estimation::load_history(path);
+                let predictions: Vec<_> = milestones
+                    .iter()
+                    .map(|m| crate::estimation::predict(m.effort, max_iter, &history))
+                    .collect();
+                let total_secs: f64 = predictions.iter().map(|p| p.predicted_secs).sum();
+                let confidence = if history.len() >= crate::estimation::MIN_SAMPLES {
+                    format!("calibrated from {} past milestone(s)", history.len())
+                } else {
+                    "cold start, no history yet — rough guess".to_string()
+                };
+                eprintln!(
+                    "  [estimate] '{id_prefix}': predicted total ~{:.1}min across {} \
+                     milestone(s) ({confidence})",
+                    total_secs / 60.0,
+                    milestones.len(),
+                );
+            }
+        }
+
         let mut sections = HashMap::new();
         for wave in &waves {
             if wave.len() == 1 {
@@ -1102,7 +1129,22 @@ impl<'a> Manager<'a> {
             )
         };
 
-        let (code, passed) = self.run_with_dual_review(
+        let history_path = self.estimation_history.clone();
+        let history = history_path.as_deref().map(crate::estimation::load_history).unwrap_or_default();
+        if history_path.is_some() {
+            let prediction = crate::estimation::predict(milestone.effort, max_iter, &history);
+            eprintln!(
+                "  [estimate] '{}': effort {}/255 → {}",
+                milestone.name,
+                milestone.effort,
+                crate::estimation::format_prediction(&prediction)
+            );
+        }
+        let tokens_in_before = self.total_input_tokens();
+        let tokens_out_before = self.total_output_tokens();
+        let started = std::time::Instant::now();
+
+        let (code, passed, iterations_used) = self.run_with_dual_review(
             &ms_id,
             "TargetImplementer",
             &implementer_system,
@@ -1110,6 +1152,26 @@ impl<'a> Manager<'a> {
             max_iter,
             variant,
         )?;
+
+        if let Some(path) = &history_path {
+            let record = crate::estimation::EstimationRecord {
+                milestone_name: milestone.name.clone(),
+                estimated_effort: milestone.effort,
+                actual_iterations: iterations_used,
+                max_iter,
+                converged: passed,
+                wall_clock_secs: started.elapsed().as_secs_f64(),
+                // Saturating: a fan-out sibling running concurrently against this same
+                // `Manager` can advance these shared counters between the two snapshots above,
+                // which would otherwise make `before > after` and underflow.
+                tokens_in: self.total_input_tokens().saturating_sub(tokens_in_before),
+                tokens_out: self.total_output_tokens().saturating_sub(tokens_out_before),
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            };
+            if let Err(e) = crate::estimation::record(path, &record) {
+                eprintln!("  [estimate] warning: failed to persist calibration record: {e}");
+            }
+        }
 
         if !passed && depth < Self::MAX_SPLIT_DEPTH {
             eprintln!(
@@ -1195,6 +1257,15 @@ struct Milestone {
     /// skill) means TargetImplementer runs with just its core system prompt, unpolluted by
     /// guidance for domains this milestone doesn't touch.
     patterns: Vec<String>,
+    /// MilestonePlanner's fine-grained difficulty rating for this milestone, 1-255 (see
+    /// `EFFORT:` in `parse_milestone_plan`). Unlike `risk` (a binary "will N iterations be
+    /// enough" gate that changes control flow), `effort` changes nothing about how this
+    /// milestone is implemented -- it only feeds `estimation::predict`, so a job can print a
+    /// calibrated guess at how long the plan will actually take. Defaults to 128 (mid-scale)
+    /// when the planner omits the line or writes something unparseable, same spirit as
+    /// `risk` defaulting to `Hard` on a garbled line: a neutral middle guess rather than
+    /// silently trusting zero.
+    effort: u8,
 }
 
 /// Group milestone indices into dependency-respecting waves (Kahn's algorithm topological
@@ -1243,10 +1314,12 @@ fn schedule_waves(milestones: &[Milestone]) -> Vec<Vec<usize>> {
     waves
 }
 
-/// Parse MilestonePlanner's `## MILESTONE: <name>` / `RISK: EASY|HARD` / `TASK: ...` blocks.
-/// Tolerant of a missing/garbled RISK line (defaults to Hard — forces a split rather than
-/// silently trusting an ambiguous plan) and of TASK spanning multiple lines up to the next
-/// milestone marker.
+/// Parse MilestonePlanner's `## MILESTONE: <name>` / `RISK: EASY|HARD` / `EFFORT: 1-255` /
+/// `TASK: ...` blocks. Tolerant of a missing/garbled RISK line (defaults to Hard — forces a
+/// split rather than silently trusting an ambiguous plan), a missing/garbled EFFORT line
+/// (defaults to `DEFAULT_EFFORT`, a neutral mid-scale guess — unlike RISK this doesn't gate any
+/// behavior, so there's no reason to force a conservative extreme), and of TASK spanning
+/// multiple lines up to the next milestone marker.
 /// Register every top-level `src/*.rs` module in the crate's entry file (`src/main.rs`,
 /// falling back to `src/lib.rs`): a `mod <name>;` line, plus a `pub use <name>::*;` re-export
 /// of that module's public items at the crate root. Only the lines that aren't already present
@@ -1332,7 +1405,13 @@ struct RawMilestone {
     task: String,
     depends_on: Option<Vec<String>>,
     patterns: Vec<String>,
+    effort: u8,
 }
+
+/// Neutral default `effort` when MilestonePlanner omits `EFFORT:` or writes something that
+/// doesn't parse as 1-255 -- a mid-scale guess rather than silently treating an unrated
+/// milestone as either trivial or maximal.
+const DEFAULT_EFFORT: u8 = 128;
 
 fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     let mut raw: Vec<RawMilestone> = Vec::new();
@@ -1341,12 +1420,14 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     let mut task = String::new();
     let mut depends_on: Option<Vec<String>> = None;
     let mut patterns: Vec<String> = Vec::new();
+    let mut effort = DEFAULT_EFFORT;
 
     let flush = |name: &mut Option<String>,
                  risk: &mut Risk,
                  task: &mut String,
                  depends_on: &mut Option<Vec<String>>,
                  patterns: &mut Vec<String>,
+                 effort: &mut u8,
                  out: &mut Vec<RawMilestone>| {
         if let Some(n) = name.take() {
             out.push(RawMilestone {
@@ -1355,9 +1436,11 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
                 task: task.trim().to_string(),
                 depends_on: depends_on.take(),
                 patterns: std::mem::take(patterns),
+                effort: *effort,
             });
         }
         *risk = Risk::Hard;
+        *effort = DEFAULT_EFFORT;
         task.clear();
     };
 
@@ -1372,11 +1455,13 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("## MILESTONE:") {
-            flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut raw);
+            flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut effort, &mut raw);
             name = Some(rest.trim().to_string());
             suppressed = false;
         } else if let Some(rest) = trimmed.strip_prefix("RISK:") {
             risk = if rest.trim().eq_ignore_ascii_case("EASY") { Risk::Easy } else { Risk::Hard };
+        } else if let Some(rest) = trimmed.strip_prefix("EFFORT:") {
+            effort = rest.trim().parse::<u8>().unwrap_or(DEFAULT_EFFORT).max(1);
         } else if let Some(rest) = trimmed.strip_prefix("DEPENDS_ON:") {
             let val = rest.trim();
             depends_on = Some(if val.is_empty() || val.eq_ignore_ascii_case("none") {
@@ -1403,7 +1488,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
             task.push('\n');
         }
     }
-    flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut raw);
+    flush(&mut name, &mut risk, &mut task, &mut depends_on, &mut patterns, &mut effort, &mut raw);
 
     // Resolve the sequential default now that we know the full plan order: a milestone with
     // no DEPENDS_ON line depends on exactly the one before it, so an unmodified plan (or a
@@ -1419,6 +1504,7 @@ fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
                 if i == 0 { Vec::new() } else { vec![raw[i - 1].name.clone()] }
             }),
             patterns: rm.patterns.clone(),
+            effort: rm.effort,
         })
         .collect()
 }
@@ -1567,6 +1653,60 @@ TASK: No RISK line was given at all.
         let milestones = parse_milestone_plan(text);
         assert_eq!(milestones.len(), 1);
         assert_eq!(milestones[0].risk, Risk::Hard);
+    }
+
+    #[test]
+    fn effort_line_is_parsed_per_milestone() {
+        let text = "\
+## MILESTONE: light
+RISK: EASY
+EFFORT: 40
+TASK: A small thing.
+
+## MILESTONE: heavy
+RISK: HARD
+EFFORT: 230
+TASK: A big thing.
+";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones[0].effort, 40);
+        assert_eq!(milestones[1].effort, 230);
+    }
+
+    #[test]
+    fn missing_or_garbled_effort_line_defaults_to_a_neutral_mid_scale_value() {
+        let text = "\
+## MILESTONE: no-effort-line
+RISK: EASY
+TASK: Nothing said about effort.
+
+## MILESTONE: garbled-effort
+RISK: EASY
+EFFORT: not-a-number
+TASK: Effort line present but unparseable.
+";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones[0].effort, DEFAULT_EFFORT);
+        assert_eq!(milestones[1].effort, DEFAULT_EFFORT);
+    }
+
+    #[test]
+    fn effort_does_not_leak_across_milestones_that_omit_it() {
+        // A garbled/omitted EFFORT line on milestone 2 must not inherit milestone 1's rating --
+        // `flush` has to reset `effort` the same way it already resets `risk`.
+        let text = "\
+## MILESTONE: rated
+RISK: EASY
+EFFORT: 250
+TASK: Rated high.
+
+## MILESTONE: unrated
+RISK: EASY
+TASK: No EFFORT line at all.
+";
+        let milestones = parse_milestone_plan(text);
+        assert_eq!(milestones[0].effort, 250);
+        assert_eq!(milestones[1].effort, DEFAULT_EFFORT);
     }
 
     #[test]
@@ -1720,6 +1860,7 @@ TASK: Do the last thing.\n\
             task: String::new(),
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             patterns: Vec::new(),
+            effort: DEFAULT_EFFORT,
         }
     }
 
@@ -2311,6 +2452,7 @@ mod pattern_prescription_tests {
             task: "Do the thing.".to_string(),
             depends_on: Vec::new(),
             patterns: vec!["trait-objects".to_string()],
+            effort: DEFAULT_EFFORT,
         };
         mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
             .expect("milestone should implement cleanly");
@@ -2341,6 +2483,7 @@ mod pattern_prescription_tests {
             task: "Do the thing.".to_string(),
             depends_on: Vec::new(),
             patterns: Vec::new(),
+            effort: DEFAULT_EFFORT,
         };
         mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
             .expect("milestone should implement cleanly");
@@ -2365,6 +2508,7 @@ mod pattern_prescription_tests {
             task: "Do the thing.".to_string(),
             depends_on: Vec::new(),
             patterns: vec!["trait-object".to_string()], // missing the trailing 's'
+            effort: DEFAULT_EFFORT,
         };
         mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
             .expect("an unknown pattern name must not fail the milestone");
@@ -2635,6 +2779,7 @@ mod escalation_fallback_tests {
             task: "Do something hard.".to_string(),
             depends_on: Vec::new(),
             patterns: Vec::new(),
+            effort: DEFAULT_EFFORT,
         };
         let result = mgr
             .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
@@ -2677,6 +2822,7 @@ mod escalation_fallback_tests {
             task: "Do something that never converges.".to_string(),
             depends_on: Vec::new(),
             patterns: Vec::new(),
+            effort: DEFAULT_EFFORT,
         };
         let result = mgr
             .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 2, 0, None, &NullToolbox)
@@ -2689,5 +2835,186 @@ mod escalation_fallback_tests {
 
         let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
         assert!(deviations.contains("accepting the pre-escalation best-effort attempt instead of silently dropping its work"));
+    }
+}
+
+#[cfg(test)]
+mod estimation_wiring_tests {
+    use super::*;
+    use crate::agents::TARGET_IMPLEMENTER;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+
+    /// Converges immediately: SecurityReviewer/MaintenanceReviewer always approve, anything
+    /// else (TargetImplementer) gets a trivial crate on the first try -- so every milestone in
+    /// these tests takes exactly 1 iteration, keeping the recorded `actual_iterations` and
+    /// `wall_clock_secs` predictable enough to assert on.
+    struct ConvergesImmediately {
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for ConvergesImmediately {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            let text = if req.system == SECURITY_REVIEWER {
+                "COMPLIANT"
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE"
+            } else {
+                "fn main() {}\n"
+            };
+            Ok(InferenceResponse {
+                text: text.to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: 100,
+                output_tokens: 20,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-estimation-wiring-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    /// A fresh, non-colliding history file path per test -- never the real
+    /// `estimation::history_path()` default, so these tests can never touch (or be polluted
+    /// by) real calibration data on this machine.
+    fn temp_history(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("aoo-estimation-wiring-history-{tag}-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    struct NullToolbox;
+    impl crate::tools::Toolbox for NullToolbox {
+        fn tool_defs(&self) -> Vec<inference_providers::ToolDef> { Vec::new() }
+        fn call(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            "error: no tools available".to_string()
+        }
+    }
+
+    #[test]
+    fn a_manager_with_no_estimation_history_records_nothing() {
+        let ws = temp_ws("disabled");
+        let provider: Box<dyn Provider> =
+            Box::new(ConvergesImmediately { models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry); // no .with_estimation_history(..) -- opted out
+
+        let ms = Milestone {
+            name: "some-milestone".to_string(),
+            risk: Risk::Easy,
+            task: "Do the thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 200,
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("milestone should implement cleanly");
+
+        // Not opting in must mean literally nothing is written anywhere -- in particular never
+        // to the real machine-wide default path every other test on this machine could share.
+        assert!(mgr.estimation_history.is_none());
+    }
+
+    #[test]
+    fn a_completed_milestone_is_recorded_to_the_history_file() {
+        let ws = temp_ws("record");
+        let history_path = temp_history("record");
+        let provider: Box<dyn Provider> =
+            Box::new(ConvergesImmediately { models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry).with_estimation_history(history_path.clone());
+
+        let ms = Milestone {
+            name: "recorded-milestone".to_string(),
+            risk: Risk::Easy,
+            task: "Do the thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 180,
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .expect("milestone should implement cleanly");
+
+        let history = crate::estimation::load_history(&history_path);
+        assert_eq!(history.len(), 1);
+        let rec = &history[0];
+        assert_eq!(rec.milestone_name, "recorded-milestone");
+        assert_eq!(rec.estimated_effort, 180);
+        assert_eq!(rec.actual_iterations, 1, "ConvergesImmediately passes on the first attempt");
+        assert!(rec.converged);
+        // 300in/60out: TargetImplementer's draft plus the SecurityReviewer and
+        // MaintenanceReviewer calls that same iteration made to approve it -- all of it is
+        // real cost attributable to this milestone's one attempt, not just the implementer's
+        // own share.
+        assert_eq!(rec.tokens_in, 300);
+        assert_eq!(rec.tokens_out, 60);
+
+        let _ = std::fs::remove_file(&history_path);
+    }
+
+    #[test]
+    fn calibration_improves_as_more_milestones_are_recorded() {
+        // Seed history with enough past records (MIN_SAMPLES) that a later prediction is
+        // actually calibrated rather than the cold-start fallback -- proving the "improves
+        // over time" loop: predict() reads whatever implement_one_milestone has already
+        // written for earlier milestones in the same run (or a prior run).
+        let history_path = temp_history("calibrates");
+        for (effort, iterations, secs) in [(50u8, 2usize, 120.0), (150, 5, 400.0), (250, 9, 800.0)] {
+            crate::estimation::record(
+                &history_path,
+                &crate::estimation::EstimationRecord {
+                    milestone_name: "seed".to_string(),
+                    estimated_effort: effort,
+                    actual_iterations: iterations,
+                    max_iter: 10,
+                    converged: true,
+                    wall_clock_secs: secs,
+                    tokens_in: 1000,
+                    tokens_out: 200,
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        }
+
+        let history = crate::estimation::load_history(&history_path);
+        let cold = crate::estimation::predict(150, 10, &[]);
+        let calibrated = crate::estimation::predict(150, 10, &history);
+        assert!(!cold.calibrated);
+        assert!(calibrated.calibrated);
+        // The calibrated prediction should track the real middle-of-range data point (5
+        // iterations, 400s) far more closely than the cold-start linear-scale guess.
+        assert!((calibrated.predicted_iterations - 5.0).abs() < 1.0, "{}", calibrated.predicted_iterations);
+
+        let _ = std::fs::remove_file(&history_path);
     }
 }

@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0]
+
+### Added
+
+- Machine-learning-style effort estimation. MilestonePlanner now rates each milestone's
+  difficulty on a continuous 1-255 `EFFORT:` scale — separate from the existing binary
+  RISK gate, which only decides whether to split before attempting. Every time a
+  milestone finishes (converged or not), what it actually cost — iterations used,
+  wall-clock time, tokens — is appended to a calibration history file
+  (`~/.local/share/rewriter/estimation-history.jsonl` by default,
+  `REWRITER_ESTIMATION_HISTORY` to override). Before a milestone runs, and before a
+  freshly-parsed plan starts executing, a least-squares fit of that growing history
+  against effort produces a predicted iteration count / ETA / token cost, printed the
+  same way the existing `[milestones]` planning summary is — so the same effort rating
+  maps to a tighter prediction as more real milestones complete, on this machine, across
+  every job, without needing a training pipeline: under `MIN_SAMPLES` (3) past records it
+  falls back to a flagged, un-calibrated cold-start guess instead of pretending to a track
+  record it doesn't have yet. Disabled by default for anything that constructs a `Manager`
+  without opting in via `with_estimation_history` — every existing test does exactly
+  that, so nothing but the real `main.rs` binary ever reads or writes real calibration
+  state.
+
 ## [0.4.3]
 
 ### Fixed
