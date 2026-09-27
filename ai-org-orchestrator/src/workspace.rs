@@ -59,6 +59,29 @@ impl Workspace {
         )
     }
 
+    /// Announce what a milestone is building, so concurrently-running sibling milestones --
+    /// each in their own isolated build workspace, with no visibility into each other's code
+    /// or even each other's existence beyond the original plan -- don't independently redefine
+    /// the same type/module. A single atomic append (`OpenOptions::append` + one `write_all`
+    /// call), not the read-modify-write `append()` helper `log_deviation` uses above: multiple
+    /// fan-out threads can call this at the same moment, and a note silently dropped by a race
+    /// would defeat the entire point of this existing.
+    pub fn log_milestone_note(&self, milestone: &str, note: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let line = format!("\n---\n**[{ts}] {milestone}**\n\n{note}\n");
+        let path = self.root.join("milestone_notes.md");
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        f.write_all(line.as_bytes())
+    }
+
+    /// Every note left so far, in the order they were written. `(no notes yet)` rather than an
+    /// error when nothing has been written -- the first milestone to check is not a failure.
+    pub fn read_milestone_notes(&self) -> String {
+        fs::read_to_string(self.root.join("milestone_notes.md"))
+            .unwrap_or_else(|_| "(no notes yet)".to_string())
+    }
+
     pub fn emit_artifact(&self, name: &str, content: &str) -> std::io::Result<()> {
         self.write(&format!("artifacts/{name}"), content)
     }

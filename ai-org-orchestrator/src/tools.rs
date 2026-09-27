@@ -159,6 +159,27 @@ impl<'a> PipelineToolbox<'a> {
         }
     }
 
+    /// Announce what a milestone is building so concurrently-running siblings (each in their
+    /// own isolated workspace, no visibility into each other otherwise) don't redefine it --
+    /// see `Workspace::log_milestone_note` for why this is a single atomic append, not a tool
+    /// wrapper around `write_artifact` (which overwrites, and would let two milestones' notes
+    /// stomp each other).
+    fn leave_note(&self, arguments: &Value) -> String {
+        let (Some(milestone), Some(note)) =
+            (arguments["milestone"].as_str(), arguments["note"].as_str())
+        else {
+            return "error: \"milestone\" and \"note\" arguments are both required".to_string();
+        };
+        match self.ws.log_milestone_note(milestone, note) {
+            Ok(()) => "note recorded".to_string(),
+            Err(e) => format!("error recording note: {e}"),
+        }
+    }
+
+    fn read_notes(&self) -> String {
+        self.ws.read_milestone_notes()
+    }
+
     fn fan_out(&self, arguments: &Value) -> String {
         let Some(tasks) = arguments["tasks"].as_array() else {
             return "error: \"tasks\" argument (an array of task strings) is required".to_string();
@@ -256,6 +277,30 @@ impl<'a> Toolbox for PipelineToolbox<'a> {
                 }),
             },
             ToolDef {
+                name: "leave_note".into(),
+                description: "Announce what you're building (a type/module/trait name and \
+                    which file it lives in) so concurrently-running sibling milestones don't \
+                    independently redefine it. Call this as soon as you know your names, before \
+                    or while implementing — not only after you finish."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "milestone": {"type": "string", "description": "Your own milestone name, exactly as given in your task."},
+                        "note": {"type": "string", "description": "What you're building, e.g. \"implementing FetchConfig struct in src/fetch_config.rs\"."},
+                    },
+                    "required": ["milestone", "note"],
+                }),
+            },
+            ToolDef {
+                name: "read_notes".into(),
+                description: "Read every note left so far by concurrently-running or \
+                    already-finished sibling milestones. Check this before defining a new \
+                    top-level type/module/trait to avoid duplicating one a sibling already owns."
+                    .into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+            ToolDef {
                 name: "fan_out".into(),
                 description: "Delegate two or more genuinely independent sub-tasks (e.g. \
                     analyzing unrelated subsystems of a large source tree) to concurrent \
@@ -284,6 +329,8 @@ impl<'a> Toolbox for PipelineToolbox<'a> {
             "read_file" => self.read_file(arguments),
             "read_artifact" => self.read_artifact(arguments),
             "write_artifact" => self.write_artifact(arguments),
+            "leave_note" => self.leave_note(arguments),
+            "read_notes" => self.read_notes(),
             "fan_out" => self.fan_out(arguments),
             other => format!("error: unknown tool \"{other}\""),
         }
@@ -456,7 +503,10 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["list_files", "read_file", "read_artifact", "write_artifact", "fan_out"]
+            vec![
+                "list_files", "read_file", "read_artifact", "write_artifact", "leave_note",
+                "read_notes", "fan_out"
+            ]
         );
     }
 

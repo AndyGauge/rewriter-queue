@@ -9,7 +9,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
     let base = name.split('-').next().unwrap_or(name);
     match base {
         // Only the agents that generate large code artifacts need the top tier
-        "TargetImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
+        "TargetImplementer" | "AgenticImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
         | "TestEngineer" | "AcceptanceCriteria" => ModelTier::Light,
@@ -27,8 +27,9 @@ pub fn agent_hora_depth(name: &str) -> u8 {
     match base {
         "MissionArchitect" | "InductiveReasoner" => 3,
         "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" => 2,
-        "TargetImplementer" | "ContractReviewer" | "TestEngineer" | "MaintenanceReviewer"
-        | "ProductionReadinessReviewer" | "AcceptanceCriteria" | "SystemTestWriter" => 1,
+        "TargetImplementer" | "AgenticImplementer" | "ContractReviewer" | "TestEngineer"
+        | "MaintenanceReviewer" | "ProductionReadinessReviewer" | "AcceptanceCriteria"
+        | "SystemTestWriter" => 1,
         _ => 0,
     }
 }
@@ -51,6 +52,12 @@ pub const PRODUCTION_READINESS_REVIEWER: &str =
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
 pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
 pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
+/// Layered on top of `TARGET_IMPLEMENTER`'s core skill (never a standalone file, to avoid the
+/// two skills' core rules drifting apart) for a milestone rated substantial enough to run as
+/// AgenticImplementer instead of the plain TargetImplementer — see
+/// `synthesis::Manager::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD`.
+pub const AGENTIC_IMPLEMENTER_ADDENDUM: &str =
+    include_str!("../../skills/agentic-implementer-addendum.md");
 
 /// One optional, domain-specific pattern TargetImplementer can be given on top of its core
 /// skill — only when a milestone actually needs it. Keeps the always-loaded system prompt

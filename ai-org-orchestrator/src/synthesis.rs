@@ -75,6 +75,13 @@ impl<'a> Manager<'a> {
     /// converges on its first attempt reports 1, not 0 -- fed to `estimation::record` by the
     /// one caller (`implement_one_milestone`) so calibration reflects real effort spent, not
     /// just whether it eventually passed.
+    ///
+    /// `toolbox`: `Some` runs every worker/patch call through `run_agentic` instead of a plain
+    /// `run` -- real tool access (list/read source, read/leave milestone notes), for a
+    /// milestone `implement_one_milestone` judged substantial enough (by `effort`) to be worth
+    /// the extra latency of letting it check what concurrently-running siblings are already
+    /// building before it writes a type/module that might collide with one of theirs. `None`
+    /// keeps the plain, tool-less call every milestone used before this existed.
     pub fn run_with_dual_review(
         &self,
         id_prefix: &str,
@@ -83,6 +90,7 @@ impl<'a> Manager<'a> {
         base_task: &str,
         max_iter: usize,
         variant: Option<&str>,
+        toolbox: Option<&(dyn crate::tools::Toolbox + Sync)>,
     ) -> Result<(String, bool, usize), Box<dyn std::error::Error>> {
         enum NextCall {
             Full(String),
@@ -95,7 +103,16 @@ impl<'a> Manager<'a> {
         for iteration in 0..max_iter {
             let raw = self.ws.checkpoint(&format!("{id_prefix}/iter/{iteration}/worker"), || {
                 match &next {
-                    NextCall::Full(task) => self.run(worker_name, worker_system, task),
+                    NextCall::Full(task) => match toolbox {
+                        Some(tb) => self.run_agentic(
+                            worker_name,
+                            worker_system,
+                            task,
+                            tb,
+                            crate::manager::AGENTIC_MAX_TURNS,
+                        ),
+                        None => self.run(worker_name, worker_system, task),
+                    },
                     NextCall::Patch(errors) => self.try_patch(
                         worker_name,
                         worker_system,
@@ -103,6 +120,7 @@ impl<'a> Manager<'a> {
                         &last_output,
                         errors,
                         &format!("iteration {iteration}"),
+                        toolbox,
                     ),
                 }
             })?;
@@ -167,10 +185,14 @@ impl<'a> Manager<'a> {
         Ok((last_output, false, max_iter))
     }
 
-    /// Ask for a minimal SEARCH/REPLACE patch against `last_output` that fixes
+    /// Ask for a minimal unified-diff patch against `last_output` that fixes
     /// `quality_errors`, and apply it. Falls back to a full regeneration — logged as a
-    /// deviation — if the patch doesn't parse or its SEARCH text doesn't match the current
-    /// file content unambiguously, so a bad patch never stalls the loop.
+    /// deviation — if the patch doesn't parse or its context doesn't match the current file
+    /// content unambiguously, so a bad patch never stalls the loop.
+    ///
+    /// `toolbox`: `Some` routes both the patch request and the fallback regeneration through
+    /// `run_agentic` instead of a plain `run` — see `run_with_dual_review`'s own doc comment
+    /// for why only some callers pass one.
     fn try_patch(
         &self,
         worker_name: &str,
@@ -179,7 +201,21 @@ impl<'a> Manager<'a> {
         last_output: &str,
         quality_errors: &str,
         label: &str,
+        toolbox: Option<&(dyn crate::tools::Toolbox + Sync)>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let call = |task: &str| -> Result<String, Box<dyn std::error::Error>> {
+            match toolbox {
+                Some(tb) => self.run_agentic(
+                    worker_name,
+                    worker_system,
+                    task,
+                    tb,
+                    crate::manager::AGENTIC_MAX_TURNS,
+                ),
+                None => self.run(worker_name, worker_system, task),
+            }
+        };
+
         let sections = Self::parse_file_sections(last_output);
         let patch_task = format!(
             "{base_task}\n\n\
@@ -190,7 +226,7 @@ impl<'a> Manager<'a> {
             Self::format_multi_file(&sections),
             crate::patch::PATCH_FORMAT_INSTRUCTIONS,
         );
-        let patch_text = self.run(worker_name, worker_system, &patch_task)?;
+        let patch_text = call(&patch_task)?;
 
         match crate::patch::apply_patch(&sections, Self::strip_fences(&patch_text)) {
             Ok(updated) => Ok(Self::format_multi_file(&updated)),
@@ -209,7 +245,7 @@ impl<'a> Manager<'a> {
                      pass all tests, and keep every file ≤500 lines. \
                      Return only the complete corrected Rust source."
                 );
-                self.run(worker_name, worker_system, &fallback_task)
+                call(&fallback_task)
             }
         }
     }
@@ -327,6 +363,7 @@ impl<'a> Manager<'a> {
                     &clean,
                     &errors,
                     &format!("integration attempt {attempt}"),
+                    None,
                 )
             })?;
             sections = Self::parse_file_sections(&repaired_raw);
@@ -500,6 +537,7 @@ impl<'a> Manager<'a> {
                         &code,
                         &fm,
                         &format!("soundness attempt {attempt}"),
+                        None,
                     )
                 })?;
 
@@ -731,6 +769,17 @@ impl<'a> Manager<'a> {
     /// single implementer attempt in practice, and a genuinely pathological milestone should
     /// surface as a deviation for a human, not loop.
     const MAX_SPLIT_DEPTH: usize = 3;
+
+    /// A milestone rated at or above this on MilestonePlanner's 1-255 `effort` scale is
+    /// implemented by AgenticImplementer instead of the plain TargetImplementer — real tool
+    /// access (read/leave milestone notes, read V1 source) so it can check what
+    /// concurrently-running siblings are already building before it writes a type/module that
+    /// might collide with one of theirs, at the cost of the extra latency `run_agentic` adds
+    /// over a plain completion. Below this, a milestone stays on the cheap, tool-less path —
+    /// most milestones are small enough that the collision risk this exists for doesn't apply,
+    /// and giving every milestone agentic overhead regardless of size would slow the common
+    /// case for a problem only the substantial ones actually have.
+    const AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD: u8 = 25;
 
     /// Cap on how many times the plan as a whole can go back to MilestonePlanner for a second
     /// opinion on scope (`fill_scope_gaps`), distinct from `MAX_SPLIT_DEPTH` — that cap bounds
@@ -1106,8 +1155,31 @@ impl<'a> Manager<'a> {
         // so a milestone that doesn't touch e.g. trait objects never pays for that guidance.
         // An unresolvable name is dropped (not fatal) but recorded, since it likely means the
         // planner typo'd a pattern name from the catalog it was shown.
-        let implementer_system = if milestone.patterns.is_empty() {
+        // Above the effort threshold, AgenticImplementer (real tool access -- read/leave
+        // milestone notes, read V1 source) replaces the plain, tool-less TargetImplementer --
+        // see `AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD`. Pattern guidance layers on top of
+        // whichever base skill this picks, same as before.
+        let use_agentic = milestone.effort >= Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD;
+        let worker_name = if use_agentic { "AgenticImplementer" } else { "TargetImplementer" };
+        let base_skill = if use_agentic {
+            format!(
+                "{worker_system}\n\n# Coordinating With Concurrent Milestones\n{}",
+                crate::agents::AGENTIC_IMPLEMENTER_ADDENDUM
+            )
+        } else {
             worker_system.to_string()
+        };
+        if use_agentic {
+            eprintln!(
+                "  [milestones] '{}': effort {}/255 ≥ {} — routing to AgenticImplementer",
+                milestone.name,
+                milestone.effort,
+                Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
+            );
+        }
+
+        let implementer_system = if milestone.patterns.is_empty() {
+            base_skill
         } else {
             let known: Vec<&str> =
                 crate::agents::IMPLEMENTER_PATTERNS.iter().map(|p| p.name).collect();
@@ -1124,7 +1196,7 @@ impl<'a> Manager<'a> {
                 )?;
             }
             format!(
-                "{worker_system}\n\n# Additional Guidance for This Milestone\n{}",
+                "{base_skill}\n\n# Additional Guidance for This Milestone\n{}",
                 crate::agents::resolve_implementer_patterns(&milestone.patterns)
             )
         };
@@ -1146,11 +1218,12 @@ impl<'a> Manager<'a> {
 
         let (code, passed, iterations_used) = self.run_with_dual_review(
             &ms_id,
-            "TargetImplementer",
+            worker_name,
             &implementer_system,
             &base_task,
             max_iter,
             variant,
+            use_agentic.then_some(toolbox),
         )?;
 
         if let Some(path) = &history_path {
@@ -1317,9 +1390,8 @@ fn schedule_waves(milestones: &[Milestone]) -> Vec<Vec<usize>> {
 /// Parse MilestonePlanner's `## MILESTONE: <name>` / `RISK: EASY|HARD` / `EFFORT: 1-255` /
 /// `TASK: ...` blocks. Tolerant of a missing/garbled RISK line (defaults to Hard — forces a
 /// split rather than silently trusting an ambiguous plan), a missing/garbled EFFORT line
-/// (defaults to `DEFAULT_EFFORT`, a neutral mid-scale guess — unlike RISK this doesn't gate any
-/// behavior, so there's no reason to force a conservative extreme), and of TASK spanning
-/// multiple lines up to the next milestone marker.
+/// (defaults to `DEFAULT_EFFORT`, deliberately below the agentic-implementer threshold — see
+/// its own doc comment), and of TASK spanning multiple lines up to the next milestone marker.
 /// Register every top-level `src/*.rs` module in the crate's entry file (`src/main.rs`,
 /// falling back to `src/lib.rs`): a `mod <name>;` line, plus a `pub use <name>::*;` re-export
 /// of that module's public items at the crate root. Only the lines that aren't already present
@@ -1408,10 +1480,15 @@ struct RawMilestone {
     effort: u8,
 }
 
-/// Neutral default `effort` when MilestonePlanner omits `EFFORT:` or writes something that
-/// doesn't parse as 1-255 -- a mid-scale guess rather than silently treating an unrated
-/// milestone as either trivial or maximal.
-const DEFAULT_EFFORT: u8 = 128;
+/// Default `effort` when MilestonePlanner omits `EFFORT:` or writes something that doesn't
+/// parse as 1-255. Deliberately *below* `AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD`, not a neutral
+/// mid-scale guess: effort now drives two different consumers -- `estimation::predict`, where a
+/// mid-scale guess is the right "no information" prior, and the plain-vs-agentic implementer
+/// routing, where an unrated milestone should stay on the cheap default path rather than
+/// silently incurring agentic tool-call overhead nobody asked for. Erring toward the fast path
+/// for a milestone with an unreadable rating is the same call this file already makes
+/// elsewhere for `patterns` (empty means the plain skill, not "guess and add overhead").
+const DEFAULT_EFFORT: u8 = 10;
 
 fn parse_milestone_plan(text: &str) -> Vec<Milestone> {
     let mut raw: Vec<RawMilestone> = Vec::new();
@@ -3013,5 +3090,264 @@ mod estimation_wiring_tests {
         assert!((calibrated.predicted_iterations - 5.0).abs() < 1.0, "{}", calibrated.predicted_iterations);
 
         let _ = std::fs::remove_file(&history_path);
+    }
+}
+
+#[cfg(test)]
+mod agentic_implementer_tests {
+    use super::*;
+    use crate::agents::TARGET_IMPLEMENTER;
+    use crate::tools::PipelineToolbox;
+    use crate::workspace::Workspace;
+    use inference_providers::backends::Provider;
+    use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+    use inference_providers::Registry;
+    use std::sync::{Arc, Mutex};
+
+    /// (system prompt, tool names offered) for one call.
+    type SystemAndTools = (String, Vec<String>);
+
+    /// Logs the system prompt and tool names offered on every call, so a test can inspect
+    /// exactly what the implementer role was given without caring which provider/model
+    /// answered. Converges immediately (SecurityReviewer/MaintenanceReviewer always approve,
+    /// the implementer always gets a trivial one-file crate) -- these tests are about routing
+    /// and tool availability, not the review loop itself.
+    struct RoleAndToolsLogger {
+        log: Arc<Mutex<Vec<SystemAndTools>>>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for RoleAndToolsLogger {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push((req.system.clone(), req.tools.iter().map(|t| t.name.clone()).collect()));
+            let text = if req.system == SECURITY_REVIEWER {
+                "COMPLIANT"
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE"
+            } else {
+                "fn main() {}\n"
+            };
+            Ok(InferenceResponse {
+                text: text.to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            provider: "mock".into(),
+            model: "mock".into(),
+            tier: ModelTier::Heavy,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
+            context_limit: 200_000,
+        }
+    }
+
+    fn temp_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-agentic-implementer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::new(dir).unwrap();
+        ws.emit_artifact(
+            "v2/Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    fn temp_source(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aoo-agentic-implementer-src-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn find_implementer_call(log: &[SystemAndTools]) -> &SystemAndTools {
+        log.iter()
+            .find(|(sys, _)| sys != SECURITY_REVIEWER && sys != MAINTENANCE_REVIEWER)
+            .expect("expected at least one implementer call")
+    }
+
+    #[test]
+    fn effort_at_or_above_threshold_routes_to_agentic_implementer_with_tool_access() {
+        let ws = temp_ws("high");
+        let src = temp_source("high");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider: Box<dyn Provider> =
+            Box::new(RoleAndToolsLogger { log: log.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "AgenticImplementer", TARGET_IMPLEMENTER, 5);
+
+        let ms = Milestone {
+            name: "big-one".to_string(),
+            risk: Risk::Easy,
+            task: "Do a big thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 200,
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+            .expect("milestone should implement cleanly");
+
+        let log = log.lock().unwrap();
+        let (system, tools) = find_implementer_call(&log);
+        assert!(
+            system.contains("Coordinating With Concurrent Milestones"),
+            "an effort-200 milestone must get the AgenticImplementer addendum"
+        );
+        assert!(tools.contains(&"read_notes".to_string()));
+        assert!(tools.contains(&"leave_note".to_string()));
+        assert!(!tools.is_empty(), "AgenticImplementer must actually be offered tools, not just the addendum text");
+    }
+
+    #[test]
+    fn effort_below_threshold_stays_on_plain_target_implementer_with_no_tools() {
+        let ws = temp_ws("low");
+        let src = temp_source("low");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider: Box<dyn Provider> =
+            Box::new(RoleAndToolsLogger { log: log.clone(), models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "AgenticImplementer", TARGET_IMPLEMENTER, 5);
+
+        let ms = Milestone {
+            name: "small-one".to_string(),
+            risk: Risk::Easy,
+            task: "Do a small thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 10,
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+            .expect("milestone should implement cleanly");
+
+        let log = log.lock().unwrap();
+        let (system, tools) = find_implementer_call(&log);
+        assert!(
+            !system.contains("Coordinating With Concurrent Milestones"),
+            "an effort-10 milestone must stay on the plain TargetImplementer skill"
+        );
+        assert!(tools.is_empty(), "the plain path must not pay for agentic tool-call overhead");
+    }
+
+    /// End-to-end through a real `PipelineToolbox`: AgenticImplementer calls `read_notes`
+    /// first (sees nothing, since no sibling has written one yet), then `leave_note` to
+    /// announce its own work, before returning its final answer -- proving the tools
+    /// `agentic-implementer-addendum.md` tells it to use actually work through the real
+    /// tool-calling wire protocol, not just that they're offered.
+    struct ChecksThenLeavesANote {
+        turn: Arc<std::sync::atomic::AtomicUsize>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for ChecksThenLeavesANote {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            if req.system == SECURITY_REVIEWER {
+                return Ok(InferenceResponse {
+                    text: "COMPLIANT".into(),
+                    tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    latency_ms: 1,
+                });
+            }
+            if req.system == MAINTENANCE_REVIEWER {
+                return Ok(InferenceResponse {
+                    text: "APPROVE".into(),
+                    tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    latency_ms: 1,
+                });
+            }
+
+            let n = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (text, tool_calls) = match n {
+                0 => (
+                    String::new(),
+                    vec![inference_providers::ToolCall {
+                        id: "call-1".into(),
+                        name: "read_notes".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                ),
+                1 => (
+                    String::new(),
+                    vec![inference_providers::ToolCall {
+                        id: "call-2".into(),
+                        name: "leave_note".into(),
+                        arguments: serde_json::json!({
+                            "milestone": "note-taker",
+                            "note": "implementing Widget struct in src/widget.rs",
+                        }),
+                    }],
+                ),
+                _ => ("fn main() {}\n".to_string(), Vec::new()),
+            };
+            Ok(InferenceResponse {
+                text,
+                tool_calls,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn agentic_implementer_can_read_and_leave_notes_through_the_real_toolbox() {
+        let ws = temp_ws("notes-e2e");
+        let src = temp_source("notes-e2e");
+        let provider: Box<dyn Provider> = Box::new(ChecksThenLeavesANote {
+            turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "AgenticImplementer", TARGET_IMPLEMENTER, 5);
+
+        let ms = Milestone {
+            name: "note-taker".to_string(),
+            risk: Risk::Easy,
+            task: "Implement the Widget struct.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 250,
+        };
+        let result = mgr
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+            .expect("milestone should implement cleanly after reading and leaving a note");
+
+        assert_eq!(result.get("src/main.rs").map(String::as_str), Some("fn main() {}\n"));
+
+        let notes = ws.read_milestone_notes();
+        assert!(notes.contains("note-taker"));
+        assert!(notes.contains("implementing Widget struct in src/widget.rs"));
     }
 }

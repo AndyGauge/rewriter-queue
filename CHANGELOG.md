@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.0]
+
+### Added
+
+- AgenticImplementer, and milestone-notes coordination between concurrently-running
+  milestones. Root-caused against a real run (job #16): fan-out milestones each build in
+  their own isolated workspace with zero visibility into siblings, and when one escalates
+  for a re-split, MilestonePlanner has no idea seven other milestones in the same wave
+  already own the types the schema mentions — so it can re-derive `FetchConfig`,
+  `OrganizeConfig`, and friends from scratch in an entirely separate branch, producing
+  conflicting definitions that only the integration gate (expensively) untangles later.
+  Two new tools, `leave_note`/`read_notes`, back a new shared, append-only
+  `milestone_notes.md` (a single atomic append per call, unlike `write_artifact`, so
+  concurrent fan-out threads can't stomp each other's notes) — check what's already
+  claimed before defining a new top-level type, announce your own before you're done so a
+  sibling starting at the same time can see it. A milestone rated at or above effort 25 (on
+  the 1-255 scale from the effort-estimation feature) is implemented by a new
+  AgenticImplementer agent — TargetImplementer's exact same core skill, plus this
+  coordination addendum and real tool access (`list_files`/`read_file`/`read_artifact`,
+  `read_notes`/`leave_note`) through `run_agentic` instead of a plain completion. Below
+  that threshold, a milestone stays on the cheap, tool-less path unchanged — most
+  milestones are small enough that the collision risk doesn't apply, and paying agentic
+  latency on every milestone regardless of size would slow the common case for a problem
+  only the substantial ones actually have.
+
 ## [0.6.0]
 
 ### Changed
