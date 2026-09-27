@@ -781,6 +781,14 @@ impl<'a> Manager<'a> {
     /// case for a problem only the substantial ones actually have.
     const AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD: u8 = 25;
 
+    /// AgenticImplementer's actual iteration budget is `estimation::predict`'s guess, not the
+    /// flat `max_iter` every other milestone shares -- but a calibrated fit over a handful of
+    /// outlier data points could otherwise extrapolate to an absurd count for an extreme effort
+    /// rating. Clamped to at most this multiple of the flat default so a bad fit costs bounded
+    /// extra time, not unbounded time, before the existing non-convergence escalation gets a
+    /// chance to kick in.
+    const AGENTIC_ITERATION_BUDGET_CAP_MULTIPLIER: usize = 3;
+
     /// Cap on how many times the plan as a whole can go back to MilestonePlanner for a second
     /// opinion on scope (`fill_scope_gaps`), distinct from `MAX_SPLIT_DEPTH` — that cap bounds
     /// re-splitting *one* milestone that's too big; this one bounds re-*planning* because the
@@ -1203,8 +1211,14 @@ impl<'a> Manager<'a> {
 
         let history_path = self.estimation_history.clone();
         let history = history_path.as_deref().map(crate::estimation::load_history).unwrap_or_default();
+        // Computed unconditionally (not just when history_path is Some) because AgenticImplementer
+        // uses the prediction itself as its iteration budget, not only as something to print --
+        // a cold-start guess (no history configured, or too few past records) is still a
+        // reasonable budget, just an unflagged one. TargetImplementer never reads `prediction`,
+        // so this costs nothing for the common (non-agentic) case beyond a cheap linear-regression
+        // call.
+        let prediction = crate::estimation::predict(milestone.effort, max_iter, &history);
         if history_path.is_some() {
-            let prediction = crate::estimation::predict(milestone.effort, max_iter, &history);
             eprintln!(
                 "  [estimate] '{}': effort {}/255 → {}",
                 milestone.name,
@@ -1212,6 +1226,27 @@ impl<'a> Manager<'a> {
                 crate::estimation::format_prediction(&prediction)
             );
         }
+
+        // AgenticImplementer runs on the estimated budget instead of the flat `max_iter` every
+        // milestone otherwise shares -- the whole point of rating effort is that a 250 and a 30
+        // don't need the same number of rounds. Clamped, not trusted unbounded: a calibrated fit
+        // over a handful of outlier data points could otherwise extrapolate to an absurd
+        // iteration count for an extreme effort rating, which would burn a lot of real wall-clock
+        // time before the existing non-convergence escalation ever gets a chance to kick in.
+        let effective_max_iter = if use_agentic {
+            let predicted = prediction.predicted_iterations.round().max(1.0) as usize;
+            let clamped = predicted.clamp(1, max_iter.saturating_mul(Self::AGENTIC_ITERATION_BUDGET_CAP_MULTIPLIER));
+            if clamped != max_iter {
+                eprintln!(
+                    "  [estimate] '{}': using predicted budget of {clamped} iteration(s) instead of the flat default of {max_iter}",
+                    milestone.name
+                );
+            }
+            clamped
+        } else {
+            max_iter
+        };
+
         let tokens_in_before = self.total_input_tokens();
         let tokens_out_before = self.total_output_tokens();
         let started = std::time::Instant::now();
@@ -1221,7 +1256,7 @@ impl<'a> Manager<'a> {
             worker_name,
             &implementer_system,
             &base_task,
-            max_iter,
+            effective_max_iter,
             variant,
             use_agentic.then_some(toolbox),
         )?;
@@ -1231,7 +1266,7 @@ impl<'a> Manager<'a> {
                 milestone_name: milestone.name.clone(),
                 estimated_effort: milestone.effort,
                 actual_iterations: iterations_used,
-                max_iter,
+                max_iter: effective_max_iter,
                 converged: passed,
                 wall_clock_secs: started.elapsed().as_secs_f64(),
                 // Saturating: a fan-out sibling running concurrently against this same
@@ -1248,22 +1283,23 @@ impl<'a> Manager<'a> {
 
         if !passed && depth < Self::MAX_SPLIT_DEPTH {
             eprintln!(
-                "  [milestones] '{}' did not converge in {max_iter} iterations — \
+                "  [milestones] '{}' did not converge in {effective_max_iter} iterations — \
                  escalating for a finer split",
                 milestone.name
             );
             self.ws.log_deviation(
                 "MilestonePlanner",
                 &format!(
-                    "Milestone '{}' did not pass its quality gate within {max_iter} \
+                    "Milestone '{}' did not pass its quality gate within {effective_max_iter} \
                      iterations as a single unit — splitting further (depth {depth})",
                     milestone.name
                 ),
             )?;
             let retry_task = format!(
                 "{}\n\n# Why This Needs Splitting\nA previous attempt implemented this as \
-                 one unit and did not pass its quality gate within {max_iter} iterations. \
-                 Split it into two or more smaller, independently-implementable pieces.",
+                 one unit and did not pass its quality gate within {effective_max_iter} \
+                 iterations. Split it into two or more smaller, independently-implementable \
+                 pieces.",
                 milestone.task
             );
             let sub = self.implement_milestones(
@@ -3176,6 +3212,13 @@ mod agentic_implementer_tests {
         dir
     }
 
+    fn temp_history(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("aoo-agentic-implementer-history-{tag}-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
     fn find_implementer_call(log: &[SystemAndTools]) -> &SystemAndTools {
         log.iter()
             .find(|(sys, _)| sys != SECURITY_REVIEWER && sys != MAINTENANCE_REVIEWER)
@@ -3349,5 +3392,131 @@ mod agentic_implementer_tests {
         let notes = ws.read_milestone_notes();
         assert!(notes.contains("note-taker"));
         assert!(notes.contains("implementing Widget struct in src/widget.rs"));
+    }
+
+    /// Always answers the exact same syntactically-valid-but-never-buildable snippet, no
+    /// matter what it's asked (full generation, patch request, or patch's own fallback
+    /// regeneration) -- the milestone can never converge, so it always exhausts its whole
+    /// iteration budget, letting these tests read that budget straight off the persisted
+    /// `EstimationRecord` instead of trying to count raw provider calls (which varies with
+    /// how many of those calls hit the patch-parse-failure fallback path).
+    struct NeverConverges {
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for NeverConverges {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, _req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            Ok(InferenceResponse {
+                text: "fn main() {\n    undefined_fn();\n}\n".to_string(),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn agentic_implementer_uses_a_smaller_cold_start_budget_for_modest_effort() {
+        // Effort right at the agentic threshold, cold start (no history): predicted iterations
+        // scale linearly with effort/255 against the flat max_iter, so a modest effort rating
+        // should land on a budget well under the flat default of 10, not the flat default
+        // itself -- proving the estimate is actually driving the budget, not just labeling it.
+        let ws = temp_ws("cold-small");
+        let src = temp_source("cold-small");
+        let history_path = temp_history("cold-small");
+        let provider: Box<dyn Provider> = Box::new(NeverConverges { models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry).with_estimation_history(history_path.clone());
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "AgenticImplementer", TARGET_IMPLEMENTER, 5);
+
+        let ms = Milestone {
+            name: "modest".to_string(),
+            risk: Risk::Easy,
+            task: "Do a modest thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 25, // exactly at AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 10, 0, None, &toolbox)
+            .expect("a non-converging milestone still returns its best effort, not an error");
+
+        let history = crate::estimation::load_history(&history_path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].max_iter, 1,
+            "effort 25 at cold start (25/255 of a flat max_iter=10) should get a much smaller \
+             budget than the flat default, not 10"
+        );
+        assert_eq!(history[0].actual_iterations, 1);
+
+        let _ = std::fs::remove_file(&history_path);
+    }
+
+    #[test]
+    fn agentic_implementer_uses_a_calibrated_budget_that_can_exceed_the_flat_default() {
+        // Seed history showing effort-~220 milestones actually need ~16 iterations. The
+        // current job's flat max_iter is only 5 -- if the budget were still capped at the flat
+        // default, a calibrated prediction of ~16 would be pointless. It shouldn't be: the
+        // whole reason to calibrate is to let real historical need override an arbitrary flat
+        // guess, bounded only by AGENTIC_ITERATION_BUDGET_CAP_MULTIPLIER (3x flat = 15 here).
+        let history_path = temp_history("calibrated-exceeds");
+        for (effort, iters, secs) in [(200u8, 15usize, 900.0), (220, 16, 950.0), (240, 17, 1000.0)] {
+            crate::estimation::record(
+                &history_path,
+                &crate::estimation::EstimationRecord {
+                    milestone_name: "seed".to_string(),
+                    estimated_effort: effort,
+                    actual_iterations: iters,
+                    max_iter: 20,
+                    converged: true,
+                    wall_clock_secs: secs,
+                    tokens_in: 1000,
+                    tokens_out: 200,
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        }
+
+        let ws = temp_ws("calibrated-exceeds");
+        let src = temp_source("calibrated-exceeds");
+        let provider: Box<dyn Provider> = Box::new(NeverConverges { models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry).with_estimation_history(history_path.clone());
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "AgenticImplementer", TARGET_IMPLEMENTER, 5);
+
+        let ms = Milestone {
+            name: "big".to_string(),
+            risk: Risk::Easy,
+            task: "Do a big thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 230,
+        };
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 5, 0, None, &toolbox)
+            .expect("a non-converging milestone still returns its best effort, not an error");
+
+        let history = crate::estimation::load_history(&history_path);
+        let record = history.iter().find(|r| r.milestone_name == "big").unwrap();
+        assert!(
+            record.max_iter > 5,
+            "calibrated budget should exceed the flat max_iter of 5, got {}",
+            record.max_iter
+        );
+        assert!(
+            record.max_iter <= 15,
+            "must still respect the {}x cap (5*3=15), got {}",
+            Manager::AGENTIC_ITERATION_BUDGET_CAP_MULTIPLIER,
+            record.max_iter
+        );
+
+        let _ = std::fs::remove_file(&history_path);
     }
 }

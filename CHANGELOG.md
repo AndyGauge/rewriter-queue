@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.1]
+
+### Changed
+
+- AgenticImplementer's iteration budget is now the estimated iteration count
+  (`estimation::predict`), not the flat `max_iter` every milestone otherwise shares. A milestone
+  rated barely above the agentic threshold gets a proportionally smaller budget at cold start;
+  once real calibration history exists, the budget can exceed the job's flat default too, if
+  that's what similar-effort milestones have actually needed — capped at 3x the flat default
+  (`AGENTIC_ITERATION_BUDGET_CAP_MULTIPLIER`) so a fit over a handful of outlier records can't
+  extrapolate to an unbounded iteration count. The persisted `EstimationRecord.max_iter` now
+  reflects this actual per-milestone budget, not the flat default, so future calibration learns
+  from what a milestone was really given rather than a number it never operated under.
+
 ## [0.7.0]
 
 ### Added
