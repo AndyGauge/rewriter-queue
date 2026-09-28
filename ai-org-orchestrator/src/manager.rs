@@ -21,11 +21,17 @@ pub(crate) const CHUNK_TARGET: usize = 8_000;
 /// source tree burned all 20 without ever answering, and reading the actual tool-call log
 /// showed why -- `objective_contract.md` read three times, `schema.rs` three times, one source
 /// file three times, `list_files` five times, one call per turn throughout even though a turn
-/// can request several at once. The turn-batching reminder in `run_agentic` targets that
-/// waste directly; this higher ceiling is the safety margin for whatever a model still doesn't
-/// follow -- exploring a real source tree can legitimately take a couple dozen reads (and a
-/// `fan_out` call, which recurses with this same budget) before there's enough context to
-/// answer at all.
+/// can request several at once. The turn-batching reminder in `run_agentic` (see
+/// `agents::AGENTIC_BATCHING_REMINDER`) targets that waste directly; this higher ceiling is the
+/// safety margin for whatever a model still doesn't follow -- exploring a real source tree can
+/// legitimately take a couple dozen reads (and a `fan_out` call, which recurses with this same
+/// budget) before there's enough context to answer at all.
+///
+/// It's a safety margin, not a guarantee: a third real run hit the exact same one-call-per-turn
+/// pattern in a different role (TestEngineer, not MilestonePlanner this time) and still
+/// exhausted all 40 turns -- re-reading one file six separate times across nine of them. The
+/// reminder is a real mitigation, demonstrably not a fix; raising this constant further buys
+/// more margin against a model that still won't batch, not a cure for it not batching.
 pub(crate) const AGENTIC_MAX_TURNS: usize = 40;
 
 pub struct Manager<'a> {
@@ -146,24 +152,12 @@ impl<'a> Manager<'a> {
         self.ws.set_agent_task(agent, task)?;
         let tool_defs = toolbox.tool_defs();
 
-        // A real run burned 27 of a 20-turn budget this way: the model asked for one file at
-        // a time even though a turn can request several tool calls at once, and re-requested
-        // things (the same artifact three times, the same source file three times) it already
-        // had sitting in its own history a few turns back. Neither is a wire-protocol limit --
-        // `run_agentic` already executes every call in one turn's `tool_calls` before the next
-        // turn -- it's purely that nothing ever told the model it could, so every stage that
-        // reads more than a couple of files pays for it turn-by-turn instead of once.
+        // Shared across every agentic role, not specific to whichever one first hit this --
+        // see `agents::AGENTIC_BATCHING_REMINDER`'s own doc comment and skill file for why.
         let user = if tool_defs.is_empty() {
             task.to_string()
         } else {
-            format!(
-                "{task}\n\n\
-                 (Tool use: if you already know you need several independent pieces of \
-                 information — multiple files, multiple artifacts — request all of those tool \
-                 calls together in the same turn rather than one at a time; you're not limited \
-                 to one call per turn. Don't re-request something you've already read earlier \
-                 in this conversation — it's still there in your own history above.)"
-            )
+            format!("{task}\n\n{}", crate::agents::AGENTIC_BATCHING_REMINDER)
         };
         let mut history: Vec<Turn> = Vec::new();
         let mut pinned_provider: Option<String> = None;
@@ -618,7 +612,7 @@ mod agentic_tests {
         let user = seen.lock().unwrap().clone().unwrap();
         assert!(user.starts_with("the actual task"), "got: {user}");
         assert!(user.contains("same turn"), "expected the batching reminder, got: {user}");
-        assert!(user.contains("Don't re-request"), "expected the no-re-read reminder, got: {user}");
+        assert!(user.contains("Never re-request"), "expected the no-re-read reminder, got: {user}");
     }
 
     #[test]

@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.2]
+
+### Changed
+
+- The agentic tool-call batching/no-re-read reminder (`run_agentic`) is now its own skill file
+  (`skills/agentic-batching.md`, `agents::AGENTIC_BATCHING_REMINDER`) instead of a string literal
+  inline in `manager.rs` — consistent with this project's own stated principle that skills are
+  the canonical source of truth and the software only loads them. No behavior change: it was
+  already appended to every agentic call offered tools, regardless of role, before this. Prompted
+  by job #17: TestEngineer hit the exact same one-call-per-turn, re-read-the-same-file pattern
+  MilestonePlanner hit in job #13 and still exhausted all 40 turns (one file read six separate
+  times across nine of them) — the reminder is a real mitigation, not a guarantee, documented now
+  in `AGENTIC_MAX_TURNS`'s own doc comment.
+
 ## [0.7.1]
 
 ### Changed

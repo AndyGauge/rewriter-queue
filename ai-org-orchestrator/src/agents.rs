@@ -52,6 +52,11 @@ pub const PRODUCTION_READINESS_REVIEWER: &str =
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
 pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
 pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
+/// Appended by `Manager::run_agentic` to every agentic call that's offered tools -- shared
+/// across every role (MissionArchitect, SchemaArchitect, MilestonePlanner, TestEngineer,
+/// AgenticImplementer, everything that calls `run_agentic`), not owned by any one of them, so
+/// it lives here rather than folded into a specific role's own skill file.
+pub const AGENTIC_BATCHING_REMINDER: &str = include_str!("../../skills/agentic-batching.md");
 /// Layered on top of `TARGET_IMPLEMENTER`'s core skill (never a standalone file, to avoid the
 /// two skills' core rules drifting apart) for a milestone rated substantial enough to run as
 /// AgenticImplementer instead of the plain TargetImplementer — see
