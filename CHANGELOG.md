@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.2]
+
+### Fixed
+
+- `write_artifact`'s own tool description invited the exact misuse v0.8.1 fixed for
+  AgenticImplementer specifically ("instead of only returning it as your final answer") — every
+  *other* role that still has this tool (MissionArchitect, SchemaArchitect, MilestonePlanner,
+  TestEngineer, InductiveReasoner, AcceptanceCriteria) was reading the same inviting phrasing.
+  Reworded to say plainly what the tool is actually for (saving an artifact a *later* stage
+  reads back) and, explicitly, what it is never for (an alternate way to deliver this call's own
+  expected output — that's always the final response text).
+
+### Changed
+
+- Reset the on-box calibration history (`estimation-history.jsonl`) on the deployment machine —
+  all 66 accumulated records predated the unified-diff, AgenticImplementer-toolbox, and
+  turn-budget-circuit-breaker fixes, so none of them reflected how the system actually behaves
+  now. Backed up rather than deleted; future estimates start from cold-start guesses again until
+  real data accumulates under the fixed pipeline.
+
 ## [0.8.1]
 
 ### Fixed

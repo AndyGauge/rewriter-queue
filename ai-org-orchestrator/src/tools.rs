@@ -289,8 +289,11 @@ impl<'a> Toolbox for PipelineToolbox<'a> {
             },
             ToolDef {
                 name: "write_artifact".into(),
-                description: "Write (or overwrite) a named pipeline artifact directly, instead \
-                    of only returning it as your final answer."
+                description: "Save a named pipeline artifact (e.g. schema.rs, \
+                    objective_contract.md) that a LATER stage will read back with \
+                    read_artifact. This is for artifacts other stages consume -- it is never \
+                    an alternate way to deliver this call's own expected output. Your actual \
+                    answer to this task always goes in your final response text, never here."
                     .into(),
                 parameters: json!({
                     "type": "object",
