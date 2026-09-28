@@ -71,6 +71,20 @@ pub struct InferenceRequest {
     /// `Registry::complete_pinned`) -- this wire-level history is provider-specific and
     /// can't be replayed against a different one.
     pub history: Vec<Turn>,
+    /// Standard OpenAI sampling param, honored by llama.cpp's server too (confirmed live
+    /// against gx10's llama-server): penalizes a token proportional to how many times it's
+    /// already appeared, so a token/span repeated many times accumulates a growing penalty
+    /// instead of a flat one-time nudge. `None` omits the field, letting the backend use its
+    /// own default. Set by `Manager` to mitigate the exact-repeated-tool-call degenerate loop
+    /// a real run hit -- see `manager::FREQUENCY_PENALTY`'s doc comment. Only
+    /// `backends::openai_compat` currently sends this; Anthropic's API has no equivalent
+    /// parameter, and Ollama/Gemini use differently-shaped ones this project doesn't route
+    /// production traffic through.
+    pub frequency_penalty: Option<f64>,
+    /// Standard OpenAI sampling param, honored by llama.cpp's server too: a flat penalty for
+    /// any token that has appeared at all, regardless of how many times. Same
+    /// `None`/backend-support caveats as `frequency_penalty`.
+    pub presence_penalty: Option<f64>,
 }
 
 impl InferenceRequest {
@@ -84,6 +98,8 @@ impl InferenceRequest {
             slot_hint: None,
             tools: Vec::new(),
             history: Vec::new(),
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 }

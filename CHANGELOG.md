@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.3]
+
+### Fixed
+
+- A real run (job #19) hit a genuine stuck-decoding repetition loop, not an ordinary reasoning
+  mistake: AgenticImplementer called `read_artifact({"name":"schema.rs"})` — the exact same call,
+  verbatim — 39 times in a row before the turn-budget circuit breaker even tripped, then kept
+  calling it after the breaker's directive too, and failed. No prompt-level reminder can fix a
+  model that isn't choosing to repeat but is stuck. Confirmed there's no vLLM anywhere in this
+  pipeline's serving stack — both backends are `llama-server` (llama.cpp), run with no
+  sampling-penalty flags. Added standard OpenAI `frequency_penalty`/`presence_penalty` fields to
+  every request (`inference-providers::InferenceRequest`, sent by
+  `backends::openai_compat` — confirmed live that llama-server's OpenAI-compatible endpoint
+  honors them) instead of a llama.cpp-specific field, so it works for any OpenAI-compatible
+  backend this abstracts over, not just the two currently in use.
+  `frequency_penalty` in particular grows with repeat count, directly targeting "the same call
+  39 times" rather than giving a flat one-time nudge. First-attempt values
+  (`manager::FREQUENCY_PENALTY` = 0.3, `PRESENCE_PENALTY` = 0.1), not a tuned optimum.
+
 ## [0.8.2]
 
 ### Fixed

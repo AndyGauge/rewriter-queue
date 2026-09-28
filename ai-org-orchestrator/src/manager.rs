@@ -34,6 +34,17 @@ pub(crate) const CHUNK_TARGET: usize = 8_000;
 /// more margin against a model that still won't batch, not a cure for it not batching.
 pub(crate) const AGENTIC_MAX_TURNS: usize = 40;
 
+/// Standard OpenAI sampling params (honored by llama.cpp's server too, confirmed live against
+/// gx10) applied to every request, agentic or not: a fourth real run degenerated into calling
+/// `read_artifact({"name":"schema.rs"})` 39 times verbatim in a row before the circuit breaker
+/// even tripped, then kept calling it after the breaker's directive too -- a genuine stuck-
+/// decoding repetition loop, not an ordinary reasoning mistake, and not something a prompt-level
+/// reminder can fix (the model isn't choosing to repeat, it's stuck). These are a first attempt
+/// at the values, not a tuned optimum -- frequency_penalty in particular grows with repeat
+/// count, directly targeting "the same call 39 times" rather than a flat one-time nudge.
+const FREQUENCY_PENALTY: f64 = 0.3;
+const PRESENCE_PENALTY: f64 = 0.1;
+
 /// How many extra turns `run_agentic`'s circuit breaker grants, once, when a call reaches
 /// `AGENTIC_MAX_TURNS` without answering -- see the breaker's own doc comment on
 /// `run_agentic`. Deliberately not "keep bumping forever": one extension, paired with a
@@ -108,6 +119,8 @@ impl<'a> Manager<'a> {
             slot_hint,
             tools: Vec::new(),
             history: Vec::new(),
+            frequency_penalty: Some(FREQUENCY_PENALTY),
+            presence_penalty: Some(PRESENCE_PENALTY),
         };
 
         let resp = self.registry.complete(&req)?;
@@ -238,6 +251,8 @@ impl<'a> Manager<'a> {
                 slot_hint: None,
                 tools: tool_defs.clone(),
                 history: history.clone(),
+                frequency_penalty: Some(FREQUENCY_PENALTY),
+                presence_penalty: Some(PRESENCE_PENALTY),
             };
             let resp = match &pinned_provider {
                 None => self.registry.complete(&req)?,
