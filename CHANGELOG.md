@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.0]
+
+### Added
+
+- Turn-budget circuit breaker for `run_agentic`. Reaching `AGENTIC_MAX_TURNS` without an answer
+  used to fail the whole call outright — job #17's TestEngineer lost 39 turns of genuine, if
+  badly redundant, file exploration to a hard failure one turn short of ever trying to answer.
+  Now the breaker trips exactly once: a fresh-context call (new role, TurnBudgetSupervisor, no
+  conversation clutter of its own) is given the original task and a plain digest of every tool
+  call made so far — including exact repeats, the clearest signal of the underlying runaway
+  pattern — and asked for one concrete directive. That directive replaces the passive batching
+  reminder for the rest of the call, and the budget is extended by `CIRCUIT_BREAKER_TURN_BUMP`
+  (15). Still bounded, not an unlimited retry: a call that hasn't converged after that one
+  extension fails for real, same as before.
+
 ## [0.7.2]
 
 ### Changed

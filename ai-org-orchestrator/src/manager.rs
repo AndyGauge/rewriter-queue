@@ -34,6 +34,14 @@ pub(crate) const CHUNK_TARGET: usize = 8_000;
 /// more margin against a model that still won't batch, not a cure for it not batching.
 pub(crate) const AGENTIC_MAX_TURNS: usize = 40;
 
+/// How many extra turns `run_agentic`'s circuit breaker grants, once, when a call reaches
+/// `AGENTIC_MAX_TURNS` without answering -- see the breaker's own doc comment on
+/// `run_agentic`. Deliberately not "keep bumping forever": one extension, paired with a
+/// fresh-context directive telling the agent specifically what it's already gathered and what
+/// (if anything) is still missing, should be enough for a call that was making real progress;
+/// a call that still can't converge after that is failing for a reason more turns won't fix.
+const CIRCUIT_BREAKER_TURN_BUMP: usize = 15;
+
 pub struct Manager<'a> {
     pub ws: &'a Workspace,
     pub registry: &'a Registry,
@@ -134,13 +142,27 @@ impl<'a> Manager<'a> {
     /// straight into its prompt: it reads V1 source files, other stages' artifacts, and (via
     /// `fan_out`) delegates genuinely separable sub-questions to concurrent copies of itself,
     /// all on demand through `toolbox` (see `tools::PipelineToolbox`). Loops turn by turn
-    /// until the model answers with no further tool calls, or `max_turns` is exhausted.
+    /// until the model answers with no further tool calls, or the turn budget (`max_turns`,
+    /// extended once by the circuit breaker below) is exhausted.
     ///
     /// The first turn is routed normally (`Registry::complete`, scored across every eligible
     /// tool-capable provider); every following turn in the same conversation is pinned to
     /// that same provider (`Registry::complete_pinned`), since the growing tool-call/tool-
     /// result history is encoded in that provider's own wire format and can't be replayed
     /// against a different one mid-conversation.
+    ///
+    /// **Turn-budget circuit breaker.** Reaching `max_turns` without an answer used to fail
+    /// the call outright — but a real run (job #17, TestEngineer) burned 39 of 40 turns on
+    /// genuine, if badly redundant, file exploration and then lost every bit of that work to a
+    /// hard failure one turn short of ever trying to answer. `AGENTIC_BATCHING_REMINDER` is
+    /// sent up front and evidently isn't always enough on its own. Instead of failing or just
+    /// silently granting more turns, the breaker trips exactly once: a fresh-context call
+    /// (`TurnBudgetSupervisor`, no conversation clutter of its own) is given the original task
+    /// and a plain digest of every tool call made so far — including exact repeats, the
+    /// clearest signal of the runaway pattern this exists to catch — and asked for one
+    /// concrete directive. That directive replaces the passive reminder for the rest of the
+    /// call, and the budget is extended by `CIRCUIT_BREAKER_TURN_BUMP`. If it still hasn't
+    /// answered after that, it fails for real — one extension, not an unbounded one.
     pub fn run_agentic(
         &self,
         agent: &str,
@@ -154,15 +176,59 @@ impl<'a> Manager<'a> {
 
         // Shared across every agentic role, not specific to whichever one first hit this --
         // see `agents::AGENTIC_BATCHING_REMINDER`'s own doc comment and skill file for why.
-        let user = if tool_defs.is_empty() {
+        let mut user = if tool_defs.is_empty() {
             task.to_string()
         } else {
             format!("{task}\n\n{}", crate::agents::AGENTIC_BATCHING_REMINDER)
         };
         let mut history: Vec<Turn> = Vec::new();
         let mut pinned_provider: Option<String> = None;
+        let mut effective_max_turns = max_turns;
+        let mut breaker_tripped = false;
+        let mut turn = 0;
 
-        for turn in 0..max_turns {
+        loop {
+            if turn >= effective_max_turns {
+                if breaker_tripped {
+                    return Err(format!(
+                        "{agent} did not produce a final answer within {effective_max_turns} \
+                         tool-calling turns (after one circuit-breaker extension)"
+                    )
+                    .into());
+                }
+                breaker_tripped = true;
+                let digest = Self::summarize_tool_call_history(&history);
+                let supervisor_task = format!(
+                    "# Original Task\n{task}\n\n\
+                     # Tool Calls Made So Far ({effective_max_turns} turns used)\n{digest}"
+                );
+                let directive = self
+                    .run("TurnBudgetSupervisor", crate::agents::TURN_BUDGET_SUPERVISOR, &supervisor_task)
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "    [{agent}] turn-budget supervisor call failed ({e}) -- falling \
+                             back to a generic directive"
+                        );
+                        "You are almost out of turns. Stop reading and answer now with what \
+                         you already have."
+                            .to_string()
+                    });
+                eprintln!(
+                    "    [{agent}] circuit breaker tripped at turn {effective_max_turns} -- \
+                     extending by {CIRCUIT_BREAKER_TURN_BUMP} turns; directive: {directive}"
+                );
+                self.ws.log_deviation(
+                    agent,
+                    &format!(
+                        "Turn budget circuit breaker tripped after {effective_max_turns} turns \
+                         -- extended by {CIRCUIT_BREAKER_TURN_BUMP} with this supervisor \
+                         directive:\n{directive}"
+                    ),
+                )?;
+                user = format!("{task}\n\n{directive}");
+                effective_max_turns += CIRCUIT_BREAKER_TURN_BUMP;
+            }
+
             let req = InferenceRequest {
                 system: system.to_string(),
                 user: user.clone(),
@@ -218,9 +284,36 @@ impl<'a> Manager<'a> {
             }
             history.push(Turn::Assistant { text: resp.text, tool_calls: resp.tool_calls });
             history.push(Turn::ToolResults(results));
+            turn += 1;
+        }
+    }
+
+    /// Condense an agentic conversation's tool-call history into a plain-text digest for
+    /// `TurnBudgetSupervisor`: every call made, and how many were exact repeats (same name and
+    /// arguments) of an earlier one -- the clearest single signal of the runaway pattern the
+    /// turn-budget circuit breaker exists to catch.
+    fn summarize_tool_call_history(history: &[Turn]) -> String {
+        let calls: Vec<String> = history
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Assistant { tool_calls, .. } => Some(tool_calls),
+                Turn::ToolResults(_) => None,
+            })
+            .flatten()
+            .map(|c| format!("{}({})", c.name, c.arguments))
+            .collect();
+
+        if calls.is_empty() {
+            return "(no tool calls made yet)".to_string();
         }
 
-        Err(format!("{agent} did not produce a final answer within {max_turns} tool-calling turns").into())
+        let mut seen = std::collections::HashSet::new();
+        let repeats = calls.iter().filter(|c| !seen.insert(c.as_str())).count();
+        format!(
+            "{} total call(s), {repeats} of them an exact repeat of an earlier call:\n{}",
+            calls.len(),
+            calls.join("\n"),
+        )
     }
 
     /// Run an agent with a single reviewer gate. Retries up to `max_iter` times.
@@ -358,7 +451,7 @@ mod agentic_tests {
     use inference_providers::{ToolCall, ToolDef};
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct EchoToolbox;
     impl Toolbox for EchoToolbox {
@@ -486,6 +579,150 @@ mod agentic_tests {
 
         let err = mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 3).unwrap_err();
         assert!(err.to_string().contains("did not produce a final answer"));
+    }
+
+    /// Exhausts a deliberately tiny original budget with real tool calls, answers the
+    /// `TurnBudgetSupervisor` call with a plausible directive, then finally produces a real
+    /// final answer once the circuit breaker's extension is in effect -- proving a call that
+    /// would have failed outright under the old hard cutoff now gets rescued.
+    struct EventuallyFinishesAfterBreaker {
+        agentic_turn: Arc<AtomicUsize>,
+        models: Vec<ModelInfo>,
+    }
+    impl Provider for EventuallyFinishesAfterBreaker {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            if req.system == crate::agents::TURN_BUDGET_SUPERVISOR {
+                return Ok(InferenceResponse {
+                    text: "You already have everything you need -- answer now.".into(),
+                    tool_calls: Vec::new(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    latency_ms: 1,
+                });
+            }
+            let n = self.agentic_turn.fetch_add(1, Ordering::SeqCst);
+            let (text, tool_calls) = if n < 3 {
+                (
+                    String::new(),
+                    vec![ToolCall {
+                        id: format!("call-{n}"),
+                        name: "echo".into(),
+                        arguments: json!({"text": format!("turn-{n}")}),
+                    }],
+                )
+            } else {
+                ("done after breaker".to_string(), Vec::new())
+            };
+            Ok(InferenceResponse {
+                text,
+                tool_calls,
+                input_tokens: 1,
+                output_tokens: 1,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_rescues_a_call_that_would_have_failed_under_the_old_hard_cutoff() {
+        let ws = temp_ws("breaker-rescue");
+        let provider: Box<dyn Provider> = Box::new(EventuallyFinishesAfterBreaker {
+            agentic_turn: Arc::new(AtomicUsize::new(0)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        // Original budget of 3 is exhausted by real tool calls, exactly like the test above --
+        // the only difference is this mock answers once the breaker grants more room.
+        let result = mgr
+            .run_agentic("TestAgent", "system", "task", &EchoToolbox, 3)
+            .expect("the circuit breaker should rescue this call instead of failing it");
+        assert_eq!(result, "done after breaker");
+
+        let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
+        assert!(deviations.contains("circuit breaker tripped after 3 turns"));
+        assert!(deviations.contains("You already have everything you need"));
+    }
+
+    #[test]
+    fn circuit_breaker_supervisor_sees_a_digest_flagging_duplicate_calls() {
+        let ws = temp_ws("breaker-digest");
+        let seen_supervisor_task = Arc::new(Mutex::new(None));
+        struct CapturesSupervisorTask {
+            seen: Arc<Mutex<Option<String>>>,
+            agentic_turn: Arc<AtomicUsize>,
+            models: Vec<ModelInfo>,
+        }
+        impl Provider for CapturesSupervisorTask {
+            fn name(&self) -> &str { "mock" }
+            fn models(&self) -> &[ModelInfo] { &self.models }
+            fn is_available(&self) -> bool { true }
+            fn supports_tools(&self) -> bool { true }
+            fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+                if req.system == crate::agents::TURN_BUDGET_SUPERVISOR {
+                    *self.seen.lock().unwrap() = Some(req.user.clone());
+                    return Ok(InferenceResponse {
+                        text: "answer now".into(),
+                        tool_calls: Vec::new(),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                        latency_ms: 1,
+                    });
+                }
+                let n = self.agentic_turn.fetch_add(1, Ordering::SeqCst);
+                // Two turns both make the exact same call -- the duplicate the digest exists to
+                // surface.
+                let (text, tool_calls) = if n < 2 {
+                    (
+                        String::new(),
+                        vec![ToolCall {
+                            id: format!("call-{n}"),
+                            name: "echo".into(),
+                            arguments: json!({"text": "same-every-time"}),
+                        }],
+                    )
+                } else {
+                    ("done".to_string(), Vec::new())
+                };
+                Ok(InferenceResponse {
+                    text,
+                    tool_calls,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    latency_ms: 1,
+                })
+            }
+        }
+        let provider: Box<dyn Provider> = Box::new(CapturesSupervisorTask {
+            seen: seen_supervisor_task.clone(),
+            agentic_turn: Arc::new(AtomicUsize::new(0)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 2)
+            .expect("should be rescued by the breaker");
+
+        let supervisor_task = seen_supervisor_task.lock().unwrap().clone().unwrap();
+        assert!(supervisor_task.contains("echo"));
+        assert!(
+            supervisor_task.contains("1 of them an exact repeat"),
+            "got: {supervisor_task}"
+        );
     }
 
     /// Provider "first" is the only one that ever answers correctly; "second" always answers

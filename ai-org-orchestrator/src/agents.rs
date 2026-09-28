@@ -12,7 +12,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
         "TargetImplementer" | "AgenticImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
-        | "TestEngineer" | "AcceptanceCriteria" => ModelTier::Light,
+        | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
         // Verdict-only agents: APPROVED/REJECTED, COMPLIANT/NON_COMPLIANT
@@ -57,6 +57,10 @@ pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writ
 /// AgenticImplementer, everything that calls `run_agentic`), not owned by any one of them, so
 /// it lives here rather than folded into a specific role's own skill file.
 pub const AGENTIC_BATCHING_REMINDER: &str = include_str!("../../skills/agentic-batching.md");
+/// Called by `Manager::run_agentic`'s turn-budget circuit breaker -- a fresh-context evaluation
+/// of an agentic call's progress so far, giving it concrete direction instead of just extending
+/// its budget and hoping. See the circuit breaker's own doc comment in `manager.rs`.
+pub const TURN_BUDGET_SUPERVISOR: &str = include_str!("../../skills/turn-budget-supervisor.md");
 /// Layered on top of `TARGET_IMPLEMENTER`'s core skill (never a standalone file, to avoid the
 /// two skills' core rules drifting apart) for a milestone rated substantial enough to run as
 /// AgenticImplementer instead of the plain TargetImplementer — see
