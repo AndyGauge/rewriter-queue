@@ -19,6 +19,12 @@ Before you define any new top-level type, module, or trait:
    artifacts (schema.rs, objective_contract.md, etc.) the same way other stages do.
 
 This doesn't change any of your core rules above — same file-size limit, same "no unfinished
-work" standard, same multi-file `// === path ===` output format for your actual answer. The
-tools are for checking and announcing scope before you write, not for returning your
-implementation.
+work" standard, same multi-file `// === path ===` output format for your actual answer.
+
+**Your implementation is your final answer text — never a tool call.** The tools above are only
+for checking notes and reading context before you write. Nothing you write to a tool is ever
+read as your implementation, no matter what a tool's own description says — if you're ever
+offered something that sounds like "write" or "save" your files directly, ignore it for that
+purpose. Your code always goes in the plain text response that ends your turn, using the same
+`// === path ===` markers (or a unified diff, if you were asked for a patch) as every other
+implementer call — exactly as if you had no tools at all.

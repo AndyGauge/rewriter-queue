@@ -781,6 +781,11 @@ impl<'a> Manager<'a> {
     /// case for a problem only the substantial ones actually have.
     const AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD: u8 = 25;
 
+    /// Hidden from AgenticImplementer's toolbox -- see `tools::RestrictedToolbox`'s doc comment
+    /// for why: neither is its job, and `write_artifact` specifically invited a real run to try
+    /// delivering its implementation through it instead of its final answer.
+    const AGENTIC_IMPLEMENTER_HIDDEN_TOOLS: &'static [&'static str] = &["write_artifact", "fan_out"];
+
     /// AgenticImplementer's actual iteration budget is `estimation::predict`'s guess, not the
     /// flat `max_iter` every other milestone shares -- but a calibrated fit over a handful of
     /// outlier data points could otherwise extrapolate to an absurd count for an extreme effort
@@ -1251,6 +1256,10 @@ impl<'a> Manager<'a> {
         let tokens_out_before = self.total_output_tokens();
         let started = std::time::Instant::now();
 
+        let restricted_toolbox = crate::tools::RestrictedToolbox {
+            inner: toolbox,
+            hidden: Self::AGENTIC_IMPLEMENTER_HIDDEN_TOOLS,
+        };
         let (code, passed, iterations_used) = self.run_with_dual_review(
             &ms_id,
             worker_name,
@@ -1258,7 +1267,7 @@ impl<'a> Manager<'a> {
             &base_task,
             effective_max_iter,
             variant,
-            use_agentic.then_some(toolbox),
+            use_agentic.then_some(&restricted_toolbox as &(dyn crate::tools::Toolbox + Sync)),
         )?;
 
         if let Some(path) = &history_path {
@@ -3256,6 +3265,12 @@ mod agentic_implementer_tests {
         assert!(tools.contains(&"read_notes".to_string()));
         assert!(tools.contains(&"leave_note".to_string()));
         assert!(!tools.is_empty(), "AgenticImplementer must actually be offered tools, not just the addendum text");
+        assert!(
+            !tools.contains(&"write_artifact".to_string()),
+            "write_artifact must be hidden -- a real run used it to try delivering its \
+             implementation instead of its final answer"
+        );
+        assert!(!tools.contains(&"fan_out".to_string()), "fan_out isn't AgenticImplementer's job");
     }
 
     #[test]

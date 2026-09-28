@@ -23,6 +23,31 @@ pub trait Toolbox: Sync {
     fn call(&self, name: &str, arguments: &Value) -> String;
 }
 
+/// Wraps another `Toolbox`, hiding tools that don't apply to the wrapped role -- a real run
+/// found the model using `write_artifact` to try to "deliver" its own milestone implementation
+/// instead of returning it as its final answer (the only thing `parse_file_sections`/the patch
+/// machinery actually reads), which `write_artifact`'s own description invites ("instead of
+/// only returning it as your final answer"). Removing the tool is the fix, not a warning
+/// competing against that description: AgenticImplementer's actual job (real/leave milestone
+/// notes, read source/artifacts) never needed `write_artifact` or `fan_out` in the first place.
+pub struct RestrictedToolbox<'a> {
+    pub inner: &'a (dyn Toolbox + Sync),
+    pub hidden: &'static [&'static str],
+}
+
+impl<'a> Toolbox for RestrictedToolbox<'a> {
+    fn tool_defs(&self) -> Vec<ToolDef> {
+        self.inner.tool_defs().into_iter().filter(|t| !self.hidden.contains(&t.name.as_str())).collect()
+    }
+
+    fn call(&self, name: &str, arguments: &Value) -> String {
+        if self.hidden.contains(&name) {
+            return format!("error: \"{name}\" is not available to this role");
+        }
+        self.inner.call(name, arguments)
+    }
+}
+
 /// The standard toolbox every uplifted pipeline stage gets: read the V1 source tree instead
 /// of having it pasted in whole, read/write named pipeline artifacts instead of having every
 /// upstream stage's output pasted into every downstream prompt, and fan sub-questions out to
@@ -563,5 +588,49 @@ mod tests {
         assert!(out.contains("## Result 1"), "got: {out}");
         assert!(out.contains("## Result 2"), "got: {out}");
         assert!(out.contains("answer to: task"), "got: {out}");
+    }
+
+    #[test]
+    fn restricted_toolbox_hides_named_tools_from_the_catalog() {
+        let src = temp_source("restricted-defs", &[]);
+        let ws = temp_ws("restricted-defs");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let inner = toolbox(&src, &ws, &mgr);
+        let restricted = RestrictedToolbox { inner: &inner, hidden: &["write_artifact", "fan_out"] };
+
+        let defs = restricted.tool_defs();
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["list_files", "read_file", "read_artifact", "leave_note", "read_notes"]);
+    }
+
+    #[test]
+    fn restricted_toolbox_rejects_a_call_to_a_hidden_tool_without_delegating() {
+        let src = temp_source("restricted-call", &[]);
+        let ws = temp_ws("restricted-call");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let inner = toolbox(&src, &ws, &mgr);
+        let restricted = RestrictedToolbox { inner: &inner, hidden: &["write_artifact"] };
+
+        let out = restricted.call("write_artifact", &json!({"name": "x", "content": "y"}));
+        assert!(out.contains("not available"), "got: {out}");
+        assert!(
+            ws.get_artifact("x").is_err(),
+            "a hidden tool's call must never reach the inner toolbox"
+        );
+    }
+
+    #[test]
+    fn restricted_toolbox_still_delegates_calls_to_tools_it_does_not_hide() {
+        let src = temp_source("restricted-passthrough", &[("src/main.rs", "fn main() {}")]);
+        let ws = temp_ws("restricted-passthrough");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let inner = toolbox(&src, &ws, &mgr);
+        let restricted = RestrictedToolbox { inner: &inner, hidden: &["write_artifact", "fan_out"] };
+
+        let out = restricted.call("read_file", &json!({"path": "src/main.rs"}));
+        assert_eq!(out, "fn main() {}");
     }
 }

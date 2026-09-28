@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.1]
+
+### Fixed
+
+- AgenticImplementer used `write_artifact` to try delivering its own milestone implementation,
+  instead of returning it as its final answer text — the only thing `parse_file_sections`/the
+  patch machinery actually reads. Root-caused against a real run (job #18): `write_artifact`'s
+  own tool description ("instead of only returning it as your final answer") directly invited
+  this, and one attempt even wrote plain JavaScript instead of Rust into it. The near-empty real
+  final answer that resulted failed the quality gate every time, and this one confusion alone
+  drove the patch-malformed rate from the earlier ~20% baseline up to ~52% for the run. Fixed by
+  removing `write_artifact` and `fan_out` from AgenticImplementer's toolbox entirely
+  (`tools::RestrictedToolbox`) rather than just adding a warning that would keep competing
+  against the tool's own inviting description — neither tool was ever actually its job (real/
+  leave milestone notes, read-only source/artifact access are). The addendum skill also now says
+  explicitly, in bold, that its implementation is always the final answer text, never a tool
+  call, regardless of what any offered tool's description suggests.
+
 ## [0.8.0]
 
 ### Added
