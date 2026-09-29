@@ -420,7 +420,7 @@ impl<'a> Manager<'a> {
         let id_prefix = format!("integration-fix/{escalation_depth}");
         let fix_sections = self.implement_milestones(
             &id_prefix, &fix_task, worker_system, contract, schema, max_repair_attempts, 0, None,
-            toolbox,
+            toolbox, false,
         )?;
         let mut sections = Self::parse_file_sections(&clean);
         sections.extend(fix_sections);
@@ -818,7 +818,7 @@ impl<'a> Manager<'a> {
         toolbox: &(dyn crate::tools::Toolbox + Sync),
     ) -> Result<String, Box<dyn std::error::Error>> {
         let mut sections = self.implement_milestones(
-            "root", root_task, worker_system, contract, schema, max_iter, 0, None, toolbox,
+            "root", root_task, worker_system, contract, schema, max_iter, 0, None, toolbox, false,
         )?;
         ensure_module_declarations(&mut sections);
 
@@ -881,6 +881,7 @@ impl<'a> Manager<'a> {
             let id_prefix = format!("root/gap-fill-{round}");
             let added = self.implement_milestones(
                 &id_prefix, &gap_task, worker_system, contract, schema, max_iter, 0, None, toolbox,
+                false,
             )?;
 
             if added.is_empty() {
@@ -936,6 +937,16 @@ impl<'a> Manager<'a> {
     /// workspace first (`Workspace::seed_variant_workspace`) so their concurrent `cargo build`
     /// runs — and the quality gate's stale-file cleanup — can't race each other or the shared
     /// directory.
+    ///
+    /// `force_agentic`: `true` once any ancestor of this call failed to converge as a plain
+    /// implementation and escalated (see `implement_one_milestone`'s convergence-failure
+    /// branch) -- every milestone this call produces routes to AgenticImplementer regardless of
+    /// its own effort rating, not just the ones above the threshold. A milestone that couldn't
+    /// converge plainly is itself evidence it needs the coordinated treatment (checking/leaving
+    /// notes, real source access), independent of whatever effort score the re-split happens to
+    /// assign it. Stays `true` through any further re-splits once set -- see
+    /// `implement_one_milestone`'s own doc comment for where it flips and why it never flips
+    /// back.
     fn implement_milestones(
         &self,
         id_prefix: &str,
@@ -947,6 +958,7 @@ impl<'a> Manager<'a> {
         depth: usize,
         variant: Option<&str>,
         toolbox: &(dyn crate::tools::Toolbox + Sync),
+        force_agentic: bool,
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let plan_task = format!(
             "{task}\n\n# Iteration Budget\nN = {max_iter}\n\n\
@@ -1030,6 +1042,7 @@ impl<'a> Manager<'a> {
                     depth,
                     variant,
                     toolbox,
+                    force_agentic,
                 )?;
                 sections.extend(sub);
                 continue;
@@ -1064,6 +1077,7 @@ impl<'a> Manager<'a> {
                                 depth,
                                 Some(ms_variant.as_str()),
                                 toolbox,
+                                force_agentic,
                             )
                             .map_err(|e| e.to_string())
                         })
@@ -1097,6 +1111,16 @@ impl<'a> Manager<'a> {
     /// so there's nothing else to fall back to), and a convergence-failure milestone that got
     /// no usable split keeps its own pre-escalation best-effort attempt instead of discarding
     /// it for nothing.
+    ///
+    /// `force_agentic`: see `implement_milestones`'s doc comment. Set here (never unset once
+    /// true) the moment a milestone fails to converge as a plain implementation and escalates
+    /// (`!passed` below) -- a real run (job #20) had a modest-effort milestone escalate, get
+    /// re-split, and land right back on the plain path because the re-split milestone's own
+    /// effort rating happened to fall under the threshold, even though the very reason it was
+    /// escalating in the first place was a failed plain attempt. Propagated (not reset) through
+    /// the HARD-risk branch too: a milestone already in a forced subtree that also turns out to
+    /// be HARD-risk shouldn't quietly fall back to plain treatment just because it's being
+    /// decomposed for a different reason.
     fn implement_one_milestone(
         &self,
         id_prefix: &str,
@@ -1108,6 +1132,7 @@ impl<'a> Manager<'a> {
         depth: usize,
         variant: Option<&str>,
         toolbox: &(dyn crate::tools::Toolbox + Sync),
+        force_agentic: bool,
     ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let ms_id = format!("{id_prefix}/{}", milestone.name);
 
@@ -1126,7 +1151,7 @@ impl<'a> Manager<'a> {
             )?;
             let sub = self.implement_milestones(
                 &ms_id, &milestone.task, worker_system, contract, schema, max_iter, depth + 1,
-                variant, toolbox,
+                variant, toolbox, force_agentic,
             )?;
             if !sub.is_empty() {
                 return Ok(sub);
@@ -1170,9 +1195,12 @@ impl<'a> Manager<'a> {
         // planner typo'd a pattern name from the catalog it was shown.
         // Above the effort threshold, AgenticImplementer (real tool access -- read/leave
         // milestone notes, read V1 source) replaces the plain, tool-less TargetImplementer --
-        // see `AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD`. Pattern guidance layers on top of
-        // whichever base skill this picks, same as before.
-        let use_agentic = milestone.effort >= Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD;
+        // see `AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD`. `force_agentic` overrides the effort
+        // check entirely once set -- see this function's own doc comment for why a milestone
+        // that already failed to converge plainly shouldn't fall back to plain treatment just
+        // because its re-split happened to come back with a low effort rating. Pattern guidance
+        // layers on top of whichever base skill this picks, same as before either way.
+        let use_agentic = force_agentic || milestone.effort >= Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD;
         let worker_name = if use_agentic { "AgenticImplementer" } else { "TargetImplementer" };
         let base_skill = if use_agentic {
             format!(
@@ -1183,12 +1211,20 @@ impl<'a> Manager<'a> {
             worker_system.to_string()
         };
         if use_agentic {
-            eprintln!(
-                "  [milestones] '{}': effort {}/255 ≥ {} — routing to AgenticImplementer",
-                milestone.name,
-                milestone.effort,
-                Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
-            );
+            if force_agentic {
+                eprintln!(
+                    "  [milestones] '{}': routing to AgenticImplementer (forced -- an earlier \
+                     attempt in this milestone's history failed to converge plainly)",
+                    milestone.name
+                );
+            } else {
+                eprintln!(
+                    "  [milestones] '{}': effort {}/255 ≥ {} — routing to AgenticImplementer",
+                    milestone.name,
+                    milestone.effort,
+                    Self::AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
+                );
+            }
         }
 
         let implementer_system = if milestone.patterns.is_empty() {
@@ -1311,9 +1347,12 @@ impl<'a> Manager<'a> {
                  pieces.",
                 milestone.task
             );
+            // Unconditionally `true`, not `force_agentic`: reaching this branch at all means
+            // *this* attempt just failed to converge plainly, regardless of whether an ancestor
+            // had already forced it -- see this function's own doc comment.
             let sub = self.implement_milestones(
                 &ms_id, &retry_task, worker_system, contract, schema, max_iter, depth + 1,
-                variant, toolbox,
+                variant, toolbox, true,
             )?;
             if !sub.is_empty() {
                 return Ok(sub);
@@ -2573,7 +2612,7 @@ mod pattern_prescription_tests {
             patterns: vec!["trait-objects".to_string()],
             effort: DEFAULT_EFFORT,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("milestone should implement cleanly");
 
         let log = log.lock().unwrap();
@@ -2604,7 +2643,7 @@ mod pattern_prescription_tests {
             patterns: Vec::new(),
             effort: DEFAULT_EFFORT,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("milestone should implement cleanly");
 
         let log = log.lock().unwrap();
@@ -2629,7 +2668,7 @@ mod pattern_prescription_tests {
             patterns: vec!["trait-object".to_string()], // missing the trailing 's'
             effort: DEFAULT_EFFORT,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("an unknown pattern name must not fail the milestone");
 
         let deviations = std::fs::read_to_string(ws.deviations_path()).unwrap();
@@ -2901,7 +2940,7 @@ mod escalation_fallback_tests {
             effort: DEFAULT_EFFORT,
         };
         let result = mgr
-            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("a HARD milestone must still be attempted when its escalation splits into nothing");
 
         assert_eq!(planner_calls.load(Ordering::SeqCst), 1, "the HARD-risk escalation must have been tried");
@@ -2944,7 +2983,7 @@ mod escalation_fallback_tests {
             effort: DEFAULT_EFFORT,
         };
         let result = mgr
-            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 2, 0, None, &NullToolbox)
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 2, 0, None, &NullToolbox, false)
             .expect("a non-converging milestone whose escalation splits into nothing must still return its best effort");
 
         assert_eq!(planner_calls.load(Ordering::SeqCst), 1, "the convergence-failure escalation must have been tried");
@@ -3055,7 +3094,7 @@ mod estimation_wiring_tests {
             patterns: Vec::new(),
             effort: 200,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("milestone should implement cleanly");
 
         // Not opting in must mean literally nothing is written anywhere -- in particular never
@@ -3080,7 +3119,7 @@ mod estimation_wiring_tests {
             patterns: Vec::new(),
             effort: 180,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &NullToolbox, false)
             .expect("milestone should implement cleanly");
 
         let history = crate::estimation::load_history(&history_path);
@@ -3253,7 +3292,7 @@ mod agentic_implementer_tests {
             patterns: Vec::new(),
             effort: 200,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox, false)
             .expect("milestone should implement cleanly");
 
         let log = log.lock().unwrap();
@@ -3292,7 +3331,7 @@ mod agentic_implementer_tests {
             patterns: Vec::new(),
             effort: 10,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox, false)
             .expect("milestone should implement cleanly");
 
         let log = log.lock().unwrap();
@@ -3399,7 +3438,7 @@ mod agentic_implementer_tests {
             effort: 250,
         };
         let result = mgr
-            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox)
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 3, 0, None, &toolbox, false)
             .expect("milestone should implement cleanly after reading and leaving a note");
 
         assert_eq!(result.get("src/main.rs").map(String::as_str), Some("fn main() {}\n"));
@@ -3459,7 +3498,7 @@ mod agentic_implementer_tests {
             patterns: Vec::new(),
             effort: 25, // exactly at AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 10, 0, None, &toolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 10, 0, None, &toolbox, false)
             .expect("a non-converging milestone still returns its best effort, not an error");
 
         let history = crate::estimation::load_history(&history_path);
@@ -3515,7 +3554,7 @@ mod agentic_implementer_tests {
             patterns: Vec::new(),
             effort: 230,
         };
-        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 5, 0, None, &toolbox)
+        mgr.implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 5, 0, None, &toolbox, false)
             .expect("a non-converging milestone still returns its best effort, not an error");
 
         let history = crate::estimation::load_history(&history_path);
@@ -3533,5 +3572,96 @@ mod agentic_implementer_tests {
         );
 
         let _ = std::fs::remove_file(&history_path);
+    }
+
+    /// Answers MilestonePlanner's escalation with a single, deliberately LOW-effort retry
+    /// milestone -- the whole point of this test is proving that low effort rating doesn't
+    /// matter once a milestone has already failed to converge plainly. The implementer role's
+    /// first call (the original, low-effort attempt) fails the quality gate; every call after
+    /// that succeeds, so the retry converges immediately once it runs.
+    struct ForcesAgenticOnRetryDespiteLowEffort {
+        log: Arc<Mutex<Vec<String>>>,
+        implementer_calls: Arc<std::sync::atomic::AtomicUsize>,
+        models: Vec<ModelInfo>,
+    }
+
+    impl Provider for ForcesAgenticOnRetryDespiteLowEffort {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[ModelInfo] { &self.models }
+        fn is_available(&self) -> bool { true }
+        fn supports_tools(&self) -> bool { true }
+        fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+            self.log.lock().unwrap().push(req.system.clone());
+            let text = if req.system == MILESTONE_PLANNER {
+                "## MILESTONE: retry\nRISK: EASY\nEFFORT: 5\nTASK: Retry the small thing.\n"
+                    .to_string()
+            } else if req.system == SECURITY_REVIEWER {
+                "COMPLIANT".to_string()
+            } else if req.system == MAINTENANCE_REVIEWER {
+                "APPROVE".to_string()
+            } else {
+                let n = self.implementer_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    "fn main() {\n    undefined_fn();\n}\n".to_string()
+                } else {
+                    "fn main() {}\n".to_string()
+                }
+            };
+            Ok(InferenceResponse {
+                text,
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                provider: "mock".into(),
+                model: "mock".into(),
+                latency_ms: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn a_milestone_that_fails_plainly_forces_agentic_on_the_retry_despite_low_effort() {
+        let ws = temp_ws("force-on-retry");
+        let src = temp_source("force-on-retry");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let implementer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Box<dyn Provider> = Box::new(ForcesAgenticOnRetryDespiteLowEffort {
+            log: log.clone(),
+            implementer_calls: implementer_calls.clone(),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+        let toolbox = PipelineToolbox::new(&src, &ws, &mgr, "MilestonePlanner", MILESTONE_PLANNER, 5);
+
+        let ms = Milestone {
+            name: "original".to_string(),
+            risk: Risk::Easy,
+            task: "Do a small thing.".to_string(),
+            depends_on: Vec::new(),
+            patterns: Vec::new(),
+            effort: 5, // well below AGENTIC_IMPLEMENTER_EFFORT_THRESHOLD
+        };
+        let result = mgr
+            .implement_one_milestone("root", &ms, TARGET_IMPLEMENTER, "contract", "schema", 1, 0, None, &toolbox, false)
+            .expect("should converge once the forced retry runs");
+
+        assert_eq!(result.get("src/main.rs").map(String::as_str), Some("fn main() {}\n"));
+
+        let log = log.lock().unwrap();
+        let implementer_systems: Vec<&String> = log
+            .iter()
+            .filter(|s| s.as_str() != MILESTONE_PLANNER && s.as_str() != SECURITY_REVIEWER && s.as_str() != MAINTENANCE_REVIEWER)
+            .collect();
+        assert_eq!(implementer_systems.len(), 2, "one failed original attempt, one retry");
+        assert!(
+            !implementer_systems[0].contains("Coordinating With Concurrent Milestones"),
+            "the original low-effort attempt must stay plain"
+        );
+        assert!(
+            implementer_systems[1].contains("Coordinating With Concurrent Milestones"),
+            "the retry after a failed plain attempt must be forced agentic despite its own low \
+             effort rating"
+        );
     }
 }

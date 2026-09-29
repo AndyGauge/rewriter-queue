@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.4]
+
+### Changed
+
+- A milestone that fails to converge as a plain implementation and escalates now forces
+  AgenticImplementer on the retry, regardless of the re-split milestone's own effort rating.
+  Root-caused against a real run (job #20): a modest-effort milestone failed to converge
+  plainly, escalated, and the re-split milestone happened to also get rated below the agentic
+  threshold — so it landed right back on the plain path, even though the very reason it
+  escalated in the first place was a failed plain attempt. `force_agentic` propagates through
+  `implement_milestones`/`implement_one_milestone`, set the moment any milestone in a subtree
+  fails to converge and never unset again (including through a further HARD-risk split of an
+  already-forced milestone) — a milestone that couldn't converge plainly is itself evidence it
+  needs the coordinated treatment (checking/leaving notes, real source access), independent of
+  whatever effort score a later re-split happens to assign it.
+
 ## [0.8.3]
 
 ### Fixed
