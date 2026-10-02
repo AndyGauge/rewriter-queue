@@ -355,11 +355,22 @@ impl<'a> Manager<'a> {
                 ),
             )?;
 
+            let attempt_task = if attempt == 0 {
+                base_task.clone()
+            } else {
+                let diagnosis = self.diagnose_failure(
+                    &format!("integration/diagnose/{attempt}"),
+                    contract,
+                    &clean,
+                    &errors,
+                );
+                crate::debug::with_diagnosis(&base_task, &diagnosis)
+            };
             let repaired_raw = self.ws.checkpoint(&format!("integration/repair/{attempt}"), || {
                 self.try_patch(
                     "TargetImplementer-Integration",
                     worker_system,
-                    &base_task,
+                    &attempt_task,
                     &clean,
                     &errors,
                     &format!("integration attempt {attempt}"),
@@ -410,12 +421,21 @@ impl<'a> Manager<'a> {
             ),
         )?;
 
-        let fix_task = format!(
-            "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
-             # Current V2 Implementation\n```rust\n{clean}\n```\n\n\
-             # Build/Test Failures Repeated Patch Attempts Could Not Fix\n{errors}\n\n\
-             Plan milestones to fix EXACTLY these failures. Do not redesign, re-implement, or \
-             re-describe anything the failures above don't implicate."
+        let diagnosis = self.diagnose_failure(
+            &format!("integration/diagnose/escalation-{escalation_depth}"),
+            contract,
+            &clean,
+            &errors,
+        );
+        let fix_task = crate::debug::with_diagnosis(
+            &format!(
+                "# ObjectiveContract\n{contract}\n\n# Schema\n```rust\n{schema}\n```\n\n\
+                 # Current V2 Implementation\n```rust\n{clean}\n```\n\n\
+                 # Build/Test Failures Repeated Patch Attempts Could Not Fix\n{errors}\n\n\
+                 Plan milestones to fix EXACTLY these failures. Do not redesign, re-implement, or \
+                 re-describe anything the failures above don't implicate."
+            ),
+            &diagnosis,
         );
         let id_prefix = format!("integration-fix/{escalation_depth}");
         let fix_sections = self.implement_milestones(

@@ -1,4 +1,5 @@
 mod agents;
+mod debug;
 mod estimation;
 mod manager;
 mod patch;

@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.6]
+
+### Added
+
+- DebugImplementer: a diagnosing agent for repairs that keep failing. From the second failed
+  integration repair attempt on, and again when escalating to MilestonePlanner for a fix plan,
+  it reads the quality-gate output, the contract and the crate, and writes a diagnosis (root
+  cause, evidence quoted from the output, whether the code, the test or the contract is at
+  fault, the smallest fix, what not to touch) that is handed to whoever makes the change. It
+  carries every implementer pattern as a pitfall list and is told to diagnose only failures
+  present in the gate output. Root-caused against a real run (job #24) where ten repair attempts
+  and a fix plan never found that a usage constant ending in a newline was printed with
+  `eprintln!`, and kept rewriting working drawing logic instead.
+- `output-text-fidelity` implementer pattern: trailing-newline doubling with `println!` on a
+  string that already ends in a newline, and repairing against a failed `assert_eq!`'s
+  left/right difference rather than a guess.
+
 ## [0.8.5]
 
 ### Added

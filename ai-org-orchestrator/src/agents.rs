@@ -9,7 +9,8 @@ pub fn agent_tier(name: &str) -> ModelTier {
     let base = name.split('-').next().unwrap_or(name);
     match base {
         // Only the agents that generate large code artifacts need the top tier
-        "TargetImplementer" | "AgenticImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
+        "TargetImplementer" | "AgenticImplementer" | "MergeAgent" | "SystemTestWriter"
+        | "DebugImplementer" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
         | "PlanReviewer" | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor" => ModelTier::Light,
@@ -27,8 +28,8 @@ pub fn agent_hora_depth(name: &str) -> u8 {
     match base {
         "MissionArchitect" | "InductiveReasoner" => 3,
         "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" | "PlanReviewer" => 2,
-        "TargetImplementer" | "AgenticImplementer" | "ContractReviewer" | "TestEngineer"
-        | "MaintenanceReviewer" | "ProductionReadinessReviewer" | "AcceptanceCriteria"
+        "TargetImplementer" | "AgenticImplementer" | "DebugImplementer" | "ContractReviewer"
+        | "TestEngineer" | "MaintenanceReviewer" | "ProductionReadinessReviewer" | "AcceptanceCriteria"
         | "SystemTestWriter" => 1,
         _ => 0,
     }
@@ -51,6 +52,7 @@ pub const PRODUCTION_READINESS_REVIEWER: &str =
     include_str!("../../skills/production-readiness-reviewer.md");
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
 pub const PLAN_REVIEWER: &str = include_str!("../../skills/plan-reviewer.md");
+pub const DEBUG_IMPLEMENTER: &str = include_str!("../../skills/debug-implementer.md");
 pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
 pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
 /// Appended by `Manager::run_agentic` to every agentic call that's offered tools -- shared
@@ -101,6 +103,13 @@ pub const IMPLEMENTER_PATTERNS: &[ImplementerPattern] = &[
         description: "thiserror's #[source]/derive requirements and chrono's fallible \
                        DateTime::from_timestamp — Result/Option correctness gotchas.",
         content: include_str!("../../skills/target-implementer/patterns/error-handling.md"),
+    },
+    ImplementerPattern {
+        name: "output-text-fidelity",
+        description: "Exact stdout/stderr text: trailing-newline doubling from println! on a \
+                       string that already ends in a newline, and repairing against a failed \
+                       assert_eq!'s left/right difference.",
+        content: include_str!("../../skills/target-implementer/patterns/output-text-fidelity.md"),
     },
     ImplementerPattern {
         name: "trait-objects",
