@@ -175,9 +175,24 @@ impl Observer {
     }
 
     pub fn end_stage(&self) {
+        self.close_stage(true);
+    }
+
+    /// Records a failure that ends the run: an error event, then the open stage (if any) ended
+    /// with `ok: false`, so the outcome is unambiguous even when nothing else follows.
+    pub fn fail(&self, agent: &str, text: &str) {
+        self.error(agent, text);
+        self.close_stage(false);
+    }
+
+    fn close_stage(&self, ok: bool) {
         let previous = lock(&self.inner.stage).take();
         if let Some(name) = previous {
-            self.emit(Event::new("orchestrator", EventKind::StageEnd, &name).with_stage(&name));
+            self.emit(
+                Event::new("orchestrator", EventKind::StageEnd, &name)
+                    .with_stage(&name)
+                    .with_detail(json!({"ok": ok})),
+            );
         }
     }
 
@@ -270,7 +285,21 @@ impl Observer {
         let observer = self.clone();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            observer.error("orchestrator", &format!("panic: {info}"));
+            let payload = info.payload();
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            let message = match info.location() {
+                Some(l) => format!("panic: {reason} (at {}:{})", l.file(), l.line()),
+                None => format!("panic: {reason}"),
+            };
+            if std::thread::current().name() == Some("main") {
+                observer.fail("orchestrator", &message);
+            } else {
+                observer.error("orchestrator", &message);
+            }
             previous(info);
         }));
     }
@@ -309,6 +338,38 @@ mod tests {
         assert!(events.iter().all(|e| e.job_id == Some(7)));
         assert!(events.iter().all(|e| e.stage.as_deref() == Some("Schema")));
         assert_eq!(events[1].summary, "chose a flat module layout");
+    }
+
+    #[test]
+    fn fail_records_an_error_then_ends_the_open_stage_as_not_ok() {
+        let dir = temp_dir("fail");
+        let obs = Observer::new(dir.join("events.jsonl"), None, None);
+        obs.stage("Schema");
+        obs.fail("orchestrator", "schema phase failed");
+        obs.fail("orchestrator", "again");
+        let events = parse_events(&std::fs::read_to_string(dir.join("events.jsonl")).unwrap());
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::StageStart,
+                EventKind::Error,
+                EventKind::StageEnd,
+                EventKind::Error
+            ]
+        );
+        assert_eq!(events[1].stage.as_deref(), Some("Schema"));
+        assert_eq!(events[2].detail.as_ref().unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn a_normally_ended_stage_is_marked_ok() {
+        let dir = temp_dir("ok");
+        let obs = Observer::new(dir.join("events.jsonl"), None, None);
+        obs.stage("A");
+        obs.end_stage();
+        let events = parse_events(&std::fs::read_to_string(dir.join("events.jsonl")).unwrap());
+        assert_eq!(events[1].detail.as_ref().unwrap()["ok"], true);
     }
 
     #[test]

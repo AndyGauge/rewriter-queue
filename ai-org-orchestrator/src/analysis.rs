@@ -1,7 +1,7 @@
 use crate::agents::POST_RUN_ANALYST;
 use crate::manager::Manager;
+use crate::provider_setup;
 use crate::workspace::Workspace;
-use inference_providers::Registry;
 use run_events::{
     parse_events, Analysis, Event, EventKind, FeatureRequest, Priority, RequestStatus,
 };
@@ -518,59 +518,6 @@ pub fn analyze(job_id: u64, events: &[Event], mgr: &Manager) -> Analysis {
     build_analysis(job_id, events, &facts, reply)
 }
 
-fn build_registry() -> Registry {
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    let cfg = inference_providers::config::Config::load();
-    let mut registry = if cfg.providers.is_empty() {
-        Registry::from_env(anthropic_key, None, Vec::new())
-    } else {
-        Registry::from_config(&cfg)
-    };
-    if let Ok(key) = std::env::var("GROQ_API_KEY") {
-        registry.add_openai_compat(
-            "groq".into(),
-            "https://api.groq.com/openai/v1".into(),
-            key,
-            vec![
-                "llama-3.3-70b-versatile".into(),
-                "llama-3.1-8b-instant".into(),
-            ],
-        );
-    }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        registry.add_openai_compat(
-            "openai".into(),
-            "https://api.openai.com/v1".into(),
-            key,
-            vec!["gpt-4o".into(), "gpt-4o-mini".into()],
-        );
-    }
-    if let Ok(host) = std::env::var("REWRITER_LMSTUDIO_HOST") {
-        let model =
-            std::env::var("REWRITER_LMSTUDIO_MODEL").unwrap_or_else(|_| "qwen2.5-coder:32b".into());
-        registry.add_openai_compat(
-            "lmstudio".into(),
-            format!("{}/v1", host.trim_end_matches('/')),
-            String::new(),
-            vec![model],
-        );
-    }
-    let cli_model = std::env::var("REWRITER_CLAUDE_CLI_MODEL").ok().or_else(|| {
-        std::env::var("REWRITER_USE_CLAUDE_CLI")
-            .ok()
-            .filter(|v| v == "1")
-            .map(|_| "claude-haiku-4-5-20251001".into())
-    });
-    if let Some(model) = cli_model {
-        registry.add_claude_cli(model);
-    }
-    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-        registry.add_gemini(key, vec!["gemini-2.0-flash".into()]);
-    }
-    registry.run_qq();
-    registry
-}
-
 struct CliArgs {
     job_id: u64,
     events: String,
@@ -626,7 +573,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     ));
     let analysis = match Workspace::new(&work) {
         Ok(ws) => {
-            let registry = build_registry();
+            let registry = provider_setup::build_registry(
+                &inference_providers::config::Config::load(),
+                provider_setup::ProviderOptions::from_env(),
+            );
             let mgr = Manager::new(&ws, &registry);
             analyze(cli.job_id, &events, &mgr)
         }
@@ -662,6 +612,7 @@ fn write_analysis(analysis: &Analysis, out: &Path) -> i32 {
 mod tests {
     use super::*;
     use inference_providers::backends::Provider;
+    use inference_providers::Registry;
     use inference_providers::types::{
         InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError,
     };

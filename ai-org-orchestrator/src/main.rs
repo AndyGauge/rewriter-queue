@@ -6,13 +6,13 @@ mod manager;
 mod observer;
 mod patch;
 mod plan_review;
+mod provider_setup;
 mod quality;
 mod synthesis;
 mod tools;
 mod workspace;
 
 use agents::*;
-use inference_providers::Registry;
 use manager::Manager;
 use std::collections::HashMap;
 use std::path::Path;
@@ -41,12 +41,7 @@ fn parse_args() -> Args {
     let mut ollama_host: Option<String> = None;
     let mut lmstudio_host: Option<String> = std::env::var("REWRITER_LMSTUDIO_HOST").ok();
     let mut lmstudio_model: Option<String> = std::env::var("REWRITER_LMSTUDIO_MODEL").ok();
-    let mut claude_cli_model: Option<String> = std::env::var("REWRITER_CLAUDE_CLI_MODEL")
-        .ok()
-        .or_else(|| std::env::var("REWRITER_USE_CLAUDE_CLI")
-            .ok()
-            .filter(|v| v == "1")
-            .map(|_| "claude-haiku-4-5-20251001".into()));
+    let mut claude_cli_model: Option<String> = provider_setup::claude_cli_model_from_env();
     let mut gemini_key: Option<String> = std::env::var("GEMINI_API_KEY").ok();
     let mut max_iter = 10usize;
 
@@ -128,65 +123,38 @@ fn main() {
     let openai_key    = std::env::var("OPENAI_API_KEY").ok();
     let cfg = inference_providers::config::Config::load();
 
+    let observer = observer::Observer::from_env(Path::new(&args.workspace));
+    observer.install_panic_hook();
+
     if anthropic_key.is_none() && groq_key.is_none() && openai_key.is_none()
         && args.local_model.is_none() && args.gemini_key.is_none()
         && cfg.providers.is_empty()
     {
-        eprintln!(
-            "error: set at least one of ANTHROPIC_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, \
-             or configure [[providers]] in ~/.config/rewriter/config.toml"
-        );
+        let message = "error: set at least one of ANTHROPIC_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, \
+             GEMINI_API_KEY, or configure [[providers]] in ~/.config/rewriter/config.toml";
+        eprintln!("{message}");
+        observer.fail("orchestrator", message);
         std::process::exit(1);
     }
 
-    let observer = observer::Observer::from_env(Path::new(&args.workspace));
-    observer.install_panic_hook();
     let ws = Workspace::new(&args.workspace)
         .expect("cannot open workspace")
         .with_observer(observer);
 
-    let mut registry = if cfg.providers.is_empty() {
-        let ollama_models = args.local_model.as_ref()
-            .map(|m| vec![m.clone()])
-            .unwrap_or_default();
-        Registry::from_env(anthropic_key, args.ollama_host.clone(), ollama_models)
-    } else {
-        Registry::from_config(&cfg)
-    };
-
-    if let Some(key) = groq_key {
-        registry.add_openai_compat(
-            "groq".into(),
-            "https://api.groq.com/openai/v1".into(),
-            key,
-            vec!["llama-3.3-70b-versatile".into(), "llama-3.1-8b-instant".into()],
-        );
-    }
-    if let Some(key) = openai_key {
-        registry.add_openai_compat(
-            "openai".into(),
-            "https://api.openai.com/v1".into(),
-            key,
-            vec!["gpt-4o".into(), "gpt-4o-mini".into()],
-        );
-    }
-    if let Some(host) = args.lmstudio_host {
-        let model = args.lmstudio_model
-            .unwrap_or_else(|| "qwen2.5-coder:32b".into());
-        eprintln!("LM Studio: {host} model={model}");
-        registry.add_openai_compat(
-            "lmstudio".into(),
-            format!("{}/v1", host.trim_end_matches('/')),
-            String::new(), // no API key needed
-            vec![model],
-        );
-    }
-    if let Some(model) = args.claude_cli_model {
-        registry.add_claude_cli(model);
-    }
-    if let Some(key) = args.gemini_key {
-        registry.add_gemini(key, vec!["gemini-2.0-flash".into()]);
-    }
+    let registry = provider_setup::build_registry(
+        &cfg,
+        provider_setup::ProviderOptions {
+            anthropic_key,
+            groq_key,
+            openai_key,
+            local_model: args.local_model.clone(),
+            ollama_host: args.ollama_host.clone(),
+            lmstudio_host: args.lmstudio_host.clone(),
+            lmstudio_model: args.lmstudio_model.clone(),
+            claude_cli_model: args.claude_cli_model.clone(),
+            gemini_key: args.gemini_key.clone(),
+        },
+    );
 
     // Probe each provider for context limit and quality before any real work.
     registry.run_qq();
@@ -208,6 +176,7 @@ fn main() {
                  artifact, not optional scaffolding.",
                 args.workspace
             );
+            ws.observer().inspect(|o| o.fail("orchestrator", "no mission set"));
             std::process::exit(1);
         }
     };
@@ -218,6 +187,7 @@ fn main() {
             "error: no readable source files found under {} (empty dir, or every file is binary/non-UTF-8)",
             args.source
         );
+        ws.observer().inspect(|o| o.fail("orchestrator", "no readable source files found"));
         std::process::exit(1);
     }
 

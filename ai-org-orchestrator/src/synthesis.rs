@@ -413,6 +413,12 @@ impl<'a> Manager<'a> {
             "  [integration] still failing after {max_repair_attempts} repair attempts — \
              escalating to MilestonePlanner for a targeted fix plan (escalation {escalation_depth})"
         );
+        if let Some(o) = self.ws.observer() {
+            o.retry(
+                "MilestonePlanner",
+                &format!("integration escalation {escalation_depth}: repair attempts exhausted"),
+            );
+        }
         self.ws.log_deviation(
             "MilestonePlanner",
             &format!(
@@ -1353,6 +1359,12 @@ impl<'a> Manager<'a> {
                  escalating for a finer split",
                 milestone.name
             );
+            if let Some(o) = self.ws.observer() {
+                o.retry(
+                    "MilestonePlanner",
+                    &format!("milestone '{}' did not converge, escalating for a finer split", milestone.name),
+                );
+            }
             self.ws.log_deviation(
                 "MilestonePlanner",
                 &format!(
