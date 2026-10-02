@@ -2,6 +2,7 @@ mod archive;
 mod backend;
 mod client;
 mod config;
+mod events;
 mod job;
 mod mcp;
 mod server;
@@ -33,6 +34,13 @@ Commands:
   artifacts <id>    List artifact files a job has emitted so far (works while running)
   artifact <id> <path>
                     Print one artifact's content (works while running)
+  events <id> [--kind <kind>] [--agent <name>] [--since <timestamp>] [--json]
+                    Show the structured events a job's agents reported (works while running)
+  analysis <id> [--json]
+                    Show the post-run analysis of a finished job
+  requests [--json] List feature requests gathered from analyses
+  request <id> <open|accepted|done|rejected>
+                    Set a feature request's status
   watch             Live queue view; refreshes until interrupted
   serve [--bind <addr>]
                     Host the queue over HTTP (default 0.0.0.0:8003) and run its jobs
@@ -52,6 +60,10 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|w| w[0] == name)
         .map(|w| w[1].as_str())
+}
+
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
 }
 
 fn id_arg(args: &[String]) -> u32 {
@@ -104,6 +116,42 @@ fn run(args: &[String]) -> std::io::Result<()> {
             let id = id_arg(rest);
             let Some(path) = rest.get(1) else { usage() };
             println!("{}", Backend::open()?.read_artifact(id, path)?);
+        }
+        Some("events") => {
+            let filter = events::EventFilter {
+                kind: flag(rest, "--kind").map(events::parse_kind).transpose()?,
+                agent: flag(rest, "--agent").map(str::to_string),
+                since: flag(rest, "--since").map(str::to_string),
+            };
+            let found = Backend::open()?.events(id_arg(rest), &filter)?;
+            if has_flag(rest, "--json") {
+                print!("{}", events::to_jsonl(&found));
+            } else {
+                println!("{}", events::render_events(&found));
+            }
+        }
+        Some("analysis") => {
+            let analysis = Backend::open()?.analysis(id_arg(rest))?;
+            if has_flag(rest, "--json") {
+                println!("{}", serde_json::to_string_pretty(&analysis)?);
+            } else {
+                println!("{}", events::render_analysis(&analysis));
+            }
+        }
+        Some("requests") => {
+            let requests = Backend::open()?.requests()?;
+            if has_flag(rest, "--json") {
+                println!("{}", serde_json::to_string_pretty(&requests)?);
+            } else {
+                println!("{}", events::render_requests(&requests));
+            }
+        }
+        Some("request") => {
+            let (Some(id), Some(status)) = (rest.first(), rest.get(1)) else {
+                usage()
+            };
+            let updated = Backend::open()?.set_request_status(id, events::parse_status(status)?)?;
+            println!("{}", events::render_requests(&[updated]));
         }
         Some("watch") => {
             let backend = Backend::open()?;

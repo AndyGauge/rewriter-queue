@@ -83,6 +83,10 @@ impl Queue {
         Ok(Self { root })
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn job_path(&self, id: u32) -> PathBuf {
         self.root.join("jobs").join(format!("{id:04}.json"))
     }

@@ -10,6 +10,7 @@ name = "rewriter-queue"
 path = "src/main.rs"
 
 [dependencies]
+run-events = { path = "../run-events" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -1,6 +1,8 @@
 use crate::client::Client;
+use crate::events::{self, EventFilter};
 use crate::job::{Job, Queue, Spec, State};
 use crate::{config, view, worker};
+use run_events::{Analysis, Event, FeatureRequest, RequestStatus};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -121,6 +123,38 @@ impl Backend {
             }
         }
     }
+
+    pub fn events(&self, id: u32, filter: &EventFilter) -> io::Result<Vec<Event>> {
+        match self {
+            Backend::Local(queue) => events::read(queue, &queue.get(id)?, filter),
+            Backend::Remote(client) => client.events(id, filter),
+        }
+    }
+
+    pub fn analysis(&self, id: u32) -> io::Result<Analysis> {
+        match self {
+            Backend::Local(queue) => events::read_analysis(queue, id),
+            Backend::Remote(client) => client.analysis(id),
+        }
+    }
+
+    pub fn requests(&self) -> io::Result<Vec<FeatureRequest>> {
+        match self {
+            Backend::Local(queue) => events::load_requests(queue),
+            Backend::Remote(client) => client.requests(),
+        }
+    }
+
+    pub fn set_request_status(
+        &self,
+        id: &str,
+        status: RequestStatus,
+    ) -> io::Result<FeatureRequest> {
+        match self {
+            Backend::Local(queue) => events::set_request_status(queue, id, status),
+            Backend::Remote(client) => client.set_request_status(id, status),
+        }
+    }
 }
 
 pub fn list_artifacts_at(workspace: &Path) -> io::Result<String> {
@@ -149,11 +183,16 @@ pub fn list_artifacts_at(workspace: &Path) -> io::Result<String> {
 
 pub fn read_artifact_at(workspace: &Path, rel_path: &str) -> io::Result<String> {
     let dir = workspace.join("artifacts");
-    let has_illegal_component = Path::new(rel_path)
-        .components()
-        .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+    let has_illegal_component = Path::new(rel_path).components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
     if rel_path.is_empty() || has_illegal_component {
-        return Err(io::Error::other(format!("invalid artifact path: {rel_path}")));
+        return Err(io::Error::other(format!(
+            "invalid artifact path: {rel_path}"
+        )));
     }
     std::fs::read_to_string(dir.join(rel_path))
 }

@@ -1,5 +1,7 @@
+use crate::events;
 use crate::job::{Job, Queue, State};
 use chrono::Utc;
+use run_events::{Analysis, RequestStatus};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -13,6 +15,13 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Cap on automatic relaunches for a job the worker finds interrupted (crash or restart),
 /// so a job whose orchestrator dies immediately every time doesn't loop forever.
 const MAX_RESUMES: u32 = 5;
+const ANALYZE_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Where a job's orchestrator should post its events: the queue server hosting this worker.
+pub struct Reporting {
+    pub url: String,
+    pub token: String,
+}
 
 const PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -69,7 +78,7 @@ pub fn run(queue: &Queue) -> io::Result<()> {
         let Some(lock) = lock_worker(queue)? else {
             return Ok(());
         };
-        serve(queue, Some(IDLE_EXIT))?;
+        serve(queue, Some(IDLE_EXIT), None)?;
         drop(lock);
         if queue.next_queued()?.is_none() {
             return Ok(());
@@ -77,13 +86,17 @@ pub fn run(queue: &Queue) -> io::Result<()> {
     }
 }
 
-pub fn serve(queue: &Queue, idle_exit: Option<Duration>) -> io::Result<()> {
+pub fn serve(
+    queue: &Queue,
+    idle_exit: Option<Duration>,
+    reporting: Option<&Reporting>,
+) -> io::Result<()> {
     recover_orphans(queue)?;
     let mut idle_since = Instant::now();
     loop {
         match queue.next_queued()? {
             Some(job) => {
-                run_job(queue, job)?;
+                run_job(queue, job, reporting)?;
                 idle_since = Instant::now();
             }
             None if idle_exit.is_some_and(|limit| idle_since.elapsed() > limit) => return Ok(()),
@@ -141,7 +154,11 @@ fn recover_orphans(queue: &Queue) -> io::Result<()> {
 
 fn append_log(queue: &Queue, id: u32, text: &str) {
     use std::io::Write;
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(queue.log_path(id)) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue.log_path(id))
+    {
         let _ = f.write_all(text.as_bytes());
     }
 }
@@ -160,7 +177,128 @@ fn find_orchestrator() -> Option<PathBuf> {
     })
 }
 
-fn run_job(queue: &Queue, mut job: Job) -> io::Result<()> {
+fn run_job(queue: &Queue, job: Job, reporting: Option<&Reporting>) -> io::Result<()> {
+    let id = job.id;
+    let result = launch_job(queue, job, reporting);
+    analyze_job(queue, id);
+    result
+}
+
+/// An analysis failure must never affect the job's outcome or stall the queue, so every
+/// error here ends as one log line.
+fn analyze_job(queue: &Queue, id: u32) {
+    if let Err(e) = try_analyze(queue, id) {
+        append_log(queue, id, &format!("\n[worker] analysis skipped: {e}\n"));
+    }
+}
+
+fn try_analyze(queue: &Queue, id: u32) -> io::Result<()> {
+    let job = queue.get(id)?;
+    let Some(events) = events::source_path(queue, &job) else {
+        return Ok(());
+    };
+    let binary =
+        find_orchestrator().ok_or_else(|| io::Error::other("ai-org-orchestrator not found"))?;
+    let out = events::analysis_scratch_path(queue, id);
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(&out);
+
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue.log_path(id))?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("analyze")
+        .arg("--job-id")
+        .arg(id.to_string())
+        .arg("--events")
+        .arg(&events)
+        .arg("--out")
+        .arg(&out)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0);
+    apply_env(&mut cmd, &job);
+
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + ANALYZE_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            terminate(&mut child)?;
+            break None;
+        }
+        std::thread::sleep(POLL);
+    };
+    match status {
+        Some(s) if !s.success() => append_log(
+            queue,
+            id,
+            &format!("\n[worker] analysis {}\n", describe_exit(s)),
+        ),
+        None => append_log(queue, id, "\n[worker] analysis timed out\n"),
+        _ => {}
+    }
+    ingest_analysis(queue, id)
+}
+
+fn ingest_analysis(queue: &Queue, id: u32) -> io::Result<()> {
+    let scratch = events::analysis_scratch_path(queue, id);
+    let text = std::fs::read_to_string(&scratch)?;
+    let mut analysis: Analysis = serde_json::from_str(&text).map_err(io::Error::other)?;
+    analysis.job_id = u64::from(id);
+    for request in &mut analysis.feature_requests {
+        request.status = RequestStatus::Open;
+        if !request.source_job_ids.contains(&analysis.job_id) {
+            request.source_job_ids.push(analysis.job_id);
+        }
+    }
+    events::write_analysis(queue, &analysis)?;
+    events::merge_into_store(queue, analysis.feature_requests)?;
+    let _ = std::fs::remove_file(scratch);
+    Ok(())
+}
+
+fn apply_env(cmd: &mut Command, job: &Job) {
+    // The worker's own inherited PATH depends on how *it* was launched (interactive
+    // shell vs. a bare `ssh host cmd`, which skips .bashrc/.profile on most systems) —
+    // that's not reliable across restarts. quality_gate() needs cargo/clippy/rustfmt
+    // (and now ast-grep) to actually be found, so guarantee cargo's bin dir is on PATH
+    // for the orchestrator regardless of how the worker itself ended up running.
+    if let Ok(home) = std::env::var("HOME") {
+        let cargo_bin = format!("{home}/.cargo/bin");
+        let existing = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{cargo_bin}:{existing}"));
+    }
+    if !job.inherit_env {
+        PROVIDER_ENV.iter().for_each(|v| {
+            cmd.env_remove(v);
+        });
+    }
+}
+
+/// Without a hosting server the orchestrator must not post anywhere, even if the worker's
+/// own environment names a queue URL for its CLI.
+fn apply_reporting(cmd: &mut Command, id: u32, reporting: Option<&Reporting>) {
+    cmd.env("REWRITER_JOB_ID", id.to_string());
+    match reporting {
+        Some(r) => {
+            cmd.env("REWRITER_QUEUE_URL", &r.url)
+                .env("REWRITER_QUEUE_TOKEN", &r.token);
+        }
+        None => {
+            cmd.env_remove("REWRITER_QUEUE_URL")
+                .env_remove("REWRITER_QUEUE_TOKEN");
+        }
+    }
+}
+
+fn launch_job(queue: &Queue, mut job: Job, reporting: Option<&Reporting>) -> io::Result<()> {
     if queue.cancel_requested(job.id) {
         return finish(queue, &mut job, State::Cancelled, None, None);
     }
@@ -192,23 +330,10 @@ fn run_job(queue: &Queue, mut job: Job) -> io::Result<()> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .process_group(0);
-    // The worker's own inherited PATH depends on how *it* was launched (interactive
-    // shell vs. a bare `ssh host cmd`, which skips .bashrc/.profile on most systems) —
-    // that's not reliable across restarts. quality_gate() needs cargo/clippy/rustfmt
-    // (and now ast-grep) to actually be found, so guarantee cargo's bin dir is on PATH
-    // for the orchestrator regardless of how the worker itself ended up running.
-    if let Ok(home) = std::env::var("HOME") {
-        let cargo_bin = format!("{home}/.cargo/bin");
-        let existing = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{cargo_bin}:{existing}"));
-    }
+    apply_env(&mut cmd, &job);
+    apply_reporting(&mut cmd, job.id, reporting);
     if let Some(n) = job.max_iter {
         cmd.arg("--max-iter").arg(n.to_string());
-    }
-    if !job.inherit_env {
-        PROVIDER_ENV.iter().for_each(|v| {
-            cmd.env_remove(v);
-        });
     }
 
     let mut child = match cmd.spawn() {
@@ -284,6 +409,84 @@ mod tests {
         assert_eq!(after.state, State::Queued);
         assert_eq!(after.resume_count, 1);
         assert!(after.pid.is_none());
+    }
+
+    fn env_of(cmd: &Command, key: &str) -> Option<Option<String>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn the_orchestrator_is_told_where_to_report_when_a_server_hosts_the_worker() {
+        let mut cmd = Command::new("true");
+        let reporting = Reporting {
+            url: "http://127.0.0.1:8003".into(),
+            token: "t".into(),
+        };
+        apply_reporting(&mut cmd, 7, Some(&reporting));
+        assert_eq!(env_of(&cmd, "REWRITER_JOB_ID"), Some(Some("7".into())));
+        assert_eq!(
+            env_of(&cmd, "REWRITER_QUEUE_URL"),
+            Some(Some("http://127.0.0.1:8003".into()))
+        );
+        assert_eq!(env_of(&cmd, "REWRITER_QUEUE_TOKEN"), Some(Some("t".into())));
+    }
+
+    #[test]
+    fn a_local_worker_clears_any_inherited_queue_endpoint() {
+        let mut cmd = Command::new("true");
+        apply_reporting(&mut cmd, 7, None);
+        assert_eq!(env_of(&cmd, "REWRITER_JOB_ID"), Some(Some("7".into())));
+        assert_eq!(env_of(&cmd, "REWRITER_QUEUE_URL"), Some(None));
+        assert_eq!(env_of(&cmd, "REWRITER_QUEUE_TOKEN"), Some(None));
+    }
+
+    #[test]
+    fn ingesting_an_analysis_stores_it_and_merges_its_requests_as_open() {
+        use run_events::{FeatureRequest, Priority};
+        let q = temp_queue("ingest");
+        let job = q.submit(spec()).unwrap();
+        let analysis = Analysis {
+            job_id: 999,
+            outcome: "failed".into(),
+            summary: "s".into(),
+            root_causes: vec![],
+            feature_requests: vec![FeatureRequest {
+                id: "retry-budget".into(),
+                title: "t".into(),
+                rationale: "r".into(),
+                evidence: vec!["e".into()],
+                source_job_ids: vec![],
+                priority: Priority::High,
+                status: RequestStatus::Done,
+            }],
+        };
+        let scratch = events::analysis_scratch_path(&q, job.id);
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        std::fs::write(&scratch, serde_json::to_vec(&analysis).unwrap()).unwrap();
+
+        ingest_analysis(&q, job.id).unwrap();
+
+        let stored = events::read_analysis(&q, job.id).unwrap();
+        assert_eq!(stored.job_id, u64::from(job.id));
+        let requests = events::load_requests(&q).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, RequestStatus::Open);
+        assert_eq!(requests[0].source_job_ids, [u64::from(job.id)]);
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn a_missing_or_garbled_analysis_file_is_an_error_not_a_panic() {
+        let q = temp_queue("ingest-bad");
+        let job = q.submit(spec()).unwrap();
+        assert!(ingest_analysis(&q, job.id).is_err());
+        let scratch = events::analysis_scratch_path(&q, job.id);
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        std::fs::write(&scratch, "{").unwrap();
+        assert!(ingest_analysis(&q, job.id).is_err());
+        assert!(events::load_requests(&q).unwrap().is_empty());
     }
 
     #[test]

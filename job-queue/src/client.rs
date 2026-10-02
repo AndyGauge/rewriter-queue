@@ -1,4 +1,6 @@
 use crate::archive;
+use crate::events::{self, EventFilter};
+use run_events::{parse_events, Analysis, Event, FeatureRequest, RequestStatus};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -52,6 +54,47 @@ impl Client {
         self.send(self.request("POST", path).call())?.into_string()
     }
 
+    pub fn events(&self, id: u32, filter: &EventFilter) -> io::Result<Vec<Event>> {
+        let kind = filter.kind.map(events::kind_label);
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if let Some(k) = &kind {
+            params.push(("kind", k));
+        }
+        if let Some(a) = &filter.agent {
+            params.push(("agent", a));
+        }
+        if let Some(s) = &filter.since {
+            params.push(("since", s));
+        }
+        let text = self.get_query(&format!("/jobs/{id}/events"), &params)?;
+        Ok(parse_events(&text))
+    }
+
+    pub fn analysis(&self, id: u32) -> io::Result<Analysis> {
+        let text = self.get(&format!("/jobs/{id}/analysis"))?;
+        serde_json::from_str(&text).map_err(io::Error::other)
+    }
+
+    pub fn requests(&self) -> io::Result<Vec<FeatureRequest>> {
+        let text = self.get("/feature-requests")?;
+        serde_json::from_str(&text).map_err(io::Error::other)
+    }
+
+    pub fn set_request_status(
+        &self,
+        id: &str,
+        status: RequestStatus,
+    ) -> io::Result<FeatureRequest> {
+        let body = serde_json::json!({ "status": status });
+        let text = self
+            .send(
+                self.request("POST", &format!("/feature-requests/{id}/status"))
+                    .send_json(body),
+            )?
+            .into_string()?;
+        serde_json::from_str(&text).map_err(io::Error::other)
+    }
+
     pub fn submit(
         &self,
         source: &Path,
@@ -92,8 +135,10 @@ impl Client {
     }
 
     pub fn download_artifacts(&self, id: u32, out: &Path) -> io::Result<String> {
-        let resp = self
-            .send(self.request("GET", &format!("/jobs/{id}/artifacts.tar.gz")).call())?;
+        let resp = self.send(
+            self.request("GET", &format!("/jobs/{id}/artifacts.tar.gz"))
+                .call(),
+        )?;
         let mut bytes = Vec::new();
         resp.into_reader().read_to_end(&mut bytes)?;
         archive::unpack(&bytes, out)?;

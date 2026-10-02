@@ -1,4 +1,5 @@
 use crate::backend::{Backend, Submission};
+use crate::events::{self, EventFilter};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -83,6 +84,34 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "job_events",
+            "description": "Structured events the job's agents reported (stage starts and ends, model calls with token and latency numbers, decisions, deviations, findings, gate results, retries, errors), one JSON object per line, oldest first. Works on a running job. Filter by kind, agent, or since (only events after that RFC 3339 timestamp).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "kind": { "type": "string", "enum": ["stage_start", "stage_end", "agent_call", "decision", "deviation", "finding", "gate_result", "retry", "error"] },
+                    "agent": { "type": "string", "description": "Only events from this agent" },
+                    "since": { "type": "string", "description": "Only events after this RFC 3339 timestamp" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "job_analysis",
+            "description": "The post-run analysis of a finished job as JSON: outcome, summary, root causes and the feature requests it proposed. Errors if the job has no analysis yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "feature_requests",
+            "description": "Every feature request gathered from job analyses, as JSON, with status (open, accepted, done, rejected), priority, evidence and the jobs that raised it.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "queue_cancel",
             "description": "Cancel a queued or running job.",
             "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
@@ -129,6 +158,21 @@ fn call(backend: &Backend, name: &str, args: &Value) -> io::Result<String> {
                 }
                 None => Ok(content),
             }
+        }
+        "job_events" => {
+            let filter = EventFilter {
+                kind: args["kind"].as_str().map(events::parse_kind).transpose()?,
+                agent: args["agent"].as_str().map(str::to_string),
+                since: args["since"].as_str().map(str::to_string),
+            };
+            Ok(events::to_jsonl(&backend.events(id()?, &filter)?))
+        }
+        "job_analysis" => {
+            let analysis = backend.analysis(id()?)?;
+            serde_json::to_string_pretty(&analysis).map_err(io::Error::other)
+        }
+        "feature_requests" => {
+            serde_json::to_string_pretty(&backend.requests()?).map_err(io::Error::other)
         }
         "queue_cancel" => backend.cancel(id()?),
         other => Err(io::Error::other(format!("unknown tool: {other}"))),
