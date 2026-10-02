@@ -34,6 +34,23 @@ All notable changes to this project are documented here.
 - The worker sets `REWRITER_JOB_ID`, and `REWRITER_QUEUE_URL` and `REWRITER_QUEUE_TOKEN` when
   hosted by `serve`, for the orchestrator it launches.
 
+### Changed
+
+- A feature request's priority rises one step (low to medium to high, never lower) when a
+  different job raises the same problem again, so recurring problems surface.
+- Reads of a job's events, and the analysis, use the union of the server's copy and the
+  workspace `events.jsonl`, so events lost to a failed post are not lost to the analysis.
+- Updates to the feature-request list take a file lock, so a CLI `request` and a worker ingest
+  can't overwrite each other.
+- The server ignores an event's own job id in favour of the one in the URL, rejects oversized
+  bodies with 413 instead of truncating them, and serialises concurrent appends to a job's events.
+- A run that aborts (no providers, no mission, no readable source, or a panic) now records an
+  `error` event and ends its stage with `ok=false`, so the analysis sees it as a failure rather
+  than a success.
+- `analyze` uses the same provider setup as a normal run (shared code) and skips the startup
+  qualification probes, so it no longer stalls for minutes on an unreachable provider.
+- Integration and milestone escalations emit `retry` events.
+
 ## [0.8.6]
 
 ### Added

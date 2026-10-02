@@ -227,17 +227,12 @@ lost.
 
 ## Limitations
 
-- The server's copy of a job's events can be partial if posting was interrupted, and analysis
-  and `events` prefer that copy over the fuller workspace file.
-- Feature-request file updates are serialised only within the server process, so a CLI
-  `request` on a local queue could race a worker ingest.
-- A problem recurring across jobs adds evidence and job ids to its request but does not raise
-  its priority.
-- Escalations and the final integration step emit no stage events of their own (escalations
-  show up only as `deviation` events), and resumed stages emit none.
-- `stage_end` events carry no success flag, so outcome inference relies on unfinished stages
-  and a trailing `error` event.
-- `analyze` builds its own provider registry, including the startup qualification probes, so it
-  can be slow to start when a provider is unreachable.
-
-Some of these may have been fixed since this page was written; check the changelog.
+- The final integration step has no stage events of its own, because it runs inside the
+  `V2 synthesis` stage. Escalations emit `retry` events, and stages resumed from a checkpoint
+  emit no stage events, so a stage's measured duration can include a cached stage after it.
+- `analyze` skips the startup qualification probes, so its provider ratings are the defaults.
+  That is deliberate (it makes one short call), but it means the analyst call is not routed by
+  measured quality.
+- The feature-request file lock has only been exercised between threads in one process.
+- Events dropped while the orchestrator is pausing posts after a failed POST are not re-sent to
+  the server; the workspace `events.jsonl` still has them, and analysis merges both copies.
