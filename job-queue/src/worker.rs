@@ -194,9 +194,15 @@ fn analyze_job(queue: &Queue, id: u32) {
 
 fn try_analyze(queue: &Queue, id: u32) -> io::Result<()> {
     let job = queue.get(id)?;
-    let Some(events) = events::source_path(queue, &job) else {
+    let all = events::all_events(queue, &job)?;
+    if all.is_empty() {
         return Ok(());
-    };
+    }
+    let events = events::analysis_events_path(queue, id);
+    if let Some(dir) = events.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&events, events::to_jsonl(&all))?;
     let binary =
         find_orchestrator().ok_or_else(|| io::Error::other("ai-org-orchestrator not found"))?;
     let out = events::analysis_scratch_path(queue, id);
@@ -244,6 +250,7 @@ fn try_analyze(queue: &Queue, id: u32) -> io::Result<()> {
         None => append_log(queue, id, "\n[worker] analysis timed out\n"),
         _ => {}
     }
+    let _ = std::fs::remove_file(&events);
     ingest_analysis(queue, id)
 }
 
@@ -372,6 +379,28 @@ fn terminate(child: &mut Child) -> io::Result<()> {
     }
     unsafe { libc::killpg(pgid, libc::SIGKILL) };
     child.wait().map(|_| ())
+}
+
+fn describe_exit(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exited with code {code}"),
+        (None, Some(sig)) => format!("killed by signal {sig}"),
+        _ => "exited abnormally".into(),
+    }
+}
+
+fn finish(
+    queue: &Queue,
+    job: &mut Job,
+    state: State,
+    exit_code: Option<i32>,
+    error: Option<String>,
+) -> io::Result<()> {
+    job.state = state;
+    job.exit_code = exit_code;
+    job.error = error;
+    job.finished_at = Some(Utc::now());
+    queue.save(job)
 }
 
 #[cfg(test)]
@@ -504,26 +533,4 @@ mod tests {
         assert_eq!(after.state, State::Failed);
         assert!(after.error.unwrap().contains("giving up"));
     }
-}
-
-fn describe_exit(status: ExitStatus) -> String {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("exited with code {code}"),
-        (None, Some(sig)) => format!("killed by signal {sig}"),
-        _ => "exited abnormally".into(),
-    }
-}
-
-fn finish(
-    queue: &Queue,
-    job: &mut Job,
-    state: State,
-    exit_code: Option<i32>,
-    error: Option<String>,
-) -> io::Result<()> {
-    job.state = state;
-    job.exit_code = exit_code;
-    job.error = error;
-    job.finished_at = Some(Utc::now());
-    queue.save(job)
 }
