@@ -1,11 +1,14 @@
 use crate::job::{Job, Queue};
-use run_events::{parse_events, Analysis, Event, EventKind, FeatureRequest, RequestStatus};
+use run_events::{
+    parse_events, Analysis, Event, EventKind, FeatureRequest, Priority, RequestStatus,
+};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-static REQUESTS_LOCK: Mutex<()> = Mutex::new(());
+static APPEND_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Clone)]
 pub struct EventFilter {
@@ -72,10 +75,11 @@ pub fn append(queue: &Queue, id: u32, events: &[Event]) -> io::Result<()> {
     let mut buf = String::new();
     for event in events {
         let mut event = event.clone();
-        event.job_id.get_or_insert(u64::from(id));
+        event.job_id = Some(u64::from(id));
         buf.push_str(&event.to_json_line());
         buf.push('\n');
     }
+    let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -83,26 +87,63 @@ pub fn append(queue: &Queue, id: u32, events: &[Event]) -> io::Result<()> {
         .write_all(buf.as_bytes())
 }
 
-/// The server's copy when it has one; otherwise the workspace file the orchestrator always
-/// writes, so local queues and unreachable servers still have events to show.
-pub fn source_path(queue: &Queue, job: &Job) -> Option<PathBuf> {
-    [
-        events_path(queue, job.id),
-        job.workspace.join("events.jsonl"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
+fn read_file_events(path: PathBuf) -> io::Result<Vec<Event>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(parse_events(&String::from_utf8_lossy(&bytes))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn identity(event: &Event) -> String {
+    let mut event = event.clone();
+    event.job_id = None;
+    event.to_json_line()
+}
+
+/// The server's copy and the workspace file the orchestrator always writes can each be missing
+/// events the other has (a post that failed, a run before the server was reachable). Taking the
+/// union, keeping each distinct event as many times as the file that has it most often, never
+/// drops anything and never double-counts events present in both.
+pub fn merge_event_sources(served: Vec<Event>, local: Vec<Event>) -> Vec<Event> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for event in &served {
+        *seen.entry(identity(event)).or_default() += 1;
+    }
+    let mut merged = served;
+    let mut local_counts: HashMap<String, usize> = HashMap::new();
+    for event in local {
+        let key = identity(&event);
+        let count = local_counts.entry(key.clone()).or_default();
+        *count += 1;
+        if *count > seen.get(&key).copied().unwrap_or(0) {
+            merged.push(event);
+        }
+    }
+    merged.sort_by_cached_key(|e| {
+        chrono::DateTime::parse_from_rfc3339(&e.ts)
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(i64::MIN)
+    });
+    merged
+}
+
+pub fn all_events(queue: &Queue, job: &Job) -> io::Result<Vec<Event>> {
+    Ok(merge_event_sources(
+        read_file_events(events_path(queue, job.id))?,
+        read_file_events(job.workspace.join("events.jsonl"))?,
+    ))
 }
 
 pub fn read(queue: &Queue, job: &Job, filter: &EventFilter) -> io::Result<Vec<Event>> {
-    let Some(path) = source_path(queue, job) else {
-        return Ok(Vec::new());
-    };
-    let text = String::from_utf8_lossy(&fs::read(path)?).into_owned();
-    Ok(parse_events(&text)
+    Ok(all_events(queue, job)?
         .into_iter()
         .filter(|e| filter.matches(e))
         .collect())
+}
+
+pub fn analysis_events_path(queue: &Queue, id: u32) -> PathBuf {
+    analysis_path(queue, id).with_extension("events.tmp")
 }
 
 pub fn to_jsonl(events: &[Event]) -> String {
@@ -110,7 +151,9 @@ pub fn to_jsonl(events: &[Event]) -> String {
 }
 
 pub fn write_analysis(queue: &Queue, analysis: &Analysis) -> io::Result<()> {
-    let path = analysis_path(queue, analysis.job_id as u32);
+    let id = u32::try_from(analysis.job_id)
+        .map_err(|_| io::Error::other(format!("job id out of range: {}", analysis.job_id)))?;
+    let path = analysis_path(queue, id);
     fs::create_dir_all(path.parent().expect("analysis path has a parent"))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(analysis)?)?;
@@ -150,6 +193,13 @@ fn extend_unique<T: PartialEq>(into: &mut Vec<T>, from: Vec<T>) {
     }
 }
 
+fn raise(priority: Priority) -> Priority {
+    match priority {
+        Priority::Low => Priority::Medium,
+        Priority::Medium | Priority::High => Priority::High,
+    }
+}
+
 pub fn merge_requests(
     existing: Vec<FeatureRequest>,
     incoming: Vec<FeatureRequest>,
@@ -158,6 +208,13 @@ pub fn merge_requests(
     for request in incoming {
         match merged.iter_mut().find(|r| r.id == request.id) {
             Some(current) => {
+                let from_new_job = request
+                    .source_job_ids
+                    .iter()
+                    .any(|j| !current.source_job_ids.contains(j));
+                if from_new_job {
+                    current.priority = raise(current.priority);
+                }
                 extend_unique(&mut current.source_job_ids, request.source_job_ids);
                 extend_unique(&mut current.evidence, request.evidence);
             }
@@ -167,10 +224,23 @@ pub fn merge_requests(
     merged
 }
 
+/// An OS-level lock keeps the worker's ingest and a CLI `request` in another process from
+/// overwriting each other's read-modify-write. It is per open file description, so it also
+/// serialises threads of one process.
+fn with_requests_lock<T>(queue: &Queue, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue.root().join("feature-requests.lock"))?;
+    lock.lock()?;
+    f()
+}
+
 pub fn merge_into_store(queue: &Queue, incoming: Vec<FeatureRequest>) -> io::Result<()> {
-    let _guard = REQUESTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let merged = merge_requests(load_requests(queue)?, incoming);
-    save_requests(queue, &merged)
+    with_requests_lock(queue, || {
+        let merged = merge_requests(load_requests(queue)?, incoming);
+        save_requests(queue, &merged)
+    })
 }
 
 pub fn set_request_status(
@@ -178,15 +248,16 @@ pub fn set_request_status(
     id: &str,
     status: RequestStatus,
 ) -> io::Result<FeatureRequest> {
-    let _guard = REQUESTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut requests = load_requests(queue)?;
-    let request = requests.iter_mut().find(|r| r.id == id).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("no feature request {id}"))
-    })?;
-    request.status = status;
-    let updated = request.clone();
-    save_requests(queue, &requests)?;
-    Ok(updated)
+    with_requests_lock(queue, || {
+        let mut requests = load_requests(queue)?;
+        let request = requests.iter_mut().find(|r| r.id == id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no feature request {id}"))
+        })?;
+        request.status = status;
+        let updated = request.clone();
+        save_requests(queue, &requests)?;
+        Ok(updated)
+    })
 }
 
 fn label<T: serde::Serialize>(value: &T) -> String {
@@ -380,10 +451,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&q, &j, &EventFilter::default()).unwrap().len(), 1);
-        let served = event("b", EventKind::Decision, "2026-01-01T00:00:00.000Z");
-        append(&q, j.id, &[served]).unwrap();
+    }
+
+    #[test]
+    fn a_partial_server_copy_is_completed_from_the_workspace_file() {
+        let q = temp_queue("partial");
+        let j = job(&q);
+        fs::create_dir_all(&j.workspace).unwrap();
+        let first = event("a", EventKind::StageStart, "2026-01-01T00:00:00.000Z");
+        let second = event("b", EventKind::Decision, "2026-01-01T00:00:01.000Z");
+        let third = event("c", EventKind::Error, "2026-01-01T00:00:02.000Z");
+        let local: String = [&first, &second, &third]
+            .iter()
+            .map(|e| e.to_json_line() + "\n")
+            .collect();
+        fs::write(j.workspace.join("events.jsonl"), local).unwrap();
+        append(&q, j.id, &[first, third]).unwrap();
+        let agents: Vec<String> = read(&q, &j, &EventFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.agent)
+            .collect();
+        assert_eq!(agents, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn repeated_identical_events_are_kept_but_not_double_counted_across_sources() {
+        let e = event("a", EventKind::Retry, "2026-01-01T00:00:00.000Z");
+        let merged = merge_event_sources(vec![e.clone(), e.clone()], vec![e.clone(), e.clone()]);
+        assert_eq!(merged.len(), 2);
+        let merged = merge_event_sources(vec![e.clone()], vec![e.clone(), e]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn the_job_id_does_not_make_the_same_event_look_different() {
+        let plain = event("a", EventKind::Retry, "2026-01-01T00:00:00.000Z");
+        let tagged = plain.clone().with_job(1);
+        assert_eq!(merge_event_sources(vec![tagged], vec![plain]).len(), 1);
+    }
+
+    #[test]
+    fn a_job_id_out_of_u32_range_is_rejected_when_storing_an_analysis() {
+        let q = temp_queue("big-id");
+        let analysis = Analysis {
+            job_id: u64::from(u32::MAX) + 5,
+            outcome: "failed".into(),
+            summary: String::new(),
+            root_causes: vec![],
+            feature_requests: vec![],
+        };
+        assert!(write_analysis(&q, &analysis).is_err());
+    }
+
+    #[test]
+    fn a_posted_event_is_stored_under_the_job_it_was_posted_to() {
+        let q = temp_queue("force-id");
+        let j = job(&q);
+        let stray = event("a", EventKind::Retry, "2026-01-01T00:00:00.000Z").with_job(99);
+        append(&q, j.id, &[stray]).unwrap();
         let events = read(&q, &j, &EventFilter::default()).unwrap();
-        assert_eq!(events[0].agent, "b");
+        assert_eq!(events[0].job_id, Some(u64::from(j.id)));
+    }
+
+    #[test]
+    fn a_request_seen_in_a_new_job_is_raised_one_step_and_never_past_high() {
+        let mut low = request("a", &[1], &[]);
+        low.priority = Priority::Low;
+        let once = merge_requests(vec![low], vec![request("a", &[2], &[])]);
+        assert_eq!(once[0].priority, Priority::Medium);
+        let twice = merge_requests(once, vec![request("a", &[3], &[])]);
+        assert_eq!(twice[0].priority, Priority::High);
+        let capped = merge_requests(twice, vec![request("a", &[4], &[])]);
+        assert_eq!(capped[0].priority, Priority::High);
+    }
+
+    #[test]
+    fn a_request_seen_again_in_the_same_job_keeps_its_priority() {
+        let mut low = request("a", &[1], &[]);
+        low.priority = Priority::Low;
+        let same = merge_requests(vec![low], vec![request("a", &[1], &["more"])]);
+        assert_eq!(same[0].priority, Priority::Low);
+    }
+
+    #[test]
+    fn a_lower_incoming_priority_never_lowers_an_existing_one() {
+        let mut high = request("a", &[1], &[]);
+        high.priority = Priority::High;
+        let mut incoming = request("a", &[2], &[]);
+        incoming.priority = Priority::Low;
+        assert_eq!(
+            merge_requests(vec![high], vec![incoming])[0].priority,
+            Priority::High
+        );
+    }
+
+    #[test]
+    fn concurrent_status_changes_and_merges_lose_nothing() {
+        let q = temp_queue("concurrent");
+        merge_into_store(&q, vec![request("seed", &[1], &[])]).unwrap();
+        let handles: Vec<_> = (0..8u64)
+            .map(|n| {
+                let q = q.clone();
+                std::thread::spawn(move || {
+                    merge_into_store(&q, vec![request(&format!("r{n}"), &[n], &[])]).unwrap();
+                    set_request_status(&q, "seed", RequestStatus::Accepted).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let requests = load_requests(&q).unwrap();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[0].status, RequestStatus::Accepted);
     }
 
     #[test]
