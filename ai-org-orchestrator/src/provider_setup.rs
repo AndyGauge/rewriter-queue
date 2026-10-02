@@ -56,7 +56,10 @@ pub fn build_registry(cfg: &Config, opts: ProviderOptions) -> Registry {
             "groq".into(),
             "https://api.groq.com/openai/v1".into(),
             key,
-            vec!["llama-3.3-70b-versatile".into(), "llama-3.1-8b-instant".into()],
+            vec![
+                "llama-3.3-70b-versatile".into(),
+                "llama-3.1-8b-instant".into(),
+            ],
         );
     }
     if let Some(key) = opts.openai_key {
@@ -68,7 +71,9 @@ pub fn build_registry(cfg: &Config, opts: ProviderOptions) -> Registry {
         );
     }
     if let Some(host) = opts.lmstudio_host {
-        let model = opts.lmstudio_model.unwrap_or_else(|| DEFAULT_LMSTUDIO_MODEL.into());
+        let model = opts
+            .lmstudio_model
+            .unwrap_or_else(|| DEFAULT_LMSTUDIO_MODEL.into());
         eprintln!("LM Studio: {host} model={model}");
         registry.add_openai_compat(
             "lmstudio".into(),
