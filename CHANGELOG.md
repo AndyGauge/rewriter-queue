@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.0]
+
+### Added
+
+- Run observability. Every agent in a job now reports what it did to one place, so a running job
+  can be watched in detail and a finished or failed one analysed without reading logs over SSH.
+  The orchestrator records structured events (stage start/end, model calls with provider, model,
+  token and latency numbers, decisions, deviations, findings, quality-gate results, retries,
+  errors, and a panic hook) to `<workspace>/events.jsonl` always, and also posts them to the
+  queue server when the worker is hosted by `serve`. Reporting is best effort: a failed write or
+  an unreachable server costs one log line, never the job. See `docs/observability.md`.
+- `run-events` crate: the shared event, analysis and feature-request types, and a tolerant JSONL
+  parser that skips a truncated final line left by a killed process.
+- Post-run analysis. When a job ends, the worker runs `ai-org-orchestrator analyze`, which
+  computes the mechanical facts in Rust (calls, tokens and latency per agent, retries per stage,
+  failed gate runs, stages that never ended, inferred outcome) and asks a new PostRunAnalyst
+  agent for root causes and feature requests. Every root cause and request must cite events that
+  actually exist, by `agent@timestamp` or by quote, and uncited claims are dropped, so the
+  analyst cannot invent evidence. If the model call fails, the analysis is still written with
+  the facts alone.
+- Feature requests: proposals from analyses are merged into one list, keyed by a slug of the
+  title so the same problem in two jobs becomes one request with both jobs attached. A request
+  keeps the status you gave it (`open`, `accepted`, `done`, `rejected`) when a later job raises
+  it again.
+- `rewriter-queue events`, `analysis`, `requests` and `request` commands, backed by new queue
+  server routes, and `job_events`, `job_analysis` and `feature_requests` MCP tools. All work
+  against a local queue too.
+- `report_finding` agent tool, offered to agentic roles, so an agent can record a missing tool,
+  malformed input or a risk it noticed as a `finding` event.
+- The worker sets `REWRITER_JOB_ID`, and `REWRITER_QUEUE_URL` and `REWRITER_QUEUE_TOKEN` when
+  hosted by `serve`, for the orchestrator it launches.
+
 ## [0.8.6]
 
 ### Added

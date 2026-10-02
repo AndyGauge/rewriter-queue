@@ -6,3 +6,4 @@
 - [Installation](installation.md)
 - [Zed setup](zed-setup.md)
 - [Remote deployment](remote-deployment.md)
+- [Run observability](observability.md)
