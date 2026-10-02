@@ -60,6 +60,9 @@ pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writ
 /// AgenticImplementer, everything that calls `run_agentic`), not owned by any one of them, so
 /// it lives here rather than folded into a specific role's own skill file.
 pub const AGENTIC_BATCHING_REMINDER: &str = include_str!("../../skills/agentic-batching.md");
+/// Appended after `AGENTIC_BATCHING_REMINDER` on every tool-capable call: tells the agent about
+/// `report_finding`, the one tool that sends a note to the run's observability stream.
+pub const AGENTIC_REPORTING_REMINDER: &str = include_str!("../../skills/reporting.md");
 /// Called by `Manager::run_agentic`'s turn-budget circuit breaker -- a fresh-context evaluation
 /// of an agentic call's progress so far, giving it concrete direction instead of just extending
 /// its budget and hoping. See the circuit breaker's own doc comment in `manager.rs`.

@@ -1,16 +1,27 @@
+use crate::observer::Observer;
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct Workspace {
     pub root: PathBuf,
+    observer: Option<Observer>,
 }
 
 impl Workspace {
     pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self { root, observer: None })
+    }
+
+    pub fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    pub fn observer(&self) -> Option<&Observer> {
+        self.observer.as_ref()
     }
 
     fn write(&self, rel: &str, content: &str) -> std::io::Result<()> {
@@ -43,6 +54,11 @@ impl Workspace {
     }
 
     pub fn log_agent_decision(&self, agent: &str, decision: &str) -> std::io::Result<()> {
+        if let Some(o) = &self.observer {
+            if !decision.contains("tokens: +") {
+                o.decision(agent, decision);
+            }
+        }
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         self.append(
             &format!("agents/{agent}/decisions.md"),
@@ -52,6 +68,9 @@ impl Workspace {
 
     /// Record a deviation without acting on it — deferred to the next phase.
     pub fn log_deviation(&self, agent: &str, description: &str) -> std::io::Result<()> {
+        if let Some(o) = &self.observer {
+            o.deviation(agent, description);
+        }
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         self.append(
             "deviations.md",

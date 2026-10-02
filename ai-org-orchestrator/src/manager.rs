@@ -1,5 +1,6 @@
 use crate::{
     agents::{agent_hora_depth, agent_tier},
+    observer::AgentCall,
     tools::Toolbox,
     workspace::Workspace,
 };
@@ -52,6 +53,27 @@ const PRESENCE_PENALTY: f64 = 0.1;
 /// (if anything) is still missing, should be enough for a call that was making real progress;
 /// a call that still can't converge after that is failing for a reason more turns won't fix.
 const CIRCUIT_BREAKER_TURN_BUMP: usize = 15;
+
+#[derive(Default)]
+struct AgenticStats {
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    latency_ms: u64,
+    turns: usize,
+}
+
+impl AgenticStats {
+    fn record(&mut self, resp: &inference_providers::InferenceResponse) {
+        self.provider = resp.provider.clone();
+        self.model = resp.model.clone();
+        self.input_tokens += u64::from(resp.input_tokens);
+        self.output_tokens += u64::from(resp.output_tokens);
+        self.latency_ms += resp.latency_ms;
+        self.turns += 1;
+    }
+}
 
 pub struct Manager<'a> {
     pub ws: &'a Workspace,
@@ -123,7 +145,15 @@ impl<'a> Manager<'a> {
             presence_penalty: Some(PRESENCE_PENALTY),
         };
 
-        let resp = self.registry.complete(&req)?;
+        let started = std::time::Instant::now();
+        let resp = match self.registry.complete(&req) {
+            Ok(r) => r,
+            Err(e) => {
+                self.observe_failed_call(agent, started, &e.to_string());
+                return Err(e.into());
+            }
+        };
+        self.observe_call(agent, &resp);
 
         let total_in = self
             .total_input_tokens
@@ -149,6 +179,33 @@ impl<'a> Manager<'a> {
         );
 
         Ok(resp.text)
+    }
+
+    fn observe_call(&self, agent: &str, resp: &inference_providers::InferenceResponse) {
+        if let Some(o) = self.ws.observer() {
+            o.agent_call(&AgentCall {
+                agent: agent.to_string(),
+                provider: resp.provider.clone(),
+                model: resp.model.clone(),
+                input_tokens: resp.input_tokens.into(),
+                output_tokens: resp.output_tokens.into(),
+                latency_ms: resp.latency_ms,
+                ok: true,
+                note: String::new(),
+            });
+        }
+    }
+
+    fn observe_failed_call(&self, agent: &str, started: std::time::Instant, error: &str) {
+        if let Some(o) = self.ws.observer() {
+            o.agent_call(&AgentCall {
+                agent: agent.to_string(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                note: format!("call failed: {error}"),
+                ..AgentCall::default()
+            });
+            o.error(agent, error);
+        }
     }
 
     /// Run an agent with tool-calling access instead of pasting everything it might need
@@ -184,6 +241,48 @@ impl<'a> Manager<'a> {
         toolbox: &(dyn Toolbox + Sync),
         max_turns: usize,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        let mut stats = AgenticStats::default();
+        let result = self.run_agentic_inner(agent, system, task, toolbox, max_turns, &mut stats);
+        if let Some(o) = self.ws.observer() {
+            let err = result.as_ref().err().map(|e| e.to_string());
+            let turns = stats.turns;
+            o.agent_call(&AgentCall {
+                agent: agent.to_string(),
+                provider: stats.provider,
+                model: stats.model,
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                latency_ms: if stats.latency_ms > 0 {
+                    stats.latency_ms
+                } else {
+                    started.elapsed().as_millis() as u64
+                },
+                ok: err.is_none(),
+                note: match &err {
+                    None => format!(
+                        "{turns} turn(s), {}in/{}out",
+                        stats.input_tokens, stats.output_tokens
+                    ),
+                    Some(e) => format!("failed after {turns} turn(s): {e}"),
+                },
+            });
+            if let Some(e) = err {
+                o.error(agent, &e);
+            }
+        }
+        result
+    }
+
+    fn run_agentic_inner(
+        &self,
+        agent: &str,
+        system: &str,
+        task: &str,
+        toolbox: &(dyn Toolbox + Sync),
+        max_turns: usize,
+        stats: &mut AgenticStats,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         self.ws.set_agent_task(agent, task)?;
         let tool_defs = toolbox.tool_defs();
 
@@ -192,7 +291,11 @@ impl<'a> Manager<'a> {
         let mut user = if tool_defs.is_empty() {
             task.to_string()
         } else {
-            format!("{task}\n\n{}", crate::agents::AGENTIC_BATCHING_REMINDER)
+            format!(
+                "{task}\n\n{}\n\n{}",
+                crate::agents::AGENTIC_BATCHING_REMINDER,
+                crate::agents::AGENTIC_REPORTING_REMINDER
+            )
         };
         let mut history: Vec<Turn> = Vec::new();
         let mut pinned_provider: Option<String> = None;
@@ -230,6 +333,12 @@ impl<'a> Manager<'a> {
                     "    [{agent}] circuit breaker tripped at turn {effective_max_turns} -- \
                      extending by {CIRCUIT_BREAKER_TURN_BUMP} turns; directive: {directive}"
                 );
+                if let Some(o) = self.ws.observer() {
+                    o.retry(
+                        agent,
+                        &format!("turn budget circuit breaker tripped after {effective_max_turns} turns"),
+                    );
+                }
                 self.ws.log_deviation(
                     agent,
                     &format!(
@@ -259,6 +368,7 @@ impl<'a> Manager<'a> {
                 Some(name) => self.registry.complete_pinned(name, &req)?,
             };
             pinned_provider = Some(resp.provider.clone());
+            stats.record(&resp);
 
             let total_in = self
                 .total_input_tokens
@@ -393,6 +503,12 @@ impl<'a> Manager<'a> {
                 "    [{reviewer_name}] rejected (iteration {}), revising...",
                 iteration + 1
             );
+            if let Some(o) = self.ws.observer() {
+                o.retry(
+                    worker_name,
+                    &format!("{reviewer_name} rejected iteration {iteration}, revising"),
+                );
+            }
 
             feedback = Some(review);
         }
@@ -439,6 +555,12 @@ impl<'a> Manager<'a> {
                 eprintln!(
                     "    [patch] {label} failed to apply ({e}) — falling back to full regeneration"
                 );
+                if let Some(o) = self.ws.observer() {
+                    o.retry(
+                        worker_name,
+                        &format!("patch failed to apply ({label}), regenerating in full"),
+                    );
+                }
                 self.ws.log_deviation(
                     worker_name,
                     &format!(
@@ -878,5 +1000,111 @@ mod agentic_tests {
         mgr.run_agentic("TestAgent", "system", "the actual task", &NoTools, 5).unwrap();
 
         assert_eq!(seen.lock().unwrap().clone().unwrap(), "the actual task");
+    }
+
+    fn observed_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-manager-observed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let observer = crate::observer::Observer::new(dir.join("events.jsonl"), Some(3), None);
+        Workspace::new(dir).unwrap().with_observer(observer)
+    }
+
+    fn events_of(ws: &Workspace) -> Vec<run_events::Event> {
+        run_events::parse_events(&std::fs::read_to_string(ws.root.join("events.jsonl")).unwrap())
+    }
+
+    #[test]
+    fn a_plain_call_emits_an_agent_call_event_with_token_and_latency_numbers() {
+        let ws = observed_ws("plain");
+        let provider: Box<dyn Provider> = Box::new(CapturesUser {
+            seen: Arc::new(std::sync::Mutex::new(None)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        mgr.run("TestAgent", "system", "task").unwrap();
+
+        let calls: Vec<_> = events_of(&ws)
+            .into_iter()
+            .filter(|e| e.kind == run_events::EventKind::AgentCall)
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].agent, "TestAgent");
+        assert_eq!(calls[0].job_id, Some(3));
+        let d = calls[0].detail.as_ref().unwrap();
+        assert_eq!(d["provider"], "mock");
+        assert_eq!(d["input_tokens"], 1);
+        assert_eq!(d["output_tokens"], 1);
+        assert_eq!(d["latency_ms"], 1);
+        assert_eq!(d["ok"], true);
+    }
+
+    #[test]
+    fn an_agentic_call_emits_one_summarising_agent_call_event_across_its_turns() {
+        let ws = observed_ws("agentic");
+        let provider: Box<dyn Provider> = Box::new(ScriptedToolCaller {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 5).unwrap();
+
+        let calls: Vec<_> = events_of(&ws)
+            .into_iter()
+            .filter(|e| e.kind == run_events::EventKind::AgentCall)
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let d = calls[0].detail.as_ref().unwrap();
+        assert_eq!(d["input_tokens"], 2);
+        assert_eq!(d["output_tokens"], 2);
+        assert_eq!(d["latency_ms"], 2);
+        assert_eq!(d["ok"], true);
+        assert!(calls[0].summary.contains("2 turn(s)"), "got: {}", calls[0].summary);
+    }
+
+    #[test]
+    fn a_failed_agentic_call_emits_a_failed_agent_call_and_an_error_event() {
+        let ws = observed_ws("failed");
+        let provider: Box<dyn Provider> = Box::new(NeverFinishes { models: vec![mock_model()] });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        let mgr = Manager::new(&ws, &registry);
+
+        assert!(mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 1).is_err());
+
+        let events = events_of(&ws);
+        let call = events.iter().rfind(|e| e.kind == run_events::EventKind::AgentCall).unwrap();
+        assert_eq!(call.detail.as_ref().unwrap()["ok"], false);
+        assert!(events.iter().any(|e| e.kind == run_events::EventKind::Error));
+        assert!(events.iter().any(|e| e.kind == run_events::EventKind::Retry), "breaker should log a retry");
+    }
+
+    #[test]
+    fn deviations_and_decisions_become_events_but_token_bookkeeping_does_not() {
+        let ws = observed_ws("logs");
+        ws.log_deviation("Reviewer", "something drifted\nmore detail").unwrap();
+        ws.log_agent_decision("Planner", "chose option b").unwrap();
+        ws.log_agent_decision("Planner", "tokens: +1in/1out").unwrap();
+
+        let events = events_of(&ws);
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![run_events::EventKind::Deviation, run_events::EventKind::Decision]);
+        assert_eq!(events[0].summary, "something drifted");
+        assert_eq!(events[0].agent, "Reviewer");
+    }
+
+    #[test]
+    fn without_an_observer_nothing_is_written_to_events_jsonl() {
+        let ws = temp_ws("no-observer-events");
+        let provider: Box<dyn Provider> = Box::new(CapturesUser {
+            seen: Arc::new(std::sync::Mutex::new(None)),
+            models: vec![mock_model()],
+        });
+        let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+        Manager::new(&ws, &registry).run("TestAgent", "system", "task").unwrap();
+        ws.log_deviation("a", "b").unwrap();
+        assert!(!ws.root.join("events.jsonl").exists());
     }
 }

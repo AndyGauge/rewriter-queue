@@ -201,6 +201,31 @@ impl<'a> PipelineToolbox<'a> {
         }
     }
 
+    fn report_finding(&self, arguments: &Value) -> String {
+        let severity = arguments["severity"].as_str().unwrap_or("");
+        if !matches!(severity, "info" | "warn" | "error") {
+            return "error: \"severity\" must be one of \"info\", \"warn\", \"error\"".to_string();
+        }
+        let category = arguments["category"].as_str().unwrap_or("").trim();
+        let kebab = !category.is_empty()
+            && category.len() <= 60
+            && category.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !category.starts_with('-')
+            && !category.ends_with('-');
+        if !kebab {
+            return "error: \"category\" must be a short kebab-case label such as \"missing-tool\"".to_string();
+        }
+        let text = arguments["text"].as_str().unwrap_or("").trim();
+        if text.is_empty() {
+            return "error: \"text\" is required and must say what you noticed".to_string();
+        }
+        let evidence = arguments["evidence"].as_str().unwrap_or("").trim();
+        if let Some(o) = self.ws.observer() {
+            o.finding(&self.agent, severity, category, text, evidence);
+        }
+        "finding noted".to_string()
+    }
+
     fn read_notes(&self) -> String {
         self.ws.read_milestone_notes()
     }
@@ -329,6 +354,24 @@ impl<'a> Toolbox for PipelineToolbox<'a> {
                 parameters: json!({"type": "object", "properties": {}}),
             },
             ToolDef {
+                name: "report_finding".into(),
+                description: "Report something you noticed that the people running this \
+                    system would want to know -- a missing or misleading tool or skill, \
+                    malformed input, a pattern that wasted effort, a risk in the source. It \
+                    is recorded for later analysis and does not affect your task or answer."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["info", "warn", "error"]},
+                        "category": {"type": "string", "description": "Short kebab-case label, e.g. \"missing-tool\"."},
+                        "text": {"type": "string", "description": "What you noticed, in one or two sentences."},
+                        "evidence": {"type": "string", "description": "A quote or file/line reference that shows it."},
+                    },
+                    "required": ["severity", "category", "text"],
+                }),
+            },
+            ToolDef {
                 name: "fan_out".into(),
                 description: "Delegate two or more genuinely independent sub-tasks (e.g. \
                     analyzing unrelated subsystems of a large source tree) to concurrent \
@@ -359,6 +402,7 @@ impl<'a> Toolbox for PipelineToolbox<'a> {
             "write_artifact" => self.write_artifact(arguments),
             "leave_note" => self.leave_note(arguments),
             "read_notes" => self.read_notes(),
+            "report_finding" => self.report_finding(arguments),
             "fan_out" => self.fan_out(arguments),
             other => format!("error: unknown tool \"{other}\""),
         }
@@ -533,7 +577,7 @@ mod tests {
             names,
             vec![
                 "list_files", "read_file", "read_artifact", "write_artifact", "leave_note",
-                "read_notes", "fan_out"
+                "read_notes", "report_finding", "fan_out"
             ]
         );
     }
@@ -604,7 +648,10 @@ mod tests {
 
         let defs = restricted.tool_defs();
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["list_files", "read_file", "read_artifact", "leave_note", "read_notes"]);
+        assert_eq!(
+            names,
+            vec!["list_files", "read_file", "read_artifact", "leave_note", "read_notes", "report_finding"]
+        );
     }
 
     #[test]
@@ -635,5 +682,73 @@ mod tests {
 
         let out = restricted.call("read_file", &json!({"path": "src/main.rs"}));
         assert_eq!(out, "fn main() {}");
+    }
+
+    fn observed_ws(tag: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("aoo-tools-observed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let observer = crate::observer::Observer::new(dir.join("events.jsonl"), Some(9), None);
+        Workspace::new(dir).unwrap().with_observer(observer)
+    }
+
+    #[test]
+    fn report_finding_is_offered_and_emits_a_finding_event() {
+        let src = temp_source("finding", &[("a.txt", "x")]);
+        let ws = observed_ws("finding");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let tb = toolbox(&src, &ws, &mgr);
+
+        assert!(tb.tool_defs().iter().any(|t| t.name == "report_finding"));
+        let out = tb.call(
+            "report_finding",
+            &json!({"severity": "warn", "category": "missing-tool", "text": "no way to grep", "evidence": "list_files only"}),
+        );
+        assert_eq!(out, "finding noted");
+
+        let events = run_events::parse_events(&std::fs::read_to_string(ws.root.join("events.jsonl")).unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, run_events::EventKind::Finding);
+        assert_eq!(events[0].agent, "TestAgent");
+        assert_eq!(events[0].summary, "no way to grep");
+        let d = events[0].detail.as_ref().unwrap();
+        assert_eq!(d["severity"], "warn");
+        assert_eq!(d["category"], "missing-tool");
+        assert_eq!(d["evidence"], "list_files only");
+    }
+
+    #[test]
+    fn report_finding_rejects_bad_arguments_and_emits_nothing() {
+        let src = temp_source("finding-bad", &[("a.txt", "x")]);
+        let ws = observed_ws("finding-bad");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let tb = toolbox(&src, &ws, &mgr);
+
+        let bad = [
+            json!({"severity": "loud", "category": "ok-cat", "text": "t"}),
+            json!({"category": "ok-cat", "text": "t"}),
+            json!({"severity": "info", "category": "Not Kebab", "text": "t"}),
+            json!({"severity": "info", "category": "", "text": "t"}),
+            json!({"severity": "info", "category": "ok-cat", "text": "   "}),
+            json!({"severity": "info", "category": "ok-cat"}),
+        ];
+        for args in &bad {
+            let out = tb.call("report_finding", args);
+            assert!(out.starts_with("error:"), "{args} -> {out}");
+        }
+        assert!(!ws.root.join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn report_finding_without_an_observer_still_succeeds() {
+        let src = temp_source("finding-none", &[("a.txt", "x")]);
+        let ws = temp_ws("finding-none");
+        let registry = empty_registry();
+        let mgr = Manager::new(&ws, &registry);
+        let tb = toolbox(&src, &ws, &mgr);
+
+        let out = tb.call("report_finding", &json!({"severity": "info", "category": "c", "text": "t"}));
+        assert_eq!(out, "finding noted");
     }
 }
