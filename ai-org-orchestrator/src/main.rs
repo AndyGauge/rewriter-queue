@@ -1,4 +1,5 @@
 mod agents;
+mod analysis;
 mod debug;
 mod estimation;
 mod manager;
@@ -117,6 +118,9 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("analyze") {
+        std::process::exit(analysis::run_cli(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
     let args = parse_args();
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
     let groq_key      = std::env::var("GROQ_API_KEY").ok();
