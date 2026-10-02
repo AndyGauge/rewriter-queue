@@ -2,6 +2,7 @@ mod agents;
 mod estimation;
 mod manager;
 mod patch;
+mod plan_review;
 mod quality;
 mod synthesis;
 mod tools;

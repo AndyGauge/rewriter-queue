@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.5]
+
+### Added
+
+- PlanReviewer: every milestone plan is now reviewed before any milestone is implemented. The
+  reviewer can read the V1 source and prior artifacts, and checks the plan for contradictions
+  with the contract/schema/source (e.g. a milestone creating a manifest the source already
+  has), contradictions between milestones, steps too small to be worth their own cycle (merged
+  into their neighbours), missing work, and bad dependencies. It either approves the plan or
+  replaces it with a corrected one; a failed or unusable review falls back to the original
+  plan. Root-caused against a real run where the planner split a trivial binary into
+  cargo-manifest and manifest-validation milestones that burned their whole budgets.
+
+### Fixed
+
+- The QQ context and quality probes capped output at 16/64/300 tokens, so a reasoning model
+  (gpt-oss-120b) spent the whole allowance thinking, returned an empty answer, and was
+  classified as having a context window under 4096 tokens — after which the router refused to
+  send it any prompt over that size. Probe limits are now 1024/1024/2048.
+- Added a bundled model entry for gpt-oss-120b (free, heavy tier, 131,072-token context).
+
 ## [0.8.4]
 
 ### Changed

@@ -12,7 +12,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
         "TargetImplementer" | "AgenticImplementer" | "MergeAgent" | "SystemTestWriter" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
-        | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor" => ModelTier::Light,
+        | "PlanReviewer" | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
         // Verdict-only agents: APPROVED/REJECTED, COMPLIANT/NON_COMPLIANT
@@ -26,7 +26,7 @@ pub fn agent_hora_depth(name: &str) -> u8 {
     let base = name.split('-').next().unwrap_or(name);
     match base {
         "MissionArchitect" | "InductiveReasoner" => 3,
-        "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" => 2,
+        "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" | "PlanReviewer" => 2,
         "TargetImplementer" | "AgenticImplementer" | "ContractReviewer" | "TestEngineer"
         | "MaintenanceReviewer" | "ProductionReadinessReviewer" | "AcceptanceCriteria"
         | "SystemTestWriter" => 1,
@@ -50,6 +50,7 @@ pub const FORMAL_METHODS_REVIEWER: &str = include_str!("../../skills/formal-meth
 pub const PRODUCTION_READINESS_REVIEWER: &str =
     include_str!("../../skills/production-readiness-reviewer.md");
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
+pub const PLAN_REVIEWER: &str = include_str!("../../skills/plan-reviewer.md");
 pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
 pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
 /// Appended by `Manager::run_agentic` to every agentic call that's offered tools -- shared

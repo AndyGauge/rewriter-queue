@@ -984,6 +984,7 @@ impl<'a> Manager<'a> {
                 crate::manager::AGENTIC_MAX_TURNS,
             )
         })?;
+        let plan_text = self.review_plan(id_prefix, &plan_task, &plan_text, toolbox)?;
         let milestones = parse_milestone_plan(&plan_text);
         let waves = schedule_waves(&milestones);
 
@@ -3595,6 +3596,8 @@ mod agentic_implementer_tests {
             let text = if req.system == MILESTONE_PLANNER {
                 "## MILESTONE: retry\nRISK: EASY\nEFFORT: 5\nTASK: Retry the small thing.\n"
                     .to_string()
+            } else if req.system == crate::agents::PLAN_REVIEWER {
+                "APPROVED".to_string()
             } else if req.system == SECURITY_REVIEWER {
                 "COMPLIANT".to_string()
             } else if req.system == MAINTENANCE_REVIEWER {
@@ -3651,7 +3654,7 @@ mod agentic_implementer_tests {
         let log = log.lock().unwrap();
         let implementer_systems: Vec<&String> = log
             .iter()
-            .filter(|s| s.as_str() != MILESTONE_PLANNER && s.as_str() != SECURITY_REVIEWER && s.as_str() != MAINTENANCE_REVIEWER)
+            .filter(|s| s.as_str() != MILESTONE_PLANNER && s.as_str() != crate::agents::PLAN_REVIEWER && s.as_str() != SECURITY_REVIEWER && s.as_str() != MAINTENANCE_REVIEWER)
             .collect();
         assert_eq!(implementer_systems.len(), 2, "one failed original attempt, one retry");
         assert!(

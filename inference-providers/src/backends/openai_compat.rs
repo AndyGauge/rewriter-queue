@@ -169,6 +169,7 @@ fn bundled_model_info(provider: &str, model: &str) -> ModelInfo {
         // since Heavy models remain eligible for lower tiers.
         "devstral" => (0.0, 0.0, ModelTier::Heavy, 232_000),
         "mistral"  => (0.0, 0.0, ModelTier::Light, 200_000),
+        "gpt-oss-120b" => (0.0, 0.0, ModelTier::Heavy, 131_072),
         // Local models served via LM Studio or any OpenAI-compat local endpoint.
         // Cost is $0; tier derived from parameter count in model name.
         _ if provider == "lmstudio" || provider == "local" => {

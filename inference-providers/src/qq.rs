@@ -51,7 +51,7 @@ fn probe_context(provider: &dyn Provider) -> (bool, bool) {
         "\n\nWhat is the last number in the list above? Respond with only that number.",
     );
 
-    let req = InferenceRequest::new(String::new(), filler, 16, ModelTier::Light, 0);
+    let req = InferenceRequest::new(String::new(), filler, 1024, ModelTier::Light, 0);
 
     match provider.complete(&req) {
         Ok(resp) => {
@@ -77,7 +77,7 @@ fn probe_quality(provider: &dyn Provider) -> (f64, u64) {
     let mut latencies: Vec<u64> = Vec::new();
 
     // ── Micro: list the days of the week ────────────────────────────────────
-    let req = InferenceRequest::new(String::new(), "List the days of the week, one per line. No other text.".into(), 64, ModelTier::Micro, 0);
+    let req = InferenceRequest::new(String::new(), "List the days of the week, one per line. No other text.".into(), 1024, ModelTier::Micro, 0);
     if let Ok(resp) = provider.complete(&req) {
         latencies.push(resp.latency_ms);
         let text = resp.text.to_lowercase();
@@ -92,7 +92,7 @@ fn probe_quality(provider: &dyn Provider) -> (f64, u64) {
     // ── Light: spot a bug in a Rust function ────────────────────────────────
     let req = InferenceRequest::new(String::new(), "Review this Rust function for correctness:\n\
                fn add(a: i32, b: i32) -> i32 { a - b }\n\
-               Respond with exactly CORRECT or INCORRECT on the first line.".into(), 64, ModelTier::Light, 0);
+               Respond with exactly CORRECT or INCORRECT on the first line.".into(), 1024, ModelTier::Light, 0);
     if let Ok(resp) = provider.complete(&req) {
         latencies.push(resp.latency_ms);
         let first = resp.text.trim().lines().next().unwrap_or("").to_uppercase();
@@ -108,7 +108,7 @@ fn probe_quality(provider: &dyn Provider) -> (f64, u64) {
 
     // ── Heavy: implement a simple trait ─────────────────────────────────────
     let req = InferenceRequest::new(String::new(), "Given: trait Store { fn get(&self, key: &str) -> Option<String>; }\n\
-               Write a HashMap-backed Rust implementation. Code only, no prose.".into(), 300, ModelTier::Heavy, 0);
+               Write a HashMap-backed Rust implementation. Code only, no prose.".into(), 2048, ModelTier::Heavy, 0);
     if let Ok(resp) = provider.complete(&req) {
         latencies.push(resp.latency_ms);
         let text = &resp.text;
