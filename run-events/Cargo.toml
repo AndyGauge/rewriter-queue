@@ -1,0 +1,11 @@
+[package]
+name = "run-events"
+version = "0.8.6"
+edition = "2021"
+description = "Shared event, analysis and feature-request types for run observability"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

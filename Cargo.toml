@@ -3,6 +3,7 @@ members = [
     "ai-org-orchestrator",
     "inference-providers",
     "job-queue",
+    "run-events",
 ]
 resolver = "2"
 
