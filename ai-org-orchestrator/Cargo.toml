@@ -16,4 +16,4 @@ chrono               = { workspace = true }
 walkdir              = { workspace = true }
 ureq                 = { workspace = true }
 inference-providers  = { path = "../inference-providers" }
-run-events          = { path = "../run-events" }
+run-events           = { path = "../run-events" }

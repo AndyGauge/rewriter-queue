@@ -13,7 +13,8 @@ pub fn agent_tier(name: &str) -> ModelTier {
         | "DebugImplementer" => ModelTier::Heavy,
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
-        | "PlanReviewer" | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor" => ModelTier::Light,
+        | "PlanReviewer" | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor"
+        | "PostRunAnalyst" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
         // Verdict-only agents: APPROVED/REJECTED, COMPLIANT/NON_COMPLIANT
@@ -55,6 +56,7 @@ pub const PLAN_REVIEWER: &str = include_str!("../../skills/plan-reviewer.md");
 pub const DEBUG_IMPLEMENTER: &str = include_str!("../../skills/debug-implementer.md");
 pub const ACCEPTANCE_CRITERIA: &str = include_str!("../../skills/acceptance-criteria.md");
 pub const SYSTEM_TEST_WRITER: &str = include_str!("../../skills/system-test-writer.md");
+pub const POST_RUN_ANALYST: &str = include_str!("../../skills/post-run-analyst.md");
 /// Appended by `Manager::run_agentic` to every agentic call that's offered tools -- shared
 /// across every role (MissionArchitect, SchemaArchitect, MilestonePlanner, TestEngineer,
 /// AgenticImplementer, everything that calls `run_agentic`), not owned by any one of them, so
