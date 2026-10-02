@@ -47,6 +47,13 @@ them at — a local `llama.cpp`/`vLLM` server, or a hosted API.
   `lints/rules/` and the next run picks it up automatically — no
   recompiling. Matches are logged as non-blocking findings, the same as
   the LLM reviewers' output, not treated as a hard gate.
+- **Run observability** — every agent reports structured events (model calls
+  with token and latency numbers, gate results, findings, errors) to the
+  workspace and the queue server. After a job ends, an analysis explains what
+  went wrong, citing real events, and proposes feature requests that merge
+  across jobs. Read it back with `rewriter-queue events`, `analysis` and
+  `requests`, or the matching MCP tools. See
+  [`docs/observability.md`](docs/observability.md).
 - **`claude-code-plugin/`** — packages the queue's MCP tools plus each
   skill as a Claude Code slash command. See its own README.
 

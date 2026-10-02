@@ -13,4 +13,5 @@ Submit and watch jobs from a terminal, from Zed, or from Claude Code.
 Not a hosted service — three small Rust binaries you run yourself, against
 whatever OpenAI-compatible inference endpoint you point them at.
 
-Start with the [tutorial](tutorial.md).
+Start with the [tutorial](tutorial.md). To see what a run did and why, see
+[run observability](observability.md).
