@@ -2,6 +2,7 @@ mod agents;
 mod debug;
 mod estimation;
 mod manager;
+mod observer;
 mod patch;
 mod plan_review;
 mod quality;
@@ -134,7 +135,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let ws = Workspace::new(&args.workspace).expect("cannot open workspace");
+    let observer = observer::Observer::from_env(Path::new(&args.workspace));
+    observer.install_panic_hook();
+    let ws = Workspace::new(&args.workspace)
+        .expect("cannot open workspace")
+        .with_observer(observer);
 
     let mut registry = if cfg.providers.is_empty() {
         let ollama_models = args.local_model.as_ref()
@@ -245,6 +250,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> ObjectiveContract");
+        ws.observer().inspect(|o| o.stage("ObjectiveContract"));
         let contract_task = format!(
             "# Mission\n{mission}\n\n\
              Produce the ObjectiveContract. V1 source has not been pasted in — read whatever \
@@ -275,6 +281,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> Acceptance criteria");
+        ws.observer().inspect(|o| o.stage("Acceptance criteria"));
         let ac_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then write Gherkin acceptance criteria covering its key behaviors and edge cases. \
              Read V1 source with list_files/read_file only if you need to confirm a concrete \
@@ -300,6 +307,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> Test matrix refinement");
+        ws.observer().inspect(|o| o.stage("Test matrix refinement"));
         let raw_matrix = ws.read_test_matrix().unwrap_or_default();
         let te_task = format!(
             "# Raw Test Matrix\n{raw_matrix}\n\n\
@@ -323,6 +331,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> Inductive analysis");
+        ws.observer().inspect(|o| o.stage("Inductive analysis"));
         let ir_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then analyze V1 as a system using list_files/read_file. Surface implicit \
              invariants, systemic patterns, architectural analogies, and risk zones. For a \
@@ -343,6 +352,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> Schema");
+        ws.observer().inspect(|o| o.stage("Schema"));
         let schema_task = "Read the ObjectiveContract (read_artifact(\"objective_contract.md\")) \
              and the Inductive Analysis (read_artifact(\"inductive_analysis.md\")), then read \
              whatever V1 source you need with list_files/read_file. Design the Rust type \
@@ -363,6 +373,7 @@ fn main() {
         cached
     } else {
         eprintln!("==> V2 synthesis");
+        ws.observer().inspect(|o| o.stage("V2 synthesis"));
         // Only the legacy byte-size chunk fan-out path (large source, multiple heavy
         // providers) still needs the literal concatenated text, for splitting -- the
         // milestone path above reads source on demand via `toolbox` instead.
@@ -386,6 +397,8 @@ fn main() {
         v
     };
     eprintln!("    v2 done");
+
+    ws.observer().inspect(|o| o.end_stage());
 
     // ── Emit final V2 source (Cargo.toml already in place from pre-synthesis setup) ──
     eprintln!("==> Emitting V2 crate");

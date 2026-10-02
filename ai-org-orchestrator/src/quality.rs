@@ -116,6 +116,16 @@ impl<'a> Manager<'a> {
     /// shared default-sequential directory; `Some(id)` is one milestone's isolated
     /// workspace during an explicit parallel fan-out wave (see `Workspace::v2_dir`).
     pub(crate) fn quality_gate(&self, raw_code: &str, variant: Option<&str>) -> (String, String) {
+        let result = self.run_quality_gate(raw_code, variant);
+        if let Some(o) = self.ws.observer() {
+            if self.ws.v2_dir(variant).join("Cargo.toml").exists() {
+                o.gate_result(variant.unwrap_or(""), result.1.is_empty(), result.1.len());
+            }
+        }
+        result
+    }
+
+    fn run_quality_gate(&self, raw_code: &str, variant: Option<&str>) -> (String, String) {
         let code = Self::strip_fences(raw_code);
         let v2_dir = self.ws.v2_dir(variant);
         let manifest = v2_dir.join("Cargo.toml");
