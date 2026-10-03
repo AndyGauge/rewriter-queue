@@ -54,6 +54,11 @@ them at — a local `llama.cpp`/`vLLM` server, or a hosted API.
   across jobs. Read it back with `rewriter-queue events`, `analysis` and
   `requests`, or the matching MCP tools. See
   [`docs/observability.md`](docs/observability.md).
+- **Benchmarks and regression tests** — deterministic structure tests that
+  pin down how the pipeline is wired (they run with `cargo test`), plus a
+  live benchmark, `rewriter-bench`, that runs a set of tasks through the real
+  pipeline, judges them with hidden acceptance checks and compares a run
+  against a stored baseline. See [`docs/benchmarking.md`](docs/benchmarking.md).
 - **`claude-code-plugin/`** — packages the queue's MCP tools plus each
   skill as a Claude Code slash command. See its own README.
 
