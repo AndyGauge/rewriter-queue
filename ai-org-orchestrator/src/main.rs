@@ -5,6 +5,8 @@ mod estimation;
 mod manager;
 mod observer;
 mod patch;
+#[cfg(test)]
+mod pipeline_structure;
 mod plan_review;
 mod provider_setup;
 mod quality;

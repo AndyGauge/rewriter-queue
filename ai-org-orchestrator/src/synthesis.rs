@@ -314,7 +314,7 @@ impl<'a> Manager<'a> {
     /// returned as `Err` rather than silently handed back as if it were a finished V2.
     /// Delivering something that doesn't compile as a "success" is exactly the failure mode
     /// this closes.
-    fn integration_check_and_repair(
+    pub(crate) fn integration_check_and_repair(
         &self,
         mut sections: HashMap<String, String>,
         contract: &str,
@@ -973,7 +973,7 @@ impl<'a> Manager<'a> {
     /// assign it. Stays `true` through any further re-splits once set -- see
     /// `implement_one_milestone`'s own doc comment for where it flips and why it never flips
     /// back.
-    fn implement_milestones(
+    pub(crate) fn implement_milestones(
         &self,
         id_prefix: &str,
         task: &str,
