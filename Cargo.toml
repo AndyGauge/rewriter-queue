@@ -4,6 +4,7 @@ members = [
     "inference-providers",
     "job-queue",
     "run-events",
+    "bench",
 ]
 resolver = "2"
 

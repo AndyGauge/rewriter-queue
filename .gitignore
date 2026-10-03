@@ -9,3 +9,6 @@ Cargo.lock
 # the source/output of whatever project someone ran through this.
 /queue-data/
 *.checkpoint
+
+# Benchmark run results (regenerable); the committed baseline is bench/baseline.json
+/bench/results/

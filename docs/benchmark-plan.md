@@ -62,6 +62,39 @@ that drives `Manager` end to end with scripted providers and asserts on the emit
 Default is a small smoke set with N=3. A full run is opt-in. Tasks carry a time budget; a task
 that exceeds it is a failure, not a hang. The runner cleans up workspaces.
 
+## Shared interface (already built)
+
+`bench/src/types.rs` holds `TaskSpec`, `Check`, `CheckOutcome`, `RunRecord`, `EnvStamp`,
+`RunFile`, `TaskSummary`, `Thresholds` (with defaults), `Regression`. Do not rename or remove
+fields without a note in the coordination file; adding optional fields is fine. `bench/src/main.rs`
+is a stub that exits 2.
+
+Module layout and ownership (the `bench` crate, binary `rewriter-bench`):
+
+- `main.rs`, `runner.rs`, `results.rs`, `env.rs`, `metrics.rs`: package B.
+- `taskspec.rs`, `acceptance.rs`, `bench/tasks/**`: package C.
+- `compare.rs`, `report.rs`, baseline handling: package D.
+- `ai-org-orchestrator/src/pipeline_structure/` (tier 1): package A.
+
+Cross-package function contracts (implement exactly these signatures; stubs may be added by the
+owner, and callers may rely on them):
+
+- C: `taskspec::load_all(dir: &Path) -> Result<Vec<(TaskSpec, PathBuf)>, String>` (sorted by
+  name; the PathBuf is the task directory); `taskspec::load_one(dir: &Path) -> Result<TaskSpec, String>`.
+- C: `acceptance::run_checks(spec: &TaskSpec, task_dir: &Path, crate_dir: &Path) -> Vec<CheckOutcome>`
+  (builds the crate, runs each check, runs cargo tests when `spec.cargo_tests`; a build failure is
+  a single failed outcome named `build`).
+- B: `metrics::from_events(events: &[run_events::Event]) -> EventMetrics` (tokens, calls, retries,
+  gate failures, integration attempts, escalations, plan_revised, debugger_consulted; see the
+  event conventions in `docs/observability.md` and `skills/`/code in `observer.rs` and
+  `synthesis.rs`).
+- B: `results::{save_run_file, load_run_file, list_run_files}` over `bench/results/`.
+- D: `compare::summarize(records: &[RunRecord]) -> Vec<TaskSummary>`,
+  `compare::compare(baseline: &RunFile, current: &RunFile, t: &Thresholds) -> Vec<Regression>`,
+  `report::render(baseline: &RunFile, current: &RunFile, regressions: &[Regression]) -> String`.
+- B owns `main.rs` dispatch of all subcommands (`run`, `compare`, `promote`, `validate-tasks`,
+  `list`) and calls into C and D; until C/D land, B may stub the calls behind the signatures above.
+
 ## Work packages
 
 - A. Tier 1 structure tests (`ai-org-orchestrator` tests, `pipeline-structure`).

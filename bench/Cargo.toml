@@ -1,0 +1,17 @@
+[package]
+name = "bench"
+version = "0.9.1"
+edition = "2021"
+description = "Live benchmark and regression suite for the rewriter pipeline"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rewriter-bench"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+run-events = { path = "../run-events" }
