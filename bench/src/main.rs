@@ -1,3 +1,5 @@
+mod compare;
+mod report;
 mod types;
 
 fn main() {
