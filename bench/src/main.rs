@@ -1,3 +1,5 @@
+mod acceptance;
+mod taskspec;
 mod types;
 
 fn main() {

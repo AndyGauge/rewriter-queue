@@ -1,0 +1,4 @@
+[package]
+name = "wc-lite"
+version = "0.1.0"
+edition = "2021"
