@@ -14,4 +14,6 @@ Not a hosted service — three small Rust binaries you run yourself, against
 whatever OpenAI-compatible inference endpoint you point them at.
 
 Start with the [tutorial](tutorial.md). To see what a run did and why, see
-[run observability](observability.md).
+[run observability](observability.md). To check that a change to the
+pipeline did not make it slower or less effective, see
+[benchmarks and regression tests](benchmarking.md).

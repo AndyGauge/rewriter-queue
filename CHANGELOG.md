@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.0]
+
+### Added
+
+- A benchmark and regression suite, so a change to the pipeline, the prompts, the skills or the
+  model configuration can be checked for making things slower or less effective. The pipeline is
+  non-deterministic and its failures are subtle (one job produced a correct program that failed its
+  own tests over a doubled trailing newline), so the suite has two tiers. See
+  `docs/benchmarking.md`.
+- `bench` crate and `rewriter-bench` binary: `run` submits each task through the queue (or runs the
+  orchestrator directly with `--direct`), then builds the finished crate and judges it with
+  acceptance checks the pipeline never sees. The pipeline's own `succeeded` never decides pass or
+  fail. Each run records pass or fail with the failing check, wall time, tokens, model calls,
+  retries, gate failures, escalations, whether plan review changed the plan and whether the
+  debugger was consulted, plus an environment stamp (commit, version, providers, binary hashes,
+  host). `compare` flags a drop in pass rate or a rise in median time or tokens beyond the
+  baseline's own spread, never fails on too few runs, and exits non-zero on a regression so it can
+  gate a release; `promote` makes a results file the committed baseline; `validate-tasks` proves
+  every task's checks pass a known-good solution and fail a known-bad one.
+- Five tasks, each taken from a real failure or a risk: `rect` (the doubled trailing newline and the
+  do-nothing program), `hello-trivial` (must not be over-split), `wc-lite`, `contract-trap` (stale
+  comments the mission overrides) and `stack-calc-refactor` (behaviour-preserving restructuring).
+- Tier-1 structure tests, run by `cargo test`: scripted-provider tests that drive the real manager
+  and assert on the agents called, their prompts and the event stream. They pin plan review before
+  implementation, debugger consultation from the second failed repair and escalation only after
+  the repair budget, fallbacks when a reviewer or debugger call fails, observability failures never
+  failing a job, the contract reviewer being given the mission, and a call-count budget for a
+  one-milestone run, so a refactor cannot quietly remove one of these.
+
+### Fixed
+
+- The contract reviewer is now shown the mission and rejects a contract that drops or contradicts
+  it. A real job (#26) reported `succeeded` with a program that did nothing: the contract was
+  written from a stub V1 and copied it, and the reviewer, which was never shown the mission, had
+  nothing to check the contract against, so every later stage faithfully built an empty program and
+  every gate passed.
+
 ## [0.9.1]
 
 ### Fixed

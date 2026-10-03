@@ -7,3 +7,4 @@
 - [Zed setup](zed-setup.md)
 - [Remote deployment](remote-deployment.md)
 - [Run observability](observability.md)
+- [Benchmarks and regression tests](benchmarking.md)
