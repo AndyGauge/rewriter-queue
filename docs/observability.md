@@ -29,7 +29,7 @@ Each event is one JSON object (one line of JSONL), defined in the `run-events` c
 | `decision`    | An agent logged a decision | `text` (full text, capped at 4000 characters) |
 | `deviation`   | A deviation from plan was logged | `text` |
 | `finding`     | An agent called `report_finding` | `severity` (`info`, `warn`, `error`), `category`, `evidence` |
-| `gate_result` | A quality-gate run (build, clippy, test, fmt) | `passed`, `error_bytes`, `attempt`, and `variant` for parallel milestone build directories |
+| `gate_result` | A quality-gate run (build, clippy, test, fmt) | `passed`, `error_bytes`, `attempt`, `variant` for parallel milestone build directories, and `integration: true` on runs of the final whole-crate gate |
 | `retry`       | A retry | `text` |
 | `error`       | An error, including a panic in the orchestrator (a panic hook records it) | `text` |
 

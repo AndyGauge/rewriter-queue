@@ -137,7 +137,7 @@ Each record:
 | `model_calls` | Number of model calls, including failed ones |
 | `retries` | Number of retry events |
 | `gate_failures` | Quality-gate runs that failed |
-| `integration_attempts` | See the caveat under Limitations |
+| `integration_attempts` | Runs of the final whole-crate gate (gate events marked `integration`) |
 | `escalations` | Retries recorded by the milestone planner (a milestone sent back for a finer split) |
 | `plan_revised` | The plan reviewer recorded a decision, meaning it changed the plan |
 | `debugger_consulted` | The debug implementer made at least one call |
@@ -357,10 +357,6 @@ exists, replace this section with the measured figures.
 - **Stamps are partial.** The environment stamp has provider names, not models or server context
   settings, so two runs on the same provider with a different model look identical to the model
   note in `compare`.
-- **`integration_attempts` is an approximation.** The events carry no separate marker for the
-  final integration gate, so the count is every quality-gate run that has no `variant` key (that
-  is, gates on the shared crate directory), and it can include gates that are not the final
-  integration. Use it as a trend, not an exact count.
 - **Tasks are small Rust programs.** The suite measures the pipeline on short, single-crate Rust
   tasks. It says little about large inputs or the merge path.
 - **Queue mode needs infrastructure.** A queue and a worker must be running and pointed at a model;
