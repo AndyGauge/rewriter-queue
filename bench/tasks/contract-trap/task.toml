@@ -1,0 +1,74 @@
+name = "contract-trap"
+description = "Refactor a crate whose doc comments and README describe stale behaviour; the mission states the true contract and the pipeline must follow it, not the comments"
+max_iter = 10
+time_budget_secs = 2400
+tags = ["refactor", "trap", "stale-docs", "contract", "difficulty:medium"]
+binary = "tidy"
+
+[[check]]
+name = "sorts-ascending"
+stdin = "b\na\nc\n"
+expect_stdout = "    a\n    b\n    c\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "indents-with-four-spaces-not-a-tab"
+stdin = "x\n"
+expect_stdout = "    x\n"
+expect_exit = 0
+
+[[check]]
+name = "removes-duplicates"
+stdin = "x\nx\ny\nx\n"
+expect_stdout = "    x\n    y\n"
+expect_exit = 0
+
+[[check]]
+name = "drops-blank-lines"
+stdin = "b\n\n  \t\na\n"
+expect_stdout = "    a\n    b\n"
+expect_exit = 0
+
+[[check]]
+name = "keeps-inner-whitespace-and-leading-spaces"
+stdin = "  b\na\n"
+expect_stdout = "      b\n    a\n"
+expect_exit = 0
+
+[[check]]
+name = "bytewise-uppercase-first"
+stdin = "b\nB\na\n"
+expect_stdout = "    B\n    a\n    b\n"
+expect_exit = 0
+
+[[check]]
+name = "empty-input"
+stdin = ""
+expect_stdout = ""
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "only-blank-lines"
+stdin = "\n \n\n"
+expect_stdout = ""
+expect_exit = 0
+
+[[check]]
+name = "no-trailing-newline-in-input"
+stdin = "b\na"
+expect_stdout = "    a\n    b\n"
+expect_exit = 0
+
+[[check]]
+name = "crlf-input"
+stdin = "b\r\na\r\n"
+expect_stdout = "    a\n    b\n"
+expect_exit = 0
+
+[[check]]
+name = "numbers-sort-as-text"
+stdin = "10\n9\n2\n"
+expect_stdout = "    10\n    2\n    9\n"
+expect_exit = 0

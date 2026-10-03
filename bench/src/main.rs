@@ -1,3 +1,5 @@
+mod acceptance;
+mod taskspec;
 mod compare;
 mod report;
 mod types;

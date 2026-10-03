@@ -1,0 +1,179 @@
+name = "stack-calc-refactor"
+description = "Restructure a messy single-file RPN calculator into modules with identical behaviour, including every error case"
+max_iter = 10
+time_budget_secs = 2700
+tags = ["refactor", "multi-module", "behaviour-preserving", "difficulty:medium"]
+binary = "calc"
+cargo_tests = true
+
+[[check]]
+name = "add"
+args = ["3", "4", "+"]
+expect_stdout = "7\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "single-argument-expression"
+args = ["3 4 +"]
+expect_stdout = "7\n"
+expect_exit = 0
+
+[[check]]
+name = "subtract"
+args = ["10", "3", "-"]
+expect_stdout = "7\n"
+expect_exit = 0
+
+[[check]]
+name = "multiply"
+args = ["6", "7", "*"]
+expect_stdout = "42\n"
+expect_exit = 0
+
+[[check]]
+name = "divide-truncates-toward-zero"
+args = ["-7", "2", "/"]
+expect_stdout = "-3\n"
+expect_exit = 0
+
+[[check]]
+name = "remainder-has-sign-of-dividend"
+args = ["-7", "2", "%"]
+expect_stdout = "-1\n"
+expect_exit = 0
+
+[[check]]
+name = "dup"
+args = ["5", "dup", "*"]
+expect_stdout = "25\n"
+expect_exit = 0
+
+[[check]]
+name = "swap"
+args = ["1", "2", "swap", "-"]
+expect_stdout = "1\n"
+expect_exit = 0
+
+[[check]]
+name = "plus-sign-number"
+args = ["+5", "1", "+"]
+expect_stdout = "6\n"
+expect_exit = 0
+
+[[check]]
+name = "single-number"
+args = ["42"]
+expect_stdout = "42\n"
+expect_exit = 0
+
+[[check]]
+name = "longer-expression"
+args = ["2 3 + 4 * 10 swap %"]
+expect_stdout = "10\n"
+expect_exit = 0
+
+[[check]]
+name = "error-empty-no-args"
+args = []
+expect_stdout = ""
+expect_stderr = "error: empty expression\n"
+expect_exit = 2
+
+[[check]]
+name = "error-empty-whitespace"
+args = ["  "]
+expect_stdout = ""
+expect_stderr = "error: empty expression\n"
+expect_exit = 2
+
+[[check]]
+name = "error-unknown-token"
+args = ["1", "foo", "+"]
+expect_stdout = ""
+expect_stderr = "error: unknown token 'foo'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-literal-too-large"
+args = ["99999999999999999999"]
+expect_stdout = ""
+expect_stderr = "error: unknown token '99999999999999999999'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-float-is-unknown"
+args = ["1.5"]
+expect_stdout = ""
+expect_stderr = "error: unknown token '1.5'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-underflow-binary"
+args = ["1", "+"]
+expect_stdout = ""
+expect_stderr = "error: stack underflow at '+'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-underflow-dup"
+args = ["dup"]
+expect_stdout = ""
+expect_stderr = "error: stack underflow at 'dup'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-underflow-swap"
+args = ["1", "swap"]
+expect_stdout = ""
+expect_stderr = "error: stack underflow at 'swap'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-division-by-zero"
+args = ["1", "0", "/"]
+expect_stdout = ""
+expect_stderr = "error: division by zero\n"
+expect_exit = 2
+
+[[check]]
+name = "error-remainder-by-zero"
+args = ["1", "0", "%"]
+expect_stdout = ""
+expect_stderr = "error: division by zero\n"
+expect_exit = 2
+
+[[check]]
+name = "error-add-overflow"
+args = ["9223372036854775807", "1", "+"]
+expect_stdout = ""
+expect_stderr = "error: overflow at '+'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-divide-overflow"
+args = ["-9223372036854775808", "-1", "/"]
+expect_stdout = ""
+expect_stderr = "error: overflow at '/'\n"
+expect_exit = 2
+
+[[check]]
+name = "error-leftover-values"
+args = ["1", "2"]
+expect_stdout = ""
+expect_stderr = "error: expected 1 value on stack, found 2\n"
+expect_exit = 2
+
+[[check]]
+name = "error-stops-at-first-error"
+args = ["1", "0", "/", "foo"]
+expect_stdout = ""
+expect_stderr = "error: division by zero\n"
+expect_exit = 2
+
+[[check]]
+name = "error-unknown-before-leftover"
+args = ["1", "2", "foo"]
+expect_stdout = ""
+expect_stderr = "error: unknown token 'foo'\n"
+expect_exit = 2

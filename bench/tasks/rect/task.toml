@@ -1,0 +1,118 @@
+name = "rect"
+description = "Greenfield CLI that draws an ASCII rectangle outline; regression for the doubled trailing newline and the program that did nothing"
+max_iter = 8
+time_budget_secs = 1800
+tags = ["greenfield", "cli", "regression", "newline", "difficulty:easy"]
+binary = "rect"
+
+[[check]]
+name = "basic"
+args = ["0", "0", "4", "2"]
+expect_stdout = "+---+\n|   |\n+---+\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "no-doubled-trailing-newline"
+args = ["0", "0", "2", "1"]
+expect_stdout = "+-+\n+-+\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "produces-output"
+args = ["1", "1", "3", "3"]
+expect_stdout = "+-+\n| |\n+-+\n"
+expect_exit = 0
+
+[[check]]
+name = "corners-reversed"
+args = ["4", "2", "0", "0"]
+expect_stdout = "+---+\n|   |\n+---+\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "corners-mixed-order"
+args = ["0", "2", "4", "0"]
+expect_stdout = "+---+\n|   |\n+---+\n"
+expect_exit = 0
+
+[[check]]
+name = "interior-spaces"
+args = ["0", "0", "5", "3"]
+expect_stdout = "+----+\n|    |\n|    |\n+----+\n"
+expect_exit = 0
+
+[[check]]
+name = "inclusive-two-by-two"
+args = ["1", "1", "2", "2"]
+expect_stdout = "++\n++\n"
+expect_exit = 0
+
+[[check]]
+name = "zero-height-line"
+args = ["0", "0", "3", "0"]
+expect_stdout = "+--+\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "zero-width-line"
+args = ["0", "0", "0", "2"]
+expect_stdout = "+\n|\n+\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "single-point"
+args = ["5", "5", "5", "5"]
+expect_stdout = "+\n"
+expect_exit = 0
+
+[[check]]
+name = "negative-coordinates"
+args = ["-2", "-1", "0", "1"]
+expect_stdout = "+-+\n| |\n+-+\n"
+expect_exit = 0
+
+[[check]]
+name = "position-does-not-matter"
+args = ["100", "200", "104", "202"]
+expect_stdout = "+---+\n|   |\n+---+\n"
+expect_exit = 0
+
+[[check]]
+name = "usage-no-args"
+args = []
+expect_stdout = ""
+expect_stderr = "Usage: rect <x1> <y1> <x2> <y2>\n"
+expect_exit = 1
+
+[[check]]
+name = "usage-too-few-args"
+args = ["1", "2", "3"]
+expect_stdout = ""
+expect_stderr = "Usage: rect <x1> <y1> <x2> <y2>\n"
+expect_exit = 1
+
+[[check]]
+name = "usage-too-many-args"
+args = ["1", "2", "3", "4", "5"]
+expect_stdout = ""
+expect_stderr = "Usage: rect <x1> <y1> <x2> <y2>\n"
+expect_exit = 1
+
+[[check]]
+name = "usage-non-numeric"
+args = ["a", "0", "3", "3"]
+expect_stdout = ""
+expect_stderr = "Usage: rect <x1> <y1> <x2> <y2>\n"
+expect_exit = 1
+
+[[check]]
+name = "usage-non-integer"
+args = ["0", "0", "2.5", "3"]
+expect_stdout = ""
+expect_stderr = "Usage: rect <x1> <y1> <x2> <y2>\n"
+expect_exit = 1

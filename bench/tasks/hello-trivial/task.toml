@@ -1,0 +1,39 @@
+name = "hello-trivial"
+description = "Trivial greeting CLI; it should be done in a single milestone and must not be over-split into many"
+max_iter = 3
+time_budget_secs = 600
+tags = ["greenfield", "trivial", "no-oversplit", "difficulty:trivial"]
+binary = "hello"
+
+[[check]]
+name = "default-name"
+args = []
+expect_stdout = "Hello, World!\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "given-name"
+args = ["Ada"]
+expect_stdout = "Hello, Ada!\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "name-with-space"
+args = ["Ada Lovelace"]
+expect_stdout = "Hello, Ada Lovelace!\n"
+expect_exit = 0
+
+[[check]]
+name = "extra-args-ignored"
+args = ["Ada", "Grace", "Linus"]
+expect_stdout = "Hello, Ada!\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[check]]
+name = "empty-name"
+args = [""]
+expect_stdout = "Hello, !\n"
+expect_exit = 0
