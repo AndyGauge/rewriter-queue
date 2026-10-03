@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.1]
+
+### Fixed
+
+- A single server-side HTTP 5xx no longer ends a run. A real job (#25) died 37 minutes in when
+  llama-server answered 500 "The model produced output that does not match the expected
+  peg-native format" -- a reasoning model's tool call it could not parse -- and with one
+  provider there was nothing to fall back to. `Registry::complete` and `complete_pinned` now
+  retry a 5xx after 5s, 15s and 30s (the next sample almost always parses). Client errors such
+  as 400 still fail immediately.
+- A nested plan's review now sees the plans above it. Reviewing the split of one milestone with
+  no knowledge of its siblings, the reviewer "filled the gap" by adding a command-line step the
+  parent plan's later milestones already owned. It is now given the effective parent plans (the
+  reviewer's correction when there was one) and told that their other milestones are separate
+  work.
+
 ## [0.9.0]
 
 ### Added

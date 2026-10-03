@@ -732,3 +732,54 @@ fn complete_pinned_never_falls_through_to_a_different_provider_on_failure() {
     assert_eq!(calls[0].load(Ordering::SeqCst), 1, "the pinned (broken) provider was tried");
     assert_eq!(calls[1].load(Ordering::SeqCst), 0, "must not fall through to the healthy one");
 }
+
+fn flaky(fail_with: &'static str, failures: usize) -> impl Fn(&InferenceRequest) -> Result<InferenceResponse, ProviderError> + Send + Sync {
+    let seen = Arc::new(AtomicUsize::new(0));
+    move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) < failures {
+            Err(ProviderError::Unavailable(fail_with.into()))
+        } else {
+            reply("recovered", 1)
+        }
+    }
+}
+
+const PEG_500: &str = "HTTP 500: {\"error\":{\"code\":500,\"message\":\"The model produced output that does not match the expected peg-native format\"}}";
+
+#[test]
+fn a_server_error_from_the_only_provider_is_retried() {
+    let (r, calls, _) = Builder::new()
+        .add("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, flaky(PEG_500, 2))
+        .build();
+    let resp = r.complete(&req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(resp.text, "recovered");
+    assert_eq!(calls[0].load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn server_errors_stop_being_retried_after_the_backoff_budget() {
+    let (r, calls, _) = Builder::new()
+        .add("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, flaky(PEG_500, usize::MAX))
+        .build();
+    assert!(r.complete(&req(ModelTier::Heavy, 0, 0)).is_err());
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1 + TRANSIENT_BACKOFF_SECS.len());
+}
+
+#[test]
+fn a_client_error_is_not_retried() {
+    let (r, calls, _) = Builder::new()
+        .add("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, flaky("HTTP 400: bad request", usize::MAX))
+        .build();
+    assert!(r.complete(&req(ModelTier::Heavy, 0, 0)).is_err());
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_server_error_in_a_pinned_conversation_is_retried_on_the_same_provider() {
+    let (r, calls, _) = Builder::new()
+        .add_tool_capable("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, flaky(PEG_500, 1))
+        .build();
+    let resp = r.complete_pinned("solo", &req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(resp.text, "recovered");
+    assert_eq!(calls[0].load(Ordering::SeqCst), 2);
+}

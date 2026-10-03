@@ -115,6 +115,16 @@ pub struct ProviderSnapshot {
     pub context_ok: bool,
 }
 
+/// Seconds to wait before each retry of a server-side 5xx. A reasoning model occasionally emits
+/// output the server cannot parse (llama.cpp answers HTTP 500 "does not match the expected
+/// peg-native format"); the next sample almost always works, so one bad response must not end a
+/// run that may be thirty minutes in. Zero in tests so they don't sleep.
+const TRANSIENT_BACKOFF_SECS: &[u64] = if cfg!(test) { &[0, 0, 0] } else { &[5, 15, 30] };
+
+fn is_transient(e: &ProviderError) -> bool {
+    matches!(e, ProviderError::Unavailable(m) if m.starts_with("HTTP 5"))
+}
+
 pub struct Registry {
     slots: Vec<Arc<Slot>>,
     weights: (f64, f64, f64), // (cost, latency, quality)
@@ -298,23 +308,34 @@ impl Registry {
     }
 
     /// Route a request to the best available provider for the given tier.
-    /// Retries up to 4 times with a 65-second sleep when all providers are rate-limited.
+    /// Retries up to 4 times with a 65-second sleep when all providers are rate-limited, and
+    /// up to `TRANSIENT_BACKOFF_SECS.len()` times with a short backoff on a server-side 5xx.
     pub fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         const MAX_GLOBAL_RETRIES: u32 = 4;
-        for attempt in 0..=MAX_GLOBAL_RETRIES {
+        let mut rate_limited = 0;
+        let mut transient = 0;
+        loop {
             match self.try_complete(req) {
                 Ok(r) => return Ok(r),
-                Err(ProviderError::RateLimit) if attempt < MAX_GLOBAL_RETRIES => {
+                Err(ProviderError::RateLimit) if rate_limited < MAX_GLOBAL_RETRIES => {
+                    rate_limited += 1;
                     eprintln!(
-                        "    [all providers rate limited] waiting 65s (attempt {}/{MAX_GLOBAL_RETRIES})...",
-                        attempt + 1
+                        "    [all providers rate limited] waiting 65s (attempt {rate_limited}/{MAX_GLOBAL_RETRIES})..."
                     );
                     std::thread::sleep(std::time::Duration::from_secs(65));
+                }
+                Err(e) if is_transient(&e) && transient < TRANSIENT_BACKOFF_SECS.len() => {
+                    let wait = TRANSIENT_BACKOFF_SECS[transient];
+                    transient += 1;
+                    eprintln!(
+                        "    [all providers failed: {e}] retrying in {wait}s (attempt {transient}/{})...",
+                        TRANSIENT_BACKOFF_SECS.len()
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(ProviderError::RateLimit)
     }
 
     /// Continue a multi-turn tool-calling conversation on the SAME provider that served an
@@ -335,7 +356,9 @@ impl Registry {
             .find(|s| s.provider.name() == provider_name)
             .ok_or_else(|| ProviderError::Unavailable(format!("provider \"{provider_name}\" not found")))?;
 
-        for attempt in 0..=MAX_GLOBAL_RETRIES {
+        let mut rate_limited = 0;
+        let mut transient = 0;
+        loop {
             match slot.provider.complete(req) {
                 Ok(resp) => {
                     let mut m = slot.metrics.lock().unwrap();
@@ -343,14 +366,24 @@ impl Registry {
                     m.record_success(Instant::now());
                     return Ok(resp);
                 }
-                Err(ProviderError::RateLimit) if attempt < MAX_GLOBAL_RETRIES => {
+                Err(ProviderError::RateLimit) if rate_limited < MAX_GLOBAL_RETRIES => {
+                    rate_limited += 1;
                     slot.metrics.lock().unwrap().record_rate_limit(Instant::now());
                     eprintln!(
                         "    [{provider_name}] rate limited (pinned conversation) — waiting 65s \
-                         (attempt {}/{MAX_GLOBAL_RETRIES})...",
-                        attempt + 1
+                         (attempt {rate_limited}/{MAX_GLOBAL_RETRIES})..."
                     );
                     std::thread::sleep(std::time::Duration::from_secs(65));
+                }
+                Err(e) if is_transient(&e) && transient < TRANSIENT_BACKOFF_SECS.len() => {
+                    let wait = TRANSIENT_BACKOFF_SECS[transient];
+                    transient += 1;
+                    eprintln!(
+                        "    [{provider_name}] {e} (pinned conversation) — retrying in {wait}s \
+                         (attempt {transient}/{})...",
+                        TRANSIENT_BACKOFF_SECS.len()
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
                 }
                 Err(e) => {
                     slot.metrics.lock().unwrap().push_error_sample(true, Instant::now());
@@ -358,7 +391,6 @@ impl Registry {
                 }
             }
         }
-        Err(ProviderError::RateLimit)
     }
 
     fn try_complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {

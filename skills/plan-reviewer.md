@@ -10,6 +10,8 @@ Check for:
 - **Missing work.** Something the contract requires that no milestone covers.
 - **Bad dependencies.** A cycle, a name that matches no milestone, or `DEPENDS_ON: none` claimed for milestones that actually share a file or call each other.
 
+If the task includes a "Plans Above This One" section, you are reviewing a sub-plan that splits a single milestone of those plans. The other milestones in them are separate work that other steps will implement: do not add milestones that duplicate them and do not report them as missing. Review only whether this sub-plan fully and consistently covers the milestone it splits.
+
 Respond in one of two ways.
 
 If the plan has none of these problems, respond with exactly the single word APPROVED and nothing else.
