@@ -115,6 +115,30 @@ fn parse_args() -> Args {
     }
 }
 
+fn author_contract(
+    mgr: &Manager,
+    mission: &str,
+    max_iter: usize,
+    toolbox: &(dyn tools::Toolbox + Sync),
+) -> Result<String, Box<dyn std::error::Error>> {
+    let contract_task = format!(
+        "# Mission\n{mission}\n\n\
+         Produce the ObjectiveContract. V1 source has not been pasted in — read whatever \
+         files you actually need with your tools (list_files/read_file). Record \
+         deviations you observe — do not implement them."
+    );
+    mgr.run_with_review(
+        "MissionArchitect",
+        MISSION_ARCHITECT,
+        "ContractReviewer",
+        CONTRACT_REVIEWER,
+        &contract_task,
+        "APPROVED",
+        max_iter,
+        toolbox,
+    )
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("analyze") {
         std::process::exit(analysis::run_cli(&std::env::args().skip(2).collect::<Vec<_>>()));
@@ -227,24 +251,8 @@ fn main() {
     } else {
         eprintln!("==> ObjectiveContract");
         ws.observer().inspect(|o| o.stage("ObjectiveContract"));
-        let contract_task = format!(
-            "# Mission\n{mission}\n\n\
-             Produce the ObjectiveContract. V1 source has not been pasted in — read whatever \
-             files you actually need with your tools (list_files/read_file). Record \
-             deviations you observe — do not implement them."
-        );
         let toolbox = toolbox_for("MissionArchitect", MISSION_ARCHITECT);
-        let c = mgr
-            .run_with_review(
-                "MissionArchitect",
-                MISSION_ARCHITECT,
-                "ContractReviewer",
-                CONTRACT_REVIEWER,
-                &contract_task,
-                "APPROVED",
-                args.max_iter,
-                &toolbox,
-            )
+        let c = author_contract(&mgr, &mission, args.max_iter, &toolbox)
             .expect("contract phase failed");
         ws.emit_artifact("objective_contract.md", &c).unwrap();
         c

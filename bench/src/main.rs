@@ -2,6 +2,7 @@ mod acceptance;
 mod compare;
 mod env;
 mod metrics;
+mod proc;
 mod report;
 mod results;
 mod runner;

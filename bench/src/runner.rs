@@ -1,11 +1,10 @@
 use crate::metrics;
+use crate::proc::{collect, drain, kill_group, MAX_CAPTURE};
 use crate::types::{CheckOutcome, RunRecord, TaskSpec};
 use run_events::Event;
-use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub type Checker<'a> = dyn Fn(&TaskSpec, &Path, &Path) -> Vec<CheckOutcome> + 'a;
@@ -47,24 +46,6 @@ fn spawn_with_retry(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     }
 }
 
-fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn drain<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    rx
-}
-
 /// Runs in its own process group so a timeout also kills what the command spawned.
 pub fn exec(
     program: &Path,
@@ -83,8 +64,8 @@ pub fn exec(
     }
     let mut child =
         spawn_with_retry(&mut cmd).map_err(|e| format!("run {}: {e}", program.display()))?;
-    let out_rx = drain(child.stdout.take().expect("stdout is piped"));
-    let err_rx = drain(child.stderr.take().expect("stderr is piped"));
+    let out_rx = drain(child.stdout.take().expect("stdout is piped"), MAX_CAPTURE);
+    let err_rx = drain(child.stderr.take().expect("stderr is piped"), MAX_CAPTURE);
     let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -100,13 +81,11 @@ pub fn exec(
             Err(e) => return Err(format!("wait for {}: {e}", program.display())),
         }
     };
-    let grace = Duration::from_secs(2);
-    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        String::from_utf8_lossy(&rx.recv_timeout(grace).unwrap_or_default()).into_owned()
-    };
+    kill_group(child.id());
+    let text = |rx| String::from_utf8_lossy(&collect(rx)).into_owned();
     Ok(Exec {
-        stdout: collect(out_rx),
-        stderr: collect(err_rx),
+        stdout: text(out_rx),
+        stderr: text(err_rx),
         code: status.and_then(|s| s.code()),
         timed_out,
     })
@@ -168,11 +147,11 @@ fn read_workspace_events(workspace: &Path) -> Vec<Event> {
         .unwrap_or_default()
 }
 
+/// The orchestrator writes the crate to `<workspace>/artifacts/v2`, and `fetch` unpacks the
+/// workspace root directly into `--out`.
 fn crate_in(root: &Path) -> Option<PathBuf> {
-    ["artifacts/v2", "ws/artifacts/v2"]
-        .iter()
-        .map(|rel| root.join(rel))
-        .find(|dir| dir.join("Cargo.toml").is_file())
+    let dir = root.join("artifacts/v2");
+    dir.join("Cargo.toml").is_file().then_some(dir)
 }
 
 fn run_direct(spec: &TaskSpec, orchestrator: &Path, work: &Path) -> Pipeline {
@@ -236,6 +215,20 @@ impl Queue<'_> {
         }
         Ok(r.stdout)
     }
+}
+
+/// `cancel` only records a request; the worker kills the orchestrator on its next poll, and the
+/// work directory must not be deleted while the orchestrator can still write to it.
+fn await_stopped(queue: &Queue, id: &str, poll: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        match queue.ok_stdout(&args(&["status", id])) {
+            Ok(text) if parse_state(&text).is_some_and(is_terminal) => return,
+            Err(_) => return,
+            Ok(_) => std::thread::sleep(poll),
+        }
+    }
+    eprintln!("  job {id} still not stopped after cancel");
 }
 
 fn run_queue(spec: &TaskSpec, queue_bin: &Path, work: &Path, opts: &Options) -> Pipeline {
@@ -309,6 +302,7 @@ fn run_queue(spec: &TaskSpec, queue_bin: &Path, work: &Path, opts: &Options) -> 
             if let Err(e) = queue.ok_stdout(&args(&["cancel", &id_arg])) {
                 eprintln!("  {e}");
             }
+            await_stopped(&queue, &id_arg, opts.poll_interval);
             break ("timeout".into(), true);
         }
         std::thread::sleep(opts.poll_interval);
@@ -361,7 +355,7 @@ fn work_dir(opts: &Options, spec: &TaskSpec, repeat: usize) -> PathBuf {
     opts.results_dir
         .join("work")
         .join(label)
-        .join(format!("{}-{repeat}", spec.name))
+        .join(format!("{}-{repeat}", crate::results::sanitize_label(&spec.name)))
 }
 
 pub fn run_one(

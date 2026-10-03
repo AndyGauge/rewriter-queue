@@ -142,4 +142,11 @@ fn escalation_to_the_milestone_planner_happens_only_after_the_repair_budget_and_
         .into_iter()
         .any(|e| e.agent == "MilestonePlanner" && e.summary.contains("integration escalation"));
     assert!(escalated, "the escalation must be visible in the event stream as a retry");
+
+    let marked = read_events(&events)
+        .into_iter()
+        .filter(|e| e.kind == run_events::EventKind::GateResult)
+        .filter(|e| e.detail.as_ref().and_then(|d| d.get("integration")).is_some())
+        .count();
+    assert!(marked >= 3, "each integration gate run must be marked as such, found {marked}");
 }

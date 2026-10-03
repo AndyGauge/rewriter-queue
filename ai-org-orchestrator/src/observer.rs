@@ -257,8 +257,10 @@ impl Observer {
     }
 
     /// `key` identifies one build directory (a milestone variant, or "" for the shared one);
-    /// `attempt` counts consecutive runs against it since it last passed.
-    pub fn gate_result(&self, key: &str, passed: bool, error_bytes: usize) {
+    /// `attempt` counts consecutive runs against it since it last passed. `integration` marks
+    /// runs of the final assembled-crate gate, which share the "" directory with sequential
+    /// milestone gates.
+    pub fn gate_result(&self, key: &str, passed: bool, error_bytes: usize, integration: bool) {
         let attempt = {
             let mut attempts = lock(&self.inner.gate_attempts);
             let n = attempts.entry(key.to_string()).or_insert(0);
@@ -277,6 +279,9 @@ impl Observer {
         let mut detail = json!({"passed": passed, "error_bytes": error_bytes, "attempt": attempt});
         if !key.is_empty() {
             detail["variant"] = Value::String(key.to_string());
+        }
+        if integration {
+            detail["integration"] = Value::Bool(true);
         }
         self.emit(Event::new("QualityGate", EventKind::GateResult, &summary).with_detail(detail));
     }

@@ -47,7 +47,9 @@ fn canned_events() -> String {
             "reviewer rejected iteration 1, revising",
         ),
         Event::new("QualityGate", EventKind::GateResult, "gate")
-            .with_detail(json!({"passed": false, "error_bytes": 3, "attempt": 1})),
+            .with_detail(json!({"passed": false, "error_bytes": 3, "attempt": 1, "integration": true})),
+        Event::new("QualityGate", EventKind::GateResult, "gate")
+            .with_detail(json!({"passed": true, "error_bytes": 0, "attempt": 2})),
         Event::new("DebugImplementer", EventKind::AgentCall, "call")
             .with_detail(json!({"input_tokens": 10, "output_tokens": 5, "ok": true})),
     ];
@@ -93,16 +95,36 @@ submit)
   echo "queued job #7 (0 ahead) — worker started"
   ;;
 status)
+  test "$1" = 7 || {{ echo "error: no job $1" >&2; exit 1; }}
   n=$(cat "$STATE/n"); echo $((n+1)) > "$STATE/n"
-  if [ "$n" -lt 1 ]; then echo "job #7 — queued"
-  elif [ "{forever}" = yes ] || [ "$n" -lt 3 ]; then echo "job #7 — running"
-  else echo "job #7 — succeeded"; fi
+  final=succeeded; test -f "$STATE/final" && final=$(cat "$STATE/final")
+  if [ -f "$STATE/cancelled" ]; then
+    c=$(cat "$STATE/cancelled"); echo $((c+1)) > "$STATE/cancelled"
+    if [ "$c" -ge 2 ]; then s=cancelled; else s=running; fi
+  elif [ "$n" -lt 1 ]; then s=queued
+  elif [ "{forever}" = yes ] || [ "$n" -lt 3 ]; then s=running
+  else s=$final; fi
+  echo "job #7 — $s"
+  echo "source:    /somewhere/source"
+  echo "workspace: /somewhere/workspace"
+  echo "providers: config file only"
+  echo "max iter:  4"
+  echo "time:      3s"
+  test "$s" = failed && echo "error:     exited with code 1"
+  echo "log:       /q/logs/0007.log"
   echo
-  echo "log tail"
+  echo "==> V2 synthesis"
   ;;
-cancel) touch "$STATE/cancelled"; echo "cancel requested for job #7" ;;
+cancel)
+  if [ -f "$STATE/cancelled" ]; then echo "error: job 7 is already cancelled" >&2; exit 1; fi
+  echo 0 > "$STATE/cancelled"; echo "cancel requested for job #7"
+  ;;
 events) cat "$STATE/events.jsonl" ;;
 fetch)
+  if [ -f "$STATE/local" ]; then
+    echo "error: local jobs write straight to their workspace; there is nothing to fetch" >&2
+    exit 1
+  fi
   while [ $# -gt 0 ]; do case "$1" in --out) out="$2";; esac; shift; done
   make_crate "$out"
   echo "workspace for job #7 written to $out"
@@ -544,5 +566,120 @@ fn validation_reports_a_bad_solution_that_passes_a_good_one_that_fails_and_missi
         results[1].1,
         vec!["missing solutions/good", "missing solutions/bad"]
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_failed_job_still_gets_its_crate_checked() {
+    let root = temp("queue-failed-job");
+    let td = task_dir(&root, "rect");
+    let fake = fake_queue(&root, "GOOD", true, false);
+    std::fs::write(fake.state.join("final"), "failed").unwrap();
+    let o = opts(
+        &root,
+        Mode::Queue {
+            queue_bin: fake.bin,
+        },
+        false,
+    );
+    let r = run_one(&spec("rect", 30), &td, 0, &o, &marker_checker);
+    assert_eq!(r.pipeline_outcome, "failed");
+    assert!(r.passed, "acceptance decides, not the pipeline outcome: {r:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_local_queue_that_refuses_fetch_leaves_the_run_without_a_crate() {
+    let root = temp("queue-local-nofetch");
+    let td = task_dir(&root, "rect");
+    let fake = fake_queue(&root, "GOOD", false, false);
+    std::fs::write(fake.state.join("local"), "").unwrap();
+    let o = opts(
+        &root,
+        Mode::Queue {
+            queue_bin: fake.bin,
+        },
+        false,
+    );
+    let r = run_one(&spec("rect", 30), &td, 0, &o, &marker_checker);
+    assert_eq!(r.pipeline_outcome, "succeeded");
+    assert_eq!(r.failed_checks, vec!["no-crate"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_timed_out_job_is_waited_for_until_the_queue_reports_it_stopped() {
+    let root = temp("queue-await-stop");
+    let td = task_dir(&root, "slow");
+    let fake = fake_queue(&root, "GOOD", true, true);
+    let o = opts(
+        &root,
+        Mode::Queue {
+            queue_bin: fake.bin,
+        },
+        false,
+    );
+    let r = run_one(&spec("slow", 1), &td, 0, &o, &marker_checker);
+    assert_eq!(r.pipeline_outcome, "timeout");
+    let polls_after_cancel: u32 = std::fs::read_to_string(fake.state.join("cancelled"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(polls_after_cancel >= 3, "{polls_after_cancel}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_crate_is_found_only_at_artifacts_v2_under_the_workspace_root() {
+    let root = temp("crate-in");
+    std::fs::create_dir_all(root.join("ws/artifacts/v2")).unwrap();
+    std::fs::write(root.join("ws/artifacts/v2/Cargo.toml"), "").unwrap();
+    assert_eq!(crate_in(&root), None);
+    std::fs::create_dir_all(root.join("artifacts/v2")).unwrap();
+    std::fs::write(root.join("artifacts/v2/Cargo.toml"), "").unwrap();
+    assert_eq!(crate_in(&root), Some(root.join("artifacts/v2")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_task_name_cannot_escape_the_work_directory() {
+    let root = temp("work-dir");
+    let o = opts(
+        &root,
+        Mode::Queue {
+            queue_bin: root.join("q"),
+        },
+        false,
+    );
+    let dir = work_dir(&o, &spec("..", 1), 0);
+    assert_eq!(dir.parent(), Some(root.join("results/work/t").as_path()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn exec_kills_background_children_of_a_command_that_exits_normally() {
+    let root = temp("exec-orphan");
+    let marker = root.join("survived");
+    let bin = root.join("spawner");
+    script(
+        &bin,
+        &format!("(sleep 2; touch '{}') &\nexit 0\n", marker.display()),
+    );
+    let r = exec(&bin, &[], None, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.code, Some(0));
+    std::thread::sleep(Duration::from_millis(3000));
+    assert!(!marker.exists(), "the background child must have been killed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn exec_caps_what_it_keeps_of_huge_output_without_hanging() {
+    let root = temp("exec-huge");
+    let bin = root.join("noisy");
+    script(&bin, "yes x | head -c 70000000\n");
+    let r = exec(&bin, &[], None, Duration::from_secs(60)).unwrap();
+    assert_eq!(r.code, Some(0));
+    assert_eq!(r.stdout.len(), crate::proc::MAX_CAPTURE);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -67,6 +67,7 @@ fn job_ids(records: &[RunRecord], task: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn render(baseline: &RunFile, current: &RunFile, regressions: &[Regression]) -> String {
     render_with(baseline, current, regressions, &Thresholds::default())
 }

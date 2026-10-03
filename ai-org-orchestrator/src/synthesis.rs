@@ -337,7 +337,7 @@ impl<'a> Manager<'a> {
 
         for attempt in 0..max_repair_attempts {
             let code = Self::format_multi_file(&sections);
-            let (clean, errors) = self.quality_gate(&code, None);
+            let (clean, errors) = self.integration_gate(&code);
             if errors.is_empty() {
                 return Ok(Self::parse_file_sections(&clean));
             }
@@ -383,7 +383,7 @@ impl<'a> Manager<'a> {
         // The loop above only re-gates at the top of the *next* iteration, so the very last
         // repair attempt's result never gets checked without one final gate here.
         let code = Self::format_multi_file(&sections);
-        let (clean, errors) = self.quality_gate(&code, None);
+        let (clean, errors) = self.integration_gate(&code);
         if errors.is_empty() {
             return Ok(Self::parse_file_sections(&clean));
         }

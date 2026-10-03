@@ -23,6 +23,13 @@ pub fn load_one(dir: &Path) -> Result<TaskSpec, String> {
         ));
     }
     let name = &spec.name;
+    if let Some(bin) = &spec.binary {
+        if bin.is_empty() || bin.contains(['/', '\\']) || bin.starts_with('.') {
+            return Err(format!(
+                "task '{name}': binary '{bin}' must be a bare executable name"
+            ));
+        }
+    }
     if !dir.join("source").is_dir() {
         return Err(format!("task '{name}': missing source/ directory"));
     }
@@ -153,6 +160,15 @@ mod tests {
         let root = scratch("name");
         let d = make_task(&root, "other", OK);
         assert!(load_one(&d).unwrap_err().contains("directory"));
+    }
+
+    #[test]
+    fn a_binary_name_with_a_path_is_rejected() {
+        let root = scratch("bin");
+        for bad in ["../x", "a/b", ".hidden", ""] {
+            let d = make_task(&root, "t", &OK.replace("binary = \"t\"", &format!("binary = \"{bad}\"")));
+            assert!(load_one(&d).unwrap_err().contains("bare executable"), "{bad}");
+        }
     }
 
     #[test]

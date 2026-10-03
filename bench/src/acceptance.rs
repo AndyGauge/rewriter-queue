@@ -1,6 +1,8 @@
+use crate::proc::{collect, drain, kill_group, remove_secrets};
 use crate::types::{Check, CheckOutcome, TaskSpec};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +13,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SHOWN: usize = 300;
+const MAX_OUTPUT: usize = 1024 * 1024;
 
 struct Captured {
     stdout: Vec<u8>,
@@ -90,9 +93,12 @@ fn fail(name: &str, detail: String) -> CheckOutcome {
 
 fn cargo_command(work: &Path) -> Command {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    remove_secrets(&mut cmd);
     cmd.current_dir(work)
-        .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env("CARGO_TARGET_DIR", work.join("target"))
         .env("CARGO_TERM_COLOR", "never");
     cmd
 }
@@ -121,7 +127,10 @@ fn first_compiler_error(stderr: &str) -> String {
 
 fn run_one_check(binary: &Path, check: &Check) -> CheckOutcome {
     let mut cmd = Command::new(binary);
-    cmd.args(&check.args);
+    cmd.args(&check.args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(binary.parent().unwrap_or(Path::new("/")));
     let stdin = check.stdin.as_deref().map(str::as_bytes);
     match run_with_timeout(cmd, stdin, CHECK_TIMEOUT) {
         Err(e) => fail(&check.name, e),
@@ -193,7 +202,8 @@ fn run_with_timeout(
         Stdio::null()
     })
     .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    .stderr(Stdio::piped())
+    .process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start process: {e}"))?;
@@ -205,32 +215,30 @@ fn run_with_timeout(
             let _ = pipe.write_all(&data);
         });
     }
-    let reader = |mut stream: Box<dyn Read + Send>| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let out_reader = reader(Box::new(child.stdout.take().expect("stdout was piped")));
-    let err_reader = reader(Box::new(child.stderr.take().expect("stderr was piped")));
+    let out_rx = drain(child.stdout.take().expect("stdout was piped"), MAX_OUTPUT);
+    let err_rx = drain(child.stderr.take().expect("stderr was piped"), MAX_OUTPUT);
 
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() >= timeout => {
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("timed out after {}s", timeout.as_secs_f64()));
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("cannot wait for process: {e}")),
+            Err(e) => {
+                kill_group(child.id());
+                return Err(format!("cannot wait for process: {e}"));
+            }
         }
     };
+    kill_group(child.id());
     Ok(Captured {
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: collect(out_rx),
+        stderr: collect(err_rx),
         code: status.code(),
     })
 }
@@ -328,7 +336,10 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == "target" || name == ".git" {
+        if matches!(
+            name.to_str(),
+            Some("target" | ".git" | ".cargo" | "rust-toolchain" | "rust-toolchain.toml")
+        ) {
             continue;
         }
         let kind = entry.file_type()?;
@@ -413,6 +424,59 @@ mod tests {
         };
         assert!(err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_background_child_holding_the_pipes_does_not_hang_the_check() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo done; (sleep 30) & exit 0"]);
+        let start = Instant::now();
+        let out = run_with_timeout(cmd, None, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.stdout, b"done\n");
+        assert!(start.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn endless_output_is_capped_and_the_timeout_still_fires() {
+        let mut cmd = Command::new("yes");
+        cmd.arg("x");
+        let err = match run_with_timeout(cmd, None, Duration::from_millis(500)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a timeout"),
+        };
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn the_checked_binary_runs_in_its_own_directory_without_the_callers_environment() {
+        let dir = std::env::temp_dir().join(format!("bench-acc-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("probe");
+        fs::write(&bin, "#!/bin/sh\npwd\necho \"${HOME:-nohome}\"\n").unwrap();
+        fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = {
+            let mut cmd = Command::new(&bin);
+            cmd.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&dir);
+            run_with_timeout(cmd, None, Duration::from_secs(5)).unwrap()
+        };
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.ends_with("nohome\n"), "{text}");
+        let outcome = run_one_check(
+            &bin,
+            &Check {
+                name: "p".into(),
+                args: vec![],
+                stdin: None,
+                expect_stdout: Some(format!("{}\nnohome\n", fs::canonicalize(&dir).unwrap().display())),
+                expect_stderr: None,
+                expect_exit: Some(0),
+            },
+        );
+        assert!(outcome.passed, "{}", outcome.detail);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

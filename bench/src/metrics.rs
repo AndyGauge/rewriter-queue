@@ -29,12 +29,6 @@ fn detail_bool(e: &Event, key: &str) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
-fn has_detail_key(e: &Event, key: &str) -> bool {
-    e.detail.as_ref().and_then(|d| d.get(key)).is_some()
-}
-
-/// Gate runs without a `variant` build the shared crate directory, which is what the final
-/// integration gate runs against; the events carry no separate integration marker.
 pub fn from_events(events: &[Event]) -> EventMetrics {
     let mut m = EventMetrics::default();
     for e in events {
@@ -57,7 +51,7 @@ pub fn from_events(events: &[Event]) -> EventMetrics {
                 if detail_bool(e, "passed") == Some(false) {
                     m.gate_failures += 1;
                 }
-                if !has_detail_key(e, "variant") {
+                if detail_bool(e, "integration") == Some(true) {
                     m.integration_attempts += 1;
                 }
             }
@@ -84,6 +78,11 @@ mod tests {
         if let Some(v) = variant {
             d["variant"] = json!(v);
         }
+        Event::new("QualityGate", EventKind::GateResult, "gate").with_detail(d)
+    }
+
+    fn integration_gate(passed: bool, attempt: u64) -> Event {
+        let d = json!({"passed": passed, "error_bytes": 0, "attempt": attempt, "integration": true});
         Event::new("QualityGate", EventKind::GateResult, "gate").with_detail(d)
     }
 
@@ -144,11 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn integration_attempts_count_gate_runs_on_the_shared_directory() {
+    fn integration_attempts_count_only_gate_runs_marked_integration() {
         let m = from_events(&[
             gate(false, 1, None),
-            gate(false, 2, None),
-            gate(true, 3, None),
+            integration_gate(false, 1),
+            integration_gate(false, 2),
+            integration_gate(true, 3),
             gate(false, 1, Some("m1")),
         ]);
         assert_eq!(m.integration_attempts, 3);

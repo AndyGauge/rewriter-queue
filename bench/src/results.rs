@@ -20,7 +20,7 @@ pub fn sanitize_label(label: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    if cleaned.chars().all(|c| c == '.') {
         "run".into()
     } else {
         cleaned
@@ -112,6 +112,14 @@ mod tests {
         );
         assert_eq!(load_run_file(&path).unwrap(), f);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_label_can_never_be_a_parent_or_current_directory() {
+        for label in ["", ".", "..", "..."] {
+            assert_eq!(sanitize_label(label), "run");
+        }
+        assert_eq!(sanitize_label("../x"), "..-x");
     }
 
     #[test]

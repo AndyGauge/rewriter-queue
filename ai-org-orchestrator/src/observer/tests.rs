@@ -108,7 +108,7 @@ fn an_unwritable_workspace_never_panics() {
     obs.decision("a", "still fine");
     obs.stage("S");
     obs.end_stage();
-    obs.gate_result("", false, 10);
+    obs.gate_result("", false, 10, false);
 }
 
 #[test]
@@ -136,11 +136,11 @@ fn concurrent_emits_produce_whole_lines() {
 fn gate_attempts_count_failures_until_a_pass_then_reset() {
     let dir = temp_dir("gate");
     let obs = Observer::new(dir.join("events.jsonl"), None, None);
-    obs.gate_result("", false, 100);
-    obs.gate_result("", false, 50);
-    obs.gate_result("", true, 0);
-    obs.gate_result("", false, 10);
-    obs.gate_result("m1", false, 10);
+    obs.gate_result("", false, 100, false);
+    obs.gate_result("", false, 50, false);
+    obs.gate_result("", true, 0, false);
+    obs.gate_result("", false, 10, false);
+    obs.gate_result("m1", false, 10, false);
     let events = parse_events(&std::fs::read_to_string(dir.join("events.jsonl")).unwrap());
     let attempts: Vec<u64> = events
         .iter()
@@ -151,6 +151,17 @@ fn gate_attempts_count_failures_until_a_pass_then_reset() {
     assert_eq!(detail["passed"], false);
     assert_eq!(detail["error_bytes"], 50);
     assert_eq!(events[4].detail.as_ref().unwrap()["variant"], "m1");
+}
+
+#[test]
+fn only_integration_gate_results_carry_the_integration_marker() {
+    let dir = temp_dir("gate-integration");
+    let obs = Observer::new(dir.join("events.jsonl"), None, None);
+    obs.gate_result("", false, 10, false);
+    obs.gate_result("", true, 0, true);
+    let events = parse_events(&std::fs::read_to_string(dir.join("events.jsonl")).unwrap());
+    assert!(events[0].detail.as_ref().unwrap().get("integration").is_none());
+    assert_eq!(events[1].detail.as_ref().unwrap()["integration"], true);
 }
 
 #[test]
