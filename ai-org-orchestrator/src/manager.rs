@@ -486,7 +486,10 @@ impl<'a> Manager<'a> {
                     self.run(
                         reviewer_name,
                         reviewer_system,
-                        &format!("Review this output:\n\n{last_output}"),
+                        &format!(
+                            "# Assignment Given To The Author\n{base_task}\n\n\
+                             # Output To Review\n{last_output}"
+                        ),
                     )
                 },
             )?;

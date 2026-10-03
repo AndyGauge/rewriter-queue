@@ -525,3 +525,57 @@ fn without_an_observer_nothing_is_written_to_events_jsonl() {
     ws.log_deviation("a", "b").unwrap();
     assert!(!ws.root.join("events.jsonl").exists());
 }
+
+/// Plays both roles of `run_with_review`: the author answers with a contract, the reviewer
+/// approves and records exactly what it was sent.
+struct AuthorAndReviewer {
+    reviewer_system: String,
+    review_prompt: Arc<Mutex<Option<String>>>,
+    models: Vec<ModelInfo>,
+}
+impl Provider for AuthorAndReviewer {
+    fn name(&self) -> &str { "mock" }
+    fn models(&self) -> &[ModelInfo] { &self.models }
+    fn is_available(&self) -> bool { true }
+    fn supports_tools(&self) -> bool { true }
+    fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+        let text = if req.system == self.reviewer_system {
+            *self.review_prompt.lock().unwrap() = Some(req.user.clone());
+            "APPROVED — fine".to_string()
+        } else {
+            "the contract".to_string()
+        };
+        Ok(InferenceResponse {
+            text,
+            tool_calls: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            provider: "mock".into(),
+            model: "mock".into(),
+            latency_ms: 1,
+        })
+    }
+}
+
+#[test]
+fn the_reviewer_is_shown_the_assignment_so_it_can_check_the_output_against_the_mission() {
+    let ws = temp_ws("review-sees-mission");
+    let seen = Arc::new(Mutex::new(None));
+    let provider: Box<dyn Provider> = Box::new(AuthorAndReviewer {
+        reviewer_system: "reviewer-system".into(),
+        review_prompt: seen.clone(),
+        models: vec![mock_model()],
+    });
+    let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+    let mgr = Manager::new(&ws, &registry);
+
+    mgr.run_with_review(
+        "Author", "author-system", "Reviewer", "reviewer-system",
+        "# Mission\nDraw a rectangle from two points.", "APPROVED", 2, &NoTools,
+    )
+    .unwrap();
+
+    let prompt = seen.lock().unwrap().clone().expect("reviewer was called");
+    assert!(prompt.contains("Draw a rectangle from two points."));
+    assert!(prompt.contains("the contract"));
+}
