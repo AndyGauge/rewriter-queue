@@ -352,10 +352,10 @@ fn setup(spec: &TaskSpec, task_dir: &Path, work: &Path) -> std::io::Result<()> {
 
 fn work_dir(opts: &Options, spec: &TaskSpec, repeat: usize) -> PathBuf {
     let label = crate::results::sanitize_label(&opts.label);
-    opts.results_dir
-        .join("work")
-        .join(label)
-        .join(format!("{}-{repeat}", crate::results::sanitize_label(&spec.name)))
+    opts.results_dir.join("work").join(label).join(format!(
+        "{}-{repeat}",
+        crate::results::sanitize_label(&spec.name)
+    ))
 }
 
 pub fn run_one(

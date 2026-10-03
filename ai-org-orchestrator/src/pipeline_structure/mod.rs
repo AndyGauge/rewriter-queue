@@ -10,13 +10,15 @@ mod observability;
 mod plan_review;
 
 use crate::agents::{
-    DEBUG_IMPLEMENTER, FORMAL_METHODS_REVIEWER, IP_COUNSEL, MAINTENANCE_REVIEWER, MILESTONE_PLANNER,
-    PLAN_REVIEWER, PRODUCTION_READINESS_REVIEWER, SECURITY_REVIEWER,
+    DEBUG_IMPLEMENTER, FORMAL_METHODS_REVIEWER, IP_COUNSEL, MAINTENANCE_REVIEWER,
+    MILESTONE_PLANNER, PLAN_REVIEWER, PRODUCTION_READINESS_REVIEWER, SECURITY_REVIEWER,
 };
 use crate::observer::Observer;
 use crate::workspace::Workspace;
 use inference_providers::backends::Provider;
-use inference_providers::types::{InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError};
+use inference_providers::types::{
+    InferenceRequest, InferenceResponse, ModelInfo, ModelTier, ProviderError,
+};
 use inference_providers::Registry;
 use run_events::Event;
 use std::path::PathBuf;
@@ -79,7 +81,10 @@ impl Provider for Scripted {
         true
     }
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
-        let call = Call { role: role_of(&req.system), user: req.user.clone() };
+        let call = Call {
+            role: role_of(&req.system),
+            user: req.user.clone(),
+        };
         self.log.lock().unwrap().push(call.clone());
         let text = (self.handler)(&call)?;
         Ok(InferenceResponse {
@@ -110,7 +115,10 @@ pub(super) fn scripted(
             context_limit: 200_000,
         }],
     });
-    (Registry::with_providers(vec![provider], (1.0, 1.0, 1.0)), log)
+    (
+        Registry::with_providers(vec![provider], (1.0, 1.0, 1.0)),
+        log,
+    )
 }
 
 pub(super) fn roles(log: &Log) -> Vec<&'static str> {
@@ -118,7 +126,12 @@ pub(super) fn roles(log: &Log) -> Vec<&'static str> {
 }
 
 pub(super) fn calls_of(log: &Log, role: &str) -> Vec<Call> {
-    log.lock().unwrap().iter().filter(|c| c.role == role).cloned().collect()
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.role == role)
+        .cloned()
+        .collect()
 }
 
 pub(super) fn crate_dir(tag: &str) -> PathBuf {
@@ -163,9 +176,13 @@ impl crate::tools::Toolbox for NullToolbox {
 pub(super) fn plan(milestones: &[(&str, &str)]) -> String {
     milestones
         .iter()
-        .map(|(name, risk)| format!("## MILESTONE: {name}\nRISK: {risk}\nEFFORT: 10\nTASK: build {name}\n"))
+        .map(|(name, risk)| {
+            format!("## MILESTONE: {name}\nRISK: {risk}\nEFFORT: 10\nTASK: build {name}\n")
+        })
         .collect()
 }
 
-pub(super) const GOOD_MAIN: &str = "// === src/main.rs ===\nfn main() {\n    println!(\"ok\");\n}\n";
-pub(super) const BROKEN_MAIN: &str = "// === src/main.rs ===\nfn main() {\n    undefined_fn();\n}\n";
+pub(super) const GOOD_MAIN: &str =
+    "// === src/main.rs ===\nfn main() {\n    println!(\"ok\");\n}\n";
+pub(super) const BROKEN_MAIN: &str =
+    "// === src/main.rs ===\nfn main() {\n    undefined_fn();\n}\n";

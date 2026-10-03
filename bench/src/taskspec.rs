@@ -166,8 +166,15 @@ mod tests {
     fn a_binary_name_with_a_path_is_rejected() {
         let root = scratch("bin");
         for bad in ["../x", "a/b", ".hidden", ""] {
-            let d = make_task(&root, "t", &OK.replace("binary = \"t\"", &format!("binary = \"{bad}\"")));
-            assert!(load_one(&d).unwrap_err().contains("bare executable"), "{bad}");
+            let d = make_task(
+                &root,
+                "t",
+                &OK.replace("binary = \"t\"", &format!("binary = \"{bad}\"")),
+            );
+            assert!(
+                load_one(&d).unwrap_err().contains("bare executable"),
+                "{bad}"
+            );
         }
     }
 

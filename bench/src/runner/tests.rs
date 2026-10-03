@@ -46,8 +46,9 @@ fn canned_events() -> String {
             EventKind::Retry,
             "reviewer rejected iteration 1, revising",
         ),
-        Event::new("QualityGate", EventKind::GateResult, "gate")
-            .with_detail(json!({"passed": false, "error_bytes": 3, "attempt": 1, "integration": true})),
+        Event::new("QualityGate", EventKind::GateResult, "gate").with_detail(
+            json!({"passed": false, "error_bytes": 3, "attempt": 1, "integration": true}),
+        ),
         Event::new("QualityGate", EventKind::GateResult, "gate")
             .with_detail(json!({"passed": true, "error_bytes": 0, "attempt": 2})),
         Event::new("DebugImplementer", EventKind::AgentCall, "call")
@@ -584,7 +585,10 @@ fn a_failed_job_still_gets_its_crate_checked() {
     );
     let r = run_one(&spec("rect", 30), &td, 0, &o, &marker_checker);
     assert_eq!(r.pipeline_outcome, "failed");
-    assert!(r.passed, "acceptance decides, not the pipeline outcome: {r:?}");
+    assert!(
+        r.passed,
+        "acceptance decides, not the pipeline outcome: {r:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -669,7 +673,10 @@ fn exec_kills_background_children_of_a_command_that_exits_normally() {
     let r = exec(&bin, &[], None, Duration::from_secs(10)).unwrap();
     assert_eq!(r.code, Some(0));
     std::thread::sleep(Duration::from_millis(3000));
-    assert!(!marker.exists(), "the background child must have been killed");
+    assert!(
+        !marker.exists(),
+        "the background child must have been killed"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

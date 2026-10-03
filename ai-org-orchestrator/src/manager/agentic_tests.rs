@@ -530,7 +530,7 @@ fn without_an_observer_nothing_is_written_to_events_jsonl() {
 /// approves and records exactly what it was sent.
 struct AuthorAndReviewer {
     reviewer_system: String,
-    review_prompt: Arc<Mutex<Option<String>>>,
+    review_prompt: std::sync::mpsc::Sender<String>,
     models: Vec<ModelInfo>,
 }
 impl Provider for AuthorAndReviewer {
@@ -540,7 +540,7 @@ impl Provider for AuthorAndReviewer {
     fn supports_tools(&self) -> bool { true }
     fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let text = if req.system == self.reviewer_system {
-            *self.review_prompt.lock().unwrap() = Some(req.user.clone());
+            self.review_prompt.send(req.user.clone()).unwrap();
             "APPROVED — fine".to_string()
         } else {
             "the contract".to_string()
@@ -560,10 +560,10 @@ impl Provider for AuthorAndReviewer {
 #[test]
 fn the_reviewer_is_shown_the_assignment_so_it_can_check_the_output_against_the_mission() {
     let ws = temp_ws("review-sees-mission");
-    let seen = Arc::new(Mutex::new(None));
+    let (seen, prompts) = std::sync::mpsc::channel();
     let provider: Box<dyn Provider> = Box::new(AuthorAndReviewer {
         reviewer_system: "reviewer-system".into(),
-        review_prompt: seen.clone(),
+        review_prompt: seen,
         models: vec![mock_model()],
     });
     let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
@@ -575,7 +575,7 @@ fn the_reviewer_is_shown_the_assignment_so_it_can_check_the_output_against_the_m
     )
     .unwrap();
 
-    let prompt = seen.lock().unwrap().clone().expect("reviewer was called");
+    let prompt = prompts.try_recv().expect("reviewer was called");
     assert!(prompt.contains("Draw a rectangle from two points."));
     assert!(prompt.contains("the contract"));
 }

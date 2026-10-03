@@ -3,10 +3,7 @@ use std::io::{self, Read};
 /// Sorts the input lines in descending order, removes duplicates and indents
 /// every line with a single tab character. Blank lines are kept as they are.
 fn tidy(input: &str) -> String {
-    let mut lines: Vec<&str> = input
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let mut lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
     lines.sort();
     lines.dedup();
     let mut out = String::new();

@@ -11,7 +11,18 @@ fn run_one_milestone(ws: &Workspace) -> HashMap<String, String> {
         _ => Ok(GOOD_MAIN.into()),
     });
     Manager::new(ws, &registry)
-        .implement_milestones("root", "task", WORKER, "contract", "schema", 3, 0, None, &NullToolbox, false)
+        .implement_milestones(
+            "root",
+            "task",
+            WORKER,
+            "contract",
+            "schema",
+            3,
+            0,
+            None,
+            &NullToolbox,
+            false,
+        )
         .expect("the run must succeed whatever the observer can or cannot do")
 }
 
@@ -34,7 +45,11 @@ fn an_unreachable_queue_server_does_not_fail_the_run_and_events_are_still_saved(
     let dir = crate_dir("obs-unreachable");
     let ws = ws_at(&dir, false);
     let events = dir.join("events.jsonl");
-    let observer = Observer::new(&events, Some(7), Some(("http://127.0.0.1:1".into(), "token".into())));
+    let observer = Observer::new(
+        &events,
+        Some(7),
+        Some(("http://127.0.0.1:1".into(), "token".into())),
+    );
     let ws = ws.with_observer(observer);
 
     let sections = run_one_milestone(&ws);
@@ -42,7 +57,9 @@ fn an_unreachable_queue_server_does_not_fail_the_run_and_events_are_still_saved(
     assert!(sections["src/main.rs"].contains("println!"));
     let saved = read_events(&events);
     assert!(
-        saved.iter().any(|e| e.kind == run_events::EventKind::AgentCall),
+        saved
+            .iter()
+            .any(|e| e.kind == run_events::EventKind::AgentCall),
         "the local events file must still record the run while the queue is down"
     );
     assert!(saved.iter().all(|e| e.job_id == Some(7)));
@@ -60,9 +77,27 @@ fn a_run_with_a_healthy_observer_records_each_model_call_as_an_event() {
         _ => Ok(GOOD_MAIN.into()),
     });
     Manager::new(&ws, &registry)
-        .implement_milestones("root", "task", WORKER, "contract", "schema", 3, 0, None, &NullToolbox, false)
+        .implement_milestones(
+            "root",
+            "task",
+            WORKER,
+            "contract",
+            "schema",
+            3,
+            0,
+            None,
+            &NullToolbox,
+            false,
+        )
         .unwrap();
 
-    let calls = read_events(&events).into_iter().filter(|e| e.kind == run_events::EventKind::AgentCall).count();
-    assert_eq!(calls, log.lock().unwrap().len(), "every model call must be reported exactly once");
+    let calls = read_events(&events)
+        .into_iter()
+        .filter(|e| e.kind == run_events::EventKind::AgentCall)
+        .count();
+    assert_eq!(
+        calls,
+        log.lock().unwrap().len(),
+        "every model call must be reported exactly once"
+    );
 }

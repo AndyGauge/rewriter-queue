@@ -125,7 +125,12 @@ pub struct Thresholds {
 
 impl Default for Thresholds {
     fn default() -> Self {
-        Thresholds { pass_rate_drop: 0.2, time_ratio: 1.5, token_ratio: 1.5, min_runs: 3 }
+        Thresholds {
+            pass_rate_drop: 0.2,
+            time_ratio: 1.5,
+            token_ratio: 1.5,
+            min_runs: 3,
+        }
     }
 }
 

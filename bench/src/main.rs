@@ -204,7 +204,10 @@ fn cmd_compare(raw: &[String]) -> Result<ExitCode, String> {
     let baseline = results::load_run_file(Path::new(baseline))?;
     let current = results::load_run_file(Path::new(current))?;
     let regressions = compare::compare(&baseline, &current, &thresholds);
-    print!("{}", report::render_with(&baseline, &current, &regressions, &thresholds));
+    print!(
+        "{}",
+        report::render_with(&baseline, &current, &regressions, &thresholds)
+    );
     Ok(if regressions.is_empty() {
         ExitCode::SUCCESS
     } else {

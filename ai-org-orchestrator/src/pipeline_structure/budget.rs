@@ -26,7 +26,17 @@ fn a_one_milestone_happy_path_stays_within_its_model_call_budget() {
     let mgr = Manager::new(&ws, &registry);
 
     let code = mgr
-        .synthesize(WORKER, "contract", "schema", "fn main() {}\n", "matrix", "inductive", "", 3, &NullToolbox)
+        .synthesize(
+            WORKER,
+            "contract",
+            "schema",
+            "fn main() {}\n",
+            "matrix",
+            "inductive",
+            "",
+            3,
+            &NullToolbox,
+        )
         .expect("happy path");
     assert!(code.contains("println!"));
 
@@ -40,7 +50,10 @@ fn a_one_milestone_happy_path_stays_within_its_model_call_budget() {
         used.len(),
     );
 
-    let reported = read_events(&events).into_iter().filter(|e| e.kind == run_events::EventKind::AgentCall).count();
+    let reported = read_events(&events)
+        .into_iter()
+        .filter(|e| e.kind == run_events::EventKind::AgentCall)
+        .count();
     assert_eq!(reported, used.len(), "events and provider calls must agree");
     assert_eq!(mgr.total_input_tokens() as usize, 10 * used.len());
 }

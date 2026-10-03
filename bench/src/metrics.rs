@@ -82,7 +82,8 @@ mod tests {
     }
 
     fn integration_gate(passed: bool, attempt: u64) -> Event {
-        let d = json!({"passed": passed, "error_bytes": 0, "attempt": attempt, "integration": true});
+        let d =
+            json!({"passed": passed, "error_bytes": 0, "attempt": attempt, "integration": true});
         Event::new("QualityGate", EventKind::GateResult, "gate").with_detail(d)
     }
 
