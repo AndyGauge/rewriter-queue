@@ -138,6 +138,21 @@ already checkpointed, not from the beginning. This is true down to the
 level of individual agent calls, not just whole pipeline stages — see the
 root README's design notes if you're curious how.
 
+## 9. If the mission is too big
+
+Every part of the build carries the whole schema (the Rust types and function signatures
+drafted for the mission), and crate files over 500 lines fail the build gate. So when the
+schema comes to more than 500 lines, the run stops before building anything and has a
+planner split the mission into 2 to 6 increments: the smallest usable core first, then the
+pieces that build on it. It writes them to `artifacts/increments.json` and finishes
+`succeeded`; `rewriter-queue status` shows a `note:` naming the new job.
+
+The queue submits increment 1 as an ordinary job in a fresh workspace, with that
+increment's own mission. When an increment succeeds, the queue submits the next one, with
+the crate the previous increment built added to its source as `v2-so-far/`. Each increment's
+job name reads `<name> · increment 2/4: <slug>`. An increment whose own schema is still over
+budget fails instead of splitting again; give it a smaller mission by hand.
+
 ## What's next
 
 - [Installation](installation.md) — the binary download details, and

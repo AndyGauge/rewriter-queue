@@ -47,6 +47,9 @@ pub struct Job {
     /// avoid crash-looping a job whose orchestrator dies immediately every time.
     #[serde(default)]
     pub resume_count: u32,
+    /// What the queue did on this job's behalf, e.g. submitted its increments as new jobs.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 pub struct Spec {
@@ -136,6 +139,7 @@ impl Queue {
                 exit_code: None,
                 error: None,
                 resume_count: 0,
+                note: None,
             };
             fs::write(&tmp, serde_json::to_vec_pretty(&job)?)?;
             match fs::hard_link(&tmp, self.job_path(id)) {

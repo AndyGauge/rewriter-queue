@@ -181,6 +181,9 @@ fn run_job(queue: &Queue, job: Job, reporting: Option<&Reporting>) -> io::Result
     let id = job.id;
     let result = launch_job(queue, job, reporting);
     analyze_job(queue, id);
+    if let Err(e) = chain::follow_up(queue, id) {
+        append_log(queue, id, &format!("\n[worker] could not submit follow-up increments: {e}\n"));
+    }
     result
 }
 
@@ -402,6 +405,8 @@ fn finish(
     job.finished_at = Some(Utc::now());
     queue.save(job)
 }
+
+mod chain;
 
 #[cfg(test)]
 mod tests;

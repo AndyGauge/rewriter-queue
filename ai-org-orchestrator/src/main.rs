@@ -2,6 +2,7 @@ mod agents;
 mod analysis;
 mod debug;
 mod estimation;
+mod increments;
 mod manager;
 mod observer;
 mod patch;
@@ -395,6 +396,46 @@ fn main() {
         }
         schema
     };
+
+    // ── 5c. A schema this size means the mission is too big for one run ──────
+    let schema_lines = increments::schema_rust_lines(&schema);
+    if schema_lines > increments::SCHEMA_LINE_BUDGET {
+        eprintln!(
+            "==> The schema is {schema_lines} lines against a budget of {} — this mission is too big for one run",
+            increments::SCHEMA_LINE_BUDGET
+        );
+        if ws.root.join("chain.json").exists() {
+            eprintln!(
+                "error: this run is already one increment of a larger mission and its own schema is still \
+                 {schema_lines} lines. Split the mission into smaller increments by hand."
+            );
+            ws.observer().inspect(|o| o.fail("orchestrator", "an increment is still too big for one run"));
+            std::process::exit(1);
+        }
+        ws.observer().inspect(|o| o.stage("Increment planning"));
+        let planned = match mgr.plan_increments(schema_lines) {
+            Ok(planned) => planned,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ws.observer().inspect(|o| o.fail("IncrementPlanner", &e.to_string()));
+                std::process::exit(1);
+            }
+        };
+        ws.emit_artifact("increments.json", &increments::increments_json(schema_lines, &planned)).unwrap();
+        eprintln!(
+            "    planned {} increments: {} — the queue will submit them as jobs",
+            planned.len(),
+            planned.iter().map(|i| i.slug.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        ws.observer().inspect(|o| o.end_stage());
+        ws.log_retrospective(&format!(
+            "Schema came to {schema_lines} lines against a budget of {}; the mission was split into {} increments (artifacts/increments.json).",
+            increments::SCHEMA_LINE_BUDGET,
+            planned.len()
+        ))
+        .unwrap();
+        return;
+    }
 
     // ── 6. V2 synthesis (hourglass: fan-out → merge → review) ────────────────
     let v2 = if let Ok(cached) = ws.get_artifact("v2.rs") {

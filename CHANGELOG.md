@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.11.0]
+
+### Added
+
+- A mission that is too big for one run is now split into increments instead of being built
+  badly. When the schema comes to more than 500 Rust lines, the run stops before building
+  anything and an increment planner splits the mission into 2 to 6 ordered increments (smallest
+  usable core first, each sized to a schema of about half the budget). The queue worker then
+  submits increment 1 as its own job and, whenever an increment succeeds, the next one with the
+  crate built so far added to its source as `v2-so-far/`. Job #31 is why: its 764-line schema put
+  every milestone at 800+ lines, over the 500-line gate, and each one then split its file
+  badly and lost the imports. An increment whose own schema is still over budget fails rather
+  than splitting again. Jobs gain a `note` shown by `status`. Extending the earlier crate is
+  asked of the pipeline in the increment's mission, not enforced: the pipeline still rewrites
+  from the source it is given.
+
 ## [0.10.2]
 
 ### Changed

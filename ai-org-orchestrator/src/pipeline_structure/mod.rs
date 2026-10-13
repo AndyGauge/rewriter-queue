@@ -6,11 +6,12 @@
 mod budget;
 mod contract_review;
 mod debug_repair;
+mod increments;
 mod observability;
 mod plan_review;
 
 use crate::agents::{
-    DEBUG_IMPLEMENTER, FORMAL_METHODS_REVIEWER, IP_COUNSEL, MAINTENANCE_REVIEWER,
+    DEBUG_IMPLEMENTER, FORMAL_METHODS_REVIEWER, INCREMENT_PLANNER, IP_COUNSEL, MAINTENANCE_REVIEWER,
     MILESTONE_PLANNER, PLAN_REVIEWER, PRODUCTION_READINESS_REVIEWER, SECURITY_REVIEWER,
 };
 use crate::observer::Observer;
@@ -43,6 +44,8 @@ fn role_of(system: &str) -> &'static str {
         "debugger"
     } else if system == crate::agents::CONTRACT_REVIEWER {
         "contract-reviewer"
+    } else if system == INCREMENT_PLANNER {
+        "increment-planner"
     } else if system == crate::agents::MISSION_ARCHITECT {
         "mission-architect"
     } else if system == SECURITY_REVIEWER {

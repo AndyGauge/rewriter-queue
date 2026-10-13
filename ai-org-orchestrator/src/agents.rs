@@ -14,7 +14,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
         // Analysis and design agents: capable but not code-generation-heavy
         "MissionArchitect" | "InductiveReasoner" | "SchemaArchitect" | "MilestonePlanner"
         | "PlanReviewer" | "TestEngineer" | "AcceptanceCriteria" | "TurnBudgetSupervisor"
-        | "PostRunAnalyst" => ModelTier::Light,
+        | "PostRunAnalyst" | "IncrementPlanner" => ModelTier::Light,
         // Reads and reasons about full code — needs Light, not Micro
         "MaintenanceReviewer" | "ProductionReadinessReviewer" => ModelTier::Light,
         // Verdict-only agents: APPROVED/REJECTED, COMPLIANT/NON_COMPLIANT
@@ -27,7 +27,7 @@ pub fn agent_tier(name: &str) -> ModelTier {
 pub fn agent_hora_depth(name: &str) -> u8 {
     let base = name.split('-').next().unwrap_or(name);
     match base {
-        "MissionArchitect" | "InductiveReasoner" => 3,
+        "MissionArchitect" | "InductiveReasoner" | "IncrementPlanner" => 3,
         "MergeAgent" | "SchemaArchitect" | "MilestonePlanner" | "PlanReviewer" => 2,
         "TargetImplementer" | "AgenticImplementer" | "DebugImplementer" | "ContractReviewer"
         | "TestEngineer" | "MaintenanceReviewer" | "ProductionReadinessReviewer" | "AcceptanceCriteria"
@@ -44,7 +44,7 @@ pub fn agent_effort(name: &str) -> Option<inference_providers::types::ReasoningE
     match name {
         "ContractReviewer" | "PlanReviewer" | "SecurityReviewer" | "MaintenanceReviewer"
         | "ProductionReadinessReviewer" | "FormalMethodsReviewer" | "IpCounsel" | "PostRunAnalyst"
-        | "TurnBudgetSupervisor" => Some(High),
+        | "TurnBudgetSupervisor" | "IncrementPlanner" => Some(High),
         _ => None,
     }
 }
@@ -63,6 +63,7 @@ pub const IP_COUNSEL: &str = include_str!("../../skills/ip-counsel.md");
 pub const FORMAL_METHODS_REVIEWER: &str = include_str!("../../skills/formal-methods-reviewer.md");
 pub const PRODUCTION_READINESS_REVIEWER: &str =
     include_str!("../../skills/production-readiness-reviewer.md");
+pub const INCREMENT_PLANNER: &str = include_str!("../../skills/increment-planner.md");
 pub const MILESTONE_PLANNER: &str = include_str!("../../skills/milestone-planner.md");
 pub const PLAN_REVIEWER: &str = include_str!("../../skills/plan-reviewer.md");
 pub const DEBUG_IMPLEMENTER: &str = include_str!("../../skills/debug-implementer.md");

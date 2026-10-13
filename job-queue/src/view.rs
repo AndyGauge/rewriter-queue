@@ -91,6 +91,9 @@ pub fn detail(queue: &Queue, job: &Job) -> String {
     if let Some(err) = &job.error {
         let _ = writeln!(out, "error:     {err}");
     }
+    if let Some(note) = &job.note {
+        let _ = writeln!(out, "note:      {note}");
+    }
     let _ = write!(out, "log:       {}", queue.log_path(job.id).display());
     out
 }
