@@ -87,6 +87,9 @@ impl Provider for OpenAiCompatProvider {
         if let Some(pp) = req.presence_penalty {
             body["presence_penalty"] = json!(pp);
         }
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let start = Instant::now();

@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.1]
+
+### Fixed
+
+- A retry after a server error now samples differently from the attempt that failed. Job #30 died
+  in the contract stage when the model looped on malformed control tokens for ~6,700 tokens and
+  the server answered HTTP 500 ("does not match the expected peg-native format"); all four
+  attempts resent the same request and failed the same way. The three retries now run at
+  temperature 0.6 with no repetition penalties, 1.0 with them, and 0.3 without them, and the log
+  says each retry is using different sampling. Which of the two settings is what pushes the
+  model off its format is not known; a probe of 32 short tool-using requests showed no
+  difference with or without the penalties, so the schedule varies both. A new `temperature`
+  field on the inference request carries this.
+
 ## [0.10.0]
 
 ### Added

@@ -783,3 +783,24 @@ fn a_server_error_in_a_pinned_conversation_is_retried_on_the_same_provider() {
     assert_eq!(resp.text, "recovered");
     assert_eq!(calls[0].load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn each_retry_of_a_server_error_samples_differently_from_the_failed_attempt() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(Option<f64>, Option<f64>)>::new()));
+    let log = seen.clone();
+    let (r, _, _) = Builder::new()
+        .add("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, move |q: &InferenceRequest| {
+            let mut log = log.lock().unwrap();
+            log.push((q.temperature, q.frequency_penalty));
+            if log.len() <= 3 { Err(ProviderError::Unavailable(PEG_500.into())) } else { reply("recovered", 1) }
+        })
+        .build();
+    let mut first = req(ModelTier::Heavy, 0, 0);
+    first.frequency_penalty = Some(0.3);
+    r.complete(&first).unwrap();
+    let attempts = seen.lock().unwrap().clone();
+    assert_eq!(attempts[0], (None, Some(0.3)), "first attempt is the caller's request untouched");
+    assert_eq!(attempts[1], (Some(0.6), None));
+    assert_eq!(attempts[2], (Some(1.0), Some(0.3)));
+    assert_eq!(attempts[3], (Some(0.3), None));
+}

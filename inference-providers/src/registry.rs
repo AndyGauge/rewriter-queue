@@ -121,6 +121,25 @@ pub struct ProviderSnapshot {
 /// run that may be thirty minutes in. Zero in tests so they don't sleep.
 const TRANSIENT_BACKOFF_SECS: &[u64] = if cfg!(test) { &[0, 0, 0] } else { &[5, 15, 30] };
 
+/// Sampling for each retry of a server-side 5xx, in step with `TRANSIENT_BACKOFF_SECS`:
+/// `(temperature, keep the repetition penalties)`. A retry that resamples under the same
+/// conditions has failed four times running on a long conversation (job #30: the model looped
+/// on malformed control tokens each time), so each retry changes the conditions instead --
+/// whether the penalties or the temperature is what pushes a model off its output format is
+/// not known, so the schedule varies both.
+const RETRY_SAMPLING: &[(f64, bool)] = &[(0.6, false), (1.0, true), (0.3, false)];
+
+fn retry_variant(req: &InferenceRequest, retry: usize) -> InferenceRequest {
+    let (temperature, penalties) = RETRY_SAMPLING[retry.min(RETRY_SAMPLING.len() - 1)];
+    let mut varied = req.clone();
+    varied.temperature = Some(temperature);
+    if !penalties {
+        varied.frequency_penalty = None;
+        varied.presence_penalty = None;
+    }
+    varied
+}
+
 fn is_transient(e: &ProviderError) -> bool {
     matches!(e, ProviderError::Unavailable(m) if m.starts_with("HTTP 5"))
 }
@@ -314,8 +333,9 @@ impl Registry {
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let mut rate_limited = 0;
         let mut transient = 0;
+        let mut varied: Option<InferenceRequest> = None;
         loop {
-            match self.try_complete(req) {
+            match self.try_complete(varied.as_ref().unwrap_or(req)) {
                 Ok(r) => return Ok(r),
                 Err(ProviderError::RateLimit) if rate_limited < MAX_GLOBAL_RETRIES => {
                     rate_limited += 1;
@@ -326,9 +346,11 @@ impl Registry {
                 }
                 Err(e) if is_transient(&e) && transient < TRANSIENT_BACKOFF_SECS.len() => {
                     let wait = TRANSIENT_BACKOFF_SECS[transient];
+                    varied = Some(retry_variant(req, transient));
                     transient += 1;
                     eprintln!(
-                        "    [all providers failed: {e}] retrying in {wait}s (attempt {transient}/{})...",
+                        "    [all providers failed: {e}] retrying in {wait}s with different sampling \
+                         (attempt {transient}/{})...",
                         TRANSIENT_BACKOFF_SECS.len()
                     );
                     std::thread::sleep(std::time::Duration::from_secs(wait));
@@ -358,8 +380,9 @@ impl Registry {
 
         let mut rate_limited = 0;
         let mut transient = 0;
+        let mut varied: Option<InferenceRequest> = None;
         loop {
-            match slot.provider.complete(req) {
+            match slot.provider.complete(varied.as_ref().unwrap_or(req)) {
                 Ok(resp) => {
                     let mut m = slot.metrics.lock().unwrap();
                     m.record_latency(resp.latency_ms);
@@ -377,10 +400,11 @@ impl Registry {
                 }
                 Err(e) if is_transient(&e) && transient < TRANSIENT_BACKOFF_SECS.len() => {
                     let wait = TRANSIENT_BACKOFF_SECS[transient];
+                    varied = Some(retry_variant(req, transient));
                     transient += 1;
                     eprintln!(
-                        "    [{provider_name}] {e} (pinned conversation) — retrying in {wait}s \
-                         (attempt {transient}/{})...",
+                        "    [{provider_name}] {e} (pinned conversation) — retrying in {wait}s with \
+                         different sampling (attempt {transient}/{})...",
                         TRANSIENT_BACKOFF_SECS.len()
                     );
                     std::thread::sleep(std::time::Duration::from_secs(wait));

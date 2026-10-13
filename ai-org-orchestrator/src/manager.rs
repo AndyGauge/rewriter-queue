@@ -146,6 +146,7 @@ impl<'a> Manager<'a> {
             history: Vec::new(),
             frequency_penalty: Some(FREQUENCY_PENALTY),
             presence_penalty: Some(PRESENCE_PENALTY),
+            temperature: None,
         };
 
         let started = std::time::Instant::now();
@@ -365,6 +366,7 @@ impl<'a> Manager<'a> {
                 history: history.clone(),
                 frequency_penalty: Some(FREQUENCY_PENALTY),
                 presence_penalty: Some(PRESENCE_PENALTY),
+                temperature: None,
             };
             let resp = match &pinned_provider {
                 None => self.registry.complete(&req)?,

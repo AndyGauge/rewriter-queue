@@ -85,6 +85,10 @@ pub struct InferenceRequest {
     /// any token that has appeared at all, regardless of how many times. Same
     /// `None`/backend-support caveats as `frequency_penalty`.
     pub presence_penalty: Option<f64>,
+    /// Standard OpenAI sampling param. `None` leaves the backend's own default. Set only by
+    /// the registry when it retries a server-side failure, so the retry does not resample
+    /// under the same conditions that just failed.
+    pub temperature: Option<f64>,
 }
 
 impl InferenceRequest {
@@ -100,6 +104,7 @@ impl InferenceRequest {
             history: Vec::new(),
             frequency_penalty: None,
             presence_penalty: None,
+            temperature: None,
         }
     }
 }
