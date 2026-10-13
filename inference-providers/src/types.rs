@@ -50,6 +50,25 @@ pub enum Turn {
     ToolResults(Vec<ToolResult>),
 }
 
+/// How much a reasoning model should think before answering. Honored only by backends and
+/// models that have such a setting (gpt-oss through `openai_compat`); ignored elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InferenceRequest {
     pub system: String,
@@ -89,6 +108,8 @@ pub struct InferenceRequest {
     /// the registry when it retries a server-side failure, so the retry does not resample
     /// under the same conditions that just failed.
     pub temperature: Option<f64>,
+    /// `None` leaves the model's own default (medium for gpt-oss).
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl InferenceRequest {
@@ -105,6 +126,7 @@ impl InferenceRequest {
             frequency_penalty: None,
             presence_penalty: None,
             temperature: None,
+            reasoning_effort: None,
         }
     }
 }

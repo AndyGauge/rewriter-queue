@@ -6,6 +6,6 @@ pub mod types;
 
 pub use registry::{ProviderSnapshot, Registry};
 pub use types::{
-    InferenceRequest, InferenceResponse, ModelTier, ProviderError, ToolCall, ToolDef, ToolResult,
-    Turn,
+    InferenceRequest, InferenceResponse, ModelTier, ProviderError, ReasoningEffort, ToolCall, ToolDef,
+    ToolResult, Turn,
 };

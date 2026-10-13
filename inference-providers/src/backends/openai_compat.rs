@@ -90,6 +90,11 @@ impl Provider for OpenAiCompatProvider {
         if let Some(t) = req.temperature {
             body["temperature"] = json!(t);
         }
+        if let Some(effort) = req.reasoning_effort {
+            if model.contains("gpt-oss") {
+                body["reasoning_effort"] = json!(effort.as_str());
+            }
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let start = Instant::now();

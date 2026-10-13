@@ -579,3 +579,69 @@ fn the_reviewer_is_shown_the_assignment_so_it_can_check_the_output_against_the_m
     assert!(prompt.contains("Draw a rectangle from two points."));
     assert!(prompt.contains("the contract"));
 }
+
+/// Records the reasoning effort of every request: one tool call, then a final answer.
+struct EffortRecorder {
+    efforts: Arc<Mutex<Vec<Option<inference_providers::ReasoningEffort>>>>,
+    models: Vec<ModelInfo>,
+}
+impl Provider for EffortRecorder {
+    fn name(&self) -> &str { "mock" }
+    fn models(&self) -> &[ModelInfo] { &self.models }
+    fn is_available(&self) -> bool { true }
+    fn supports_tools(&self) -> bool { true }
+    fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+        let mut efforts = self.efforts.lock().unwrap();
+        efforts.push(req.reasoning_effort);
+        let first = efforts.len() == 1;
+        Ok(InferenceResponse {
+            text: if first { String::new() } else { "done".into() },
+            tool_calls: if first {
+                vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"text": "hi"}) }]
+            } else {
+                Vec::new()
+            },
+            input_tokens: 1,
+            output_tokens: 1,
+            provider: "mock".into(),
+            model: "mock".into(),
+            latency_ms: 1,
+        })
+    }
+}
+
+#[test]
+fn tool_turns_run_at_low_effort_and_the_final_answer_is_asked_again_at_high() {
+    use inference_providers::ReasoningEffort::{High, Low};
+    let ws = temp_ws("effort");
+    let efforts = Arc::new(Mutex::new(Vec::new()));
+    let provider: Box<dyn Provider> =
+        Box::new(EffortRecorder { efforts: efforts.clone(), models: vec![mock_model()] });
+    let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+    let mgr = Manager::new(&ws, &registry).with_answers_at_high_effort();
+
+    let result = mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 5).unwrap();
+    assert_eq!(result, "done");
+    assert_eq!(*efforts.lock().unwrap(), vec![Some(Low), Some(Low), Some(High)]);
+}
+
+#[test]
+fn without_the_opt_in_a_final_answer_is_not_asked_for_twice() {
+    let ws = temp_ws("effort-off");
+    let efforts = Arc::new(Mutex::new(Vec::new()));
+    let provider: Box<dyn Provider> =
+        Box::new(EffortRecorder { efforts: efforts.clone(), models: vec![mock_model()] });
+    let registry = Registry::with_providers(vec![provider], (1.0, 1.0, 1.0));
+    let mgr = Manager::new(&ws, &registry);
+
+    mgr.run_agentic("TestAgent", "system", "task", &EchoToolbox, 5).unwrap();
+    assert_eq!(efforts.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn assessment_roles_ask_for_high_effort_and_others_keep_the_default() {
+    use inference_providers::ReasoningEffort::High;
+    assert_eq!(crate::agents::agent_effort("ContractReviewer"), Some(High));
+    assert_eq!(crate::agents::agent_effort("SecurityReviewer"), Some(High));
+    assert_eq!(crate::agents::agent_effort("TargetImplementer"), None);
+}

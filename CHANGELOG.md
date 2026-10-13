@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.2]
+
+### Changed
+
+- gpt-oss models now think less while choosing tool calls and more while judging. Every
+  tool-offering turn of an agentic call runs at low reasoning effort; when such a turn instead
+  ends the conversation, that final answer is asked for again at high effort. Reviewers, plan
+  review, the post-run analyst and the turn-budget supervisor run at high effort on every call.
+  Costs one extra model call per agentic call. The setting is the standard `reasoning_effort`
+  request field, sent only to gpt-oss models, and `llama-server` honors it. The tool schema
+  needs no extra wiring: the server already renders each request's `tools` into the model's
+  developer message.
+
 ## [0.10.1]
 
 ### Fixed

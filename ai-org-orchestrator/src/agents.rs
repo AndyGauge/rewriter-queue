@@ -37,6 +37,18 @@ pub fn agent_hora_depth(name: &str) -> u8 {
 }
 
 // Skills are the canonical source of truth. The software loads them; it does not define them.
+/// Roles whose output is a judgement about someone else's work. They get the most thinking the
+/// model offers; everything else keeps the model's default.
+pub fn agent_effort(name: &str) -> Option<inference_providers::types::ReasoningEffort> {
+    use inference_providers::types::ReasoningEffort::High;
+    match name {
+        "ContractReviewer" | "PlanReviewer" | "SecurityReviewer" | "MaintenanceReviewer"
+        | "ProductionReadinessReviewer" | "FormalMethodsReviewer" | "IpCounsel" | "PostRunAnalyst"
+        | "TurnBudgetSupervisor" => Some(High),
+        _ => None,
+    }
+}
+
 pub const MISSION_ARCHITECT: &str = include_str!("../../skills/mission-architect.md");
 pub const CONTRACT_REVIEWER: &str = include_str!("../../skills/contract-reviewer.md");
 pub const TEST_ENGINEER: &str = include_str!("../../skills/test-engineer.md");

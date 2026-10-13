@@ -1,10 +1,10 @@
 use crate::{
-    agents::{agent_hora_depth, agent_tier},
+    agents::{agent_effort, agent_hora_depth, agent_tier},
     observer::AgentCall,
     tools::Toolbox,
     workspace::Workspace,
 };
-use inference_providers::{InferenceRequest, Registry, Turn};
+use inference_providers::{InferenceRequest, ReasoningEffort, Registry, Turn};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -88,6 +88,11 @@ pub struct Manager<'a> {
     /// real calibration state; only `main.rs` calls `with_estimation_history` explicitly, and
     /// tests of the estimation feature itself opt in with their own temp path.
     pub(crate) estimation_history: Option<std::path::PathBuf>,
+    /// Whether a conversation's final answer is asked for again at high reasoning effort after
+    /// a low-effort turn produced it. Off by default for the same reason as
+    /// `estimation_history`: it adds a model call, and every test that scripts a fixed number
+    /// of responses constructs a `Manager` with `new()`. Only `main.rs` opts in.
+    answer_at_high_effort: bool,
     pub(crate) gate_signatures: std::sync::Mutex<HashMap<String, BTreeSet<String>>>,
 }
 
@@ -99,8 +104,14 @@ impl<'a> Manager<'a> {
             total_input_tokens: AtomicU32::new(0),
             total_output_tokens: AtomicU32::new(0),
             estimation_history: None,
+            answer_at_high_effort: false,
             gate_signatures: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_answers_at_high_effort(mut self) -> Self {
+        self.answer_at_high_effort = true;
+        self
     }
 
     pub fn with_estimation_history(mut self, path: std::path::PathBuf) -> Self {
@@ -147,6 +158,7 @@ impl<'a> Manager<'a> {
             frequency_penalty: Some(FREQUENCY_PENALTY),
             presence_penalty: Some(PRESENCE_PENALTY),
             temperature: None,
+            reasoning_effort: agent_effort(agent),
         };
 
         let started = std::time::Instant::now();
@@ -367,29 +379,20 @@ impl<'a> Manager<'a> {
                 frequency_penalty: Some(FREQUENCY_PENALTY),
                 presence_penalty: Some(PRESENCE_PENALTY),
                 temperature: None,
+                reasoning_effort: Some(ReasoningEffort::Low),
             };
-            let resp = match &pinned_provider {
-                None => self.registry.complete(&req)?,
-                Some(name) => self.registry.complete_pinned(name, &req)?,
-            };
+            let mut resp = self.agentic_turn(&pinned_provider, &req)?;
             pinned_provider = Some(resp.provider.clone());
-            stats.record(&resp);
+            let (mut total_in, mut total_out) = self.account_turn(agent, turn, &resp, stats)?;
 
-            let total_in = self
-                .total_input_tokens
-                .fetch_add(resp.input_tokens, Ordering::Relaxed)
-                + resp.input_tokens;
-            let total_out = self
-                .total_output_tokens
-                .fetch_add(resp.output_tokens, Ordering::Relaxed)
-                + resp.output_tokens;
-            self.ws.log_agent_decision(
-                agent,
-                &format!(
-                    "turn {turn}: tokens: +{}in/{}out — running total: {total_in}in/{total_out}out",
-                    resp.input_tokens, resp.output_tokens,
-                ),
-            )?;
+            // Choosing the next tool call needs little thought, which is why every turn
+            // starts at low effort. A turn that instead ends the conversation is the answer
+            // the whole call exists to produce, so it is asked again with full reasoning.
+            if resp.tool_calls.is_empty() && self.answer_at_high_effort {
+                let answer_req = InferenceRequest { reasoning_effort: Some(ReasoningEffort::High), ..req };
+                resp = self.agentic_turn(&pinned_provider, &answer_req)?;
+                (total_in, total_out) = self.account_turn(agent, turn, &resp, stats)?;
+            }
 
             if resp.tool_calls.is_empty() {
                 eprintln!(
@@ -416,6 +419,37 @@ impl<'a> Manager<'a> {
             history.push(Turn::ToolResults(results));
             turn += 1;
         }
+    }
+
+    fn agentic_turn(
+        &self,
+        pinned_provider: &Option<String>,
+        req: &InferenceRequest,
+    ) -> Result<inference_providers::InferenceResponse, Box<dyn std::error::Error>> {
+        Ok(match pinned_provider {
+            None => self.registry.complete(req)?,
+            Some(name) => self.registry.complete_pinned(name, req)?,
+        })
+    }
+
+    fn account_turn(
+        &self,
+        agent: &str,
+        turn: usize,
+        resp: &inference_providers::InferenceResponse,
+        stats: &mut AgenticStats,
+    ) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+        stats.record(resp);
+        let total_in = self.total_input_tokens.fetch_add(resp.input_tokens, Ordering::Relaxed) + resp.input_tokens;
+        let total_out = self.total_output_tokens.fetch_add(resp.output_tokens, Ordering::Relaxed) + resp.output_tokens;
+        self.ws.log_agent_decision(
+            agent,
+            &format!(
+                "turn {turn}: tokens: +{}in/{}out — running total: {total_in}in/{total_out}out",
+                resp.input_tokens, resp.output_tokens,
+            ),
+        )?;
+        Ok((total_in, total_out))
     }
 
     /// Condense an agentic conversation's tool-call history into a plain-text digest for

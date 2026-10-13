@@ -1,6 +1,6 @@
 [package]
 name = "run-events"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "Shared event, analysis and feature-request types for run observability"
 license = "MIT OR Apache-2.0"
