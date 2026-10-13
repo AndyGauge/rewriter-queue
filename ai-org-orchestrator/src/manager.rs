@@ -5,6 +5,7 @@ use crate::{
     workspace::Workspace,
 };
 use inference_providers::{InferenceRequest, Registry, Turn};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) const SPLIT_THRESHOLD: usize = 100_000;
@@ -87,6 +88,7 @@ pub struct Manager<'a> {
     /// real calibration state; only `main.rs` calls `with_estimation_history` explicitly, and
     /// tests of the estimation feature itself opt in with their own temp path.
     pub(crate) estimation_history: Option<std::path::PathBuf>,
+    pub(crate) gate_signatures: std::sync::Mutex<HashMap<String, BTreeSet<String>>>,
 }
 
 impl<'a> Manager<'a> {
@@ -97,6 +99,7 @@ impl<'a> Manager<'a> {
             total_input_tokens: AtomicU32::new(0),
             total_output_tokens: AtomicU32::new(0),
             estimation_history: None,
+            gate_signatures: std::sync::Mutex::new(HashMap::new()),
         }
     }
 

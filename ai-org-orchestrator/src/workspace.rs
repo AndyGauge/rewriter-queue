@@ -153,6 +153,16 @@ impl Workspace {
         Ok(n)
     }
 
+    /// Discard everything synthesis has built or memoized, so a changed schema is not
+    /// answered from checkpoints made against the old one.
+    pub fn reset_synthesis(&self) {
+        for rel in ["artifacts/synthesis", "artifacts/fanout", "artifacts/v2/src", "artifacts/v2.rs"] {
+            let path = self.root.join(rel);
+            let _ = fs::remove_dir_all(&path);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
     pub fn log_retrospective(&self, entry: &str) -> std::io::Result<()> {
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         self.append(

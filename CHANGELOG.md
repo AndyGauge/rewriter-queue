@@ -38,6 +38,15 @@ All notable changes to this project are documented here.
   written from a stub V1 and copied it, and the reviewer, which was never shown the mission, had
   nothing to check the contract against, so every later stage faithfully built an empty program and
   every gate passed.
+- The schema is now compiled on its own before synthesis starts, and sent back for repair (up to
+  three times) when it does not build; the run stops with the compiler output if it never does.
+  Real jobs (#27, #28) failed every milestone, however small, because the schema stacked
+  conflicting `sqlx` derives and asked for a feature the crate does not have, and each implementer
+  starts from the schema. The schema now declares its dependencies in a `Cargo.toml` section,
+  merged into the V2 manifest, and a repaired schema discards stale synthesis checkpoints.
+- A milestone that fails with mostly the same errors as the milestone it was split from is no
+  longer split again: the failure is not about size. Job #28 split one failing milestone three
+  levels deep, down to a single helper function, with the errors unchanged at every level.
 
 ## [0.9.1]
 

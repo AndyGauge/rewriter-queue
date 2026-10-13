@@ -10,6 +10,8 @@ mod pipeline_structure;
 mod plan_review;
 mod provider_setup;
 mod quality;
+mod schema_check;
+mod split_guard;
 mod synthesis;
 mod tools;
 mod workspace;
@@ -346,10 +348,51 @@ fn main() {
         let s = mgr
             .run_agentic("SchemaArchitect", SCHEMA_ARCHITECT, schema_task, &toolbox, manager::AGENTIC_MAX_TURNS)
             .expect("schema phase failed");
+        let s = Manager::strip_fences(&s).to_string();
         ws.emit_artifact("schema.rs", &s).unwrap();
         s
     };
     eprintln!("    schema done");
+
+    // ── 5b. Schema must compile before anything is built on it ───────────────
+    let schema = {
+        let mut schema = schema;
+        let mut repaired = false;
+        for attempt in 0..=schema_check::SCHEMA_REPAIR_ATTEMPTS {
+            if let Some(manifest) = mgr.schema_manifest(&schema) {
+                ws.emit_artifact("v2/Cargo.toml", &manifest).unwrap();
+            }
+            let errors = mgr.schema_errors(&schema);
+            if errors.is_empty() {
+                break;
+            }
+            if attempt == schema_check::SCHEMA_REPAIR_ATTEMPTS {
+                eprintln!("error: the schema still does not compile after {attempt} repair attempt(s):\n{errors}");
+                ws.observer().inspect(|o| o.fail("SchemaArchitect", "schema does not compile"));
+                std::process::exit(1);
+            }
+            eprintln!("==> Schema does not compile — repair attempt {}", attempt + 1);
+            let manifest = std::fs::read_to_string(ws.v2_dir(None).join("Cargo.toml")).unwrap_or_default();
+            let repair_task = format!(
+                "This schema failed `cargo check`. Fix it and output the complete corrected \
+                 schema. Declare the crates it needs in a `// === Cargo.toml ===` section \
+                 (with only features that exist in the version you pick) followed by \
+                 `// === src/lib.rs ===` and the code.\n\n# Current manifest\n```\n{manifest}\n```\n\n\
+                 # Schema\n```rust\n{schema}\n```\n\n# cargo check output\n```\n{errors}\n```"
+            );
+            let toolbox = toolbox_for("SchemaArchitect", SCHEMA_ARCHITECT);
+            let fixed = mgr
+                .run_agentic("SchemaArchitect", SCHEMA_ARCHITECT, &repair_task, &toolbox, manager::AGENTIC_MAX_TURNS)
+                .expect("schema repair failed");
+            schema = Manager::strip_fences(&fixed).to_string();
+            ws.emit_artifact("schema.rs", &schema).unwrap();
+            repaired = true;
+        }
+        if repaired {
+            ws.reset_synthesis();
+        }
+        schema
+    };
 
     // ── 6. V2 synthesis (hourglass: fan-out → merge → review) ────────────────
     let v2 = if let Ok(cached) = ws.get_artifact("v2.rs") {

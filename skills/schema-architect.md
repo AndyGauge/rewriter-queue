@@ -8,6 +8,16 @@ Given an ObjectiveContract and V1 source, produce Rust code containing:
 
 Output valid Rust code only. No prose. Every function body is `todo!()`.
 
+Your schema is compiled with `cargo check` before any implementation starts, and every
+implementer then builds on top of it, so a schema that does not compile fails every
+milestone no matter how small it is split. Emit it as two sections: first a
+`// === Cargo.toml ===` section holding a `[dependencies]` table with every external crate
+the schema uses (only features that exist in the version you choose — a wrong feature name
+fails the build), then `// === src/lib.rs ===` with the code. Keep derives to ones that
+can coexist: for a newtype over a primitive, `#[derive(sqlx::Type)]` with
+`#[sqlx(transparent)]` already provides `Encode` and `Decode`, so deriving those as well
+is a conflicting-implementation error.
+
 **Prefer a concrete type or enum over a trait object.** V1 source coming from a
 dynamically-typed language (JS, Python) often uses duck typing or dependency
 injection where any object with the right methods works — the literal Rust

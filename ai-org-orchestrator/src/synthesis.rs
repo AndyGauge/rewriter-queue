@@ -127,6 +127,7 @@ impl<'a> Manager<'a> {
             let (clean, quality_errors) = self.quality_gate(&raw, variant);
             last_output = clean.clone();
 
+            self.record_gate_errors(id_prefix, &quality_errors);
             if !quality_errors.is_empty() {
                 eprintln!(
                     "    [quality] iteration {} failed — feeding {} bytes of errors back",
@@ -1353,7 +1354,25 @@ impl<'a> Manager<'a> {
             }
         }
 
-        if !passed && depth < Self::MAX_SPLIT_DEPTH {
+        let unchanged_by_split = !passed && self.split_cannot_help(&ms_id);
+        if unchanged_by_split {
+            eprintln!(
+                "  [milestones] '{}' fails with the same errors as the milestone it was split from — \
+                 splitting is not the fix, not splitting further",
+                milestone.name
+            );
+            self.ws.log_deviation(
+                "MilestonePlanner",
+                &format!(
+                    "Milestone '{}' still fails with the same errors as its parent after being \
+                     split, so the failure is not about milestone size (likely a defect in the \
+                     schema or manifest every milestone starts from) — not splitting further",
+                    milestone.name
+                ),
+            )?;
+        }
+
+        if !passed && !unchanged_by_split && depth < Self::MAX_SPLIT_DEPTH {
             eprintln!(
                 "  [milestones] '{}' did not converge in {effective_max_iter} iterations — \
                  escalating for a finer split",
