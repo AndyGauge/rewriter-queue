@@ -16,7 +16,32 @@ enum Reply {
 
 type Failure = (u16, String);
 
-pub fn run(queue: Queue, bind: &str, token: String) -> io::Result<()> {
+/// The full-access token, plus an optional read-only one that can look but not change anything.
+#[derive(Clone)]
+pub struct Tokens {
+    pub full: String,
+    pub read_only: Option<String>,
+}
+
+#[derive(PartialEq)]
+enum Access {
+    Full,
+    ReadOnly,
+}
+
+impl Tokens {
+    fn access(&self, header: &str) -> Option<Access> {
+        if header == format!("Bearer {}", self.full) {
+            return Some(Access::Full);
+        }
+        match &self.read_only {
+            Some(t) if header == format!("Bearer {t}") => Some(Access::ReadOnly),
+            _ => None,
+        }
+    }
+}
+
+pub fn run(queue: Queue, bind: &str, tokens: Tokens) -> io::Result<()> {
     let _lock = worker::lock_worker(&queue)?
         .ok_or_else(|| io::Error::other("another process is already running this queue"))?;
     let server = tiny_http::Server::http(bind).map_err(io::Error::other)?;
@@ -24,7 +49,7 @@ pub fn run(queue: Queue, bind: &str, token: String) -> io::Result<()> {
     let worker_queue = queue.clone();
     let reporting = worker::Reporting {
         url: loopback_url(bind),
-        token: token.clone(),
+        token: tokens.full.clone(),
     };
     std::thread::spawn(move || {
         if let Err(e) = worker::serve(&worker_queue, None, Some(&reporting)) {
@@ -34,16 +59,16 @@ pub fn run(queue: Queue, bind: &str, token: String) -> io::Result<()> {
     });
 
     eprintln!("rewriter-queue listening on http://{bind}");
-    serve_requests(&server, &queue, token);
+    serve_requests(&server, &queue, tokens);
     Ok(())
 }
 
-fn serve_requests(server: &tiny_http::Server, queue: &Queue, token: String) {
-    let token = Arc::new(token);
+fn serve_requests(server: &tiny_http::Server, queue: &Queue, tokens: Tokens) {
+    let tokens = Arc::new(tokens);
     for request in server.incoming_requests() {
         let queue = queue.clone();
-        let token = Arc::clone(&token);
-        std::thread::spawn(move || handle(&queue, &token, request));
+        let tokens = Arc::clone(&tokens);
+        std::thread::spawn(move || handle(&queue, &tokens, request));
     }
 }
 
@@ -56,8 +81,8 @@ fn loopback_url(bind: &str) -> String {
     format!("http://{host}:{port}")
 }
 
-fn handle(queue: &Queue, token: &str, mut request: Request) {
-    let response = match route(queue, token, &mut request) {
+fn handle(queue: &Queue, tokens: &Tokens, mut request: Request) {
+    let response = match route(queue, tokens, &mut request) {
         Ok(Reply::Text(text)) => Response::from_string(text).boxed(),
         Ok(Reply::Bytes(bytes)) => Response::from_data(bytes)
             .with_header(Header::from_bytes("content-type", "application/gzip").unwrap())
@@ -78,15 +103,15 @@ fn fail(e: io::Error) -> Failure {
     (code, e.to_string())
 }
 
-fn route(queue: &Queue, token: &str, request: &mut Request) -> Result<Reply, Failure> {
-    let expected = format!("Bearer {token}");
-    let authorized = request
+fn route(queue: &Queue, tokens: &Tokens, request: &mut Request) -> Result<Reply, Failure> {
+    let access = request
         .headers()
         .iter()
-        .any(|h| h.field.equiv("authorization") && h.value.as_str() == expected);
-    if !authorized {
+        .find(|h| h.field.equiv("authorization"))
+        .and_then(|h| tokens.access(h.value.as_str()));
+    let Some(access) = access else {
         return Err((401, "unauthorized".into()));
-    }
+    };
 
     let url = url::Url::parse(&format!("http://queue{}", request.url()))
         .map_err(|e| (400, e.to_string()))?;
@@ -101,6 +126,15 @@ fn route(queue: &Queue, token: &str, request: &mut Request) -> Result<Reply, Fai
             .map_err(|_| (400, format!("bad job id: {segment}")))
     };
     let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
+
+    // The read-only token may look at progress and artifacts. It may not change anything, and
+    // it may not pull the whole uploaded workspace, which can hold secrets the run never wrote.
+    if access == Access::ReadOnly {
+        let whole_workspace = matches!(segments.as_slice(), ["jobs", _, "result"]);
+        if request.method() != &Method::Get || whole_workspace {
+            return Err((403, "this token is read-only".into()));
+        }
+    }
 
     match (request.method().clone(), segments.as_slice()) {
         (Method::Post, ["jobs"]) => {

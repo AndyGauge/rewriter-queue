@@ -236,3 +236,22 @@ lost.
 - The feature-request file lock has only been exercised between threads in one process.
 - Events dropped while the orchestrator is pausing posts after a failed POST are not re-sent to
   the server; the workspace `events.jsonl` still has them, and analysis merges both copies.
+
+## Watching without being able to change anything
+
+Give the server a second, read-only token and point the MCP server at it:
+
+```sh
+# on the machine running `rewriter-queue serve`
+echo "some-long-random-string" > ~/.config/rewriter/queue-read-token
+# restart `rewriter-queue serve`
+
+# on the machine you watch from
+REWRITER_QUEUE_URL=http://host:8003 REWRITER_QUEUE_READ_TOKEN=some-long-random-string \
+  rewriter-queue mcp --read-only
+```
+
+The read-only server offers `queue_list`, `queue_status`, `queue_artifacts`, `queue_artifact`,
+`queue_download`, `job_events`, `job_analysis` and `feature_requests`. The permission is enforced
+by the queue server, not just hidden in the client: the read-only token gets a 403 on anything
+that submits, cancels or changes a request, and on downloading a job's whole uploaded workspace.

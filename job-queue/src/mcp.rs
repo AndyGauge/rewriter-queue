@@ -4,8 +4,10 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-fn tools() -> Value {
-    json!([
+const WRITING_TOOLS: [&str; 3] = ["queue_submit", "queue_cancel", "queue_fetch"];
+
+fn tools(read_only: bool) -> Value {
+    let all = json!([
         {
             "name": "queue_submit",
             "description": "Queue a synthesis run. Jobs run one at a time in submission order. Paths are on this machine; with a queue server configured, both directories are uploaded to it. The workspace must already contain artifacts/mission.md (a short statement of what V2 should actually do) before submitting -- the run fails immediately without one.",
@@ -116,10 +118,24 @@ fn tools() -> Value {
             "description": "Cancel a queued or running job.",
             "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
         }
-    ])
+    ]);
+    if !read_only {
+        return all;
+    }
+    let kept: Vec<Value> = all
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| !WRITING_TOOLS.contains(&t["name"].as_str().unwrap_or("")))
+        .cloned()
+        .collect();
+    Value::Array(kept)
 }
 
-fn call(backend: &Backend, name: &str, args: &Value) -> io::Result<String> {
+fn call(backend: &Backend, name: &str, args: &Value, read_only: bool) -> io::Result<String> {
+    if read_only && WRITING_TOOLS.contains(&name) {
+        return Err(io::Error::other(format!("{name} is not available in read-only mode")));
+    }
     let id = || {
         args["id"]
             .as_u64()
@@ -179,7 +195,7 @@ fn call(backend: &Backend, name: &str, args: &Value) -> io::Result<String> {
     }
 }
 
-fn handle(backend: &Backend, req: &Value) -> Value {
+fn handle(backend: &Backend, req: &Value, read_only: bool) -> Value {
     let id = &req["id"];
     match req["method"].as_str().unwrap_or("") {
         "initialize" => json!({
@@ -190,13 +206,14 @@ fn handle(backend: &Backend, req: &Value) -> Value {
                 "serverInfo": { "name": "rewriter-queue", "version": "0.1.0" }
             }
         }),
-        "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools() } }),
+        "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools(read_only) } }),
         "tools/call" => {
             let params = &req["params"];
             let (text, is_error) = match call(
                 backend,
                 params["name"].as_str().unwrap_or(""),
                 &params["arguments"],
+                read_only,
             ) {
                 Ok(t) => (t, false),
                 Err(e) => (format!("Error: {e}"), true),
@@ -214,7 +231,7 @@ fn handle(backend: &Backend, req: &Value) -> Value {
     }
 }
 
-pub fn serve(backend: &Backend) -> io::Result<()> {
+pub fn serve(backend: &Backend, read_only: bool) -> io::Result<()> {
     let mut out = io::stdout().lock();
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -222,7 +239,7 @@ pub fn serve(backend: &Backend) -> io::Result<()> {
             continue;
         }
         let resp = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => handle(backend, &req),
+            Ok(req) => handle(backend, &req, read_only),
             Err(e) => json!({
                 "jsonrpc": "2.0", "id": Value::Null,
                 "error": { "code": -32700, "message": format!("Parse error: {e}") }
@@ -234,4 +251,38 @@ pub fn serve(backend: &Backend) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(read_only: bool) -> Vec<String> {
+        tools(read_only)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn read_only_mode_offers_only_the_looking_tools() {
+        let full = names(false);
+        let read_only = names(true);
+        for writer in WRITING_TOOLS {
+            assert!(full.iter().any(|n| n == writer), "{writer} is a normal tool");
+            assert!(!read_only.iter().any(|n| n == writer), "{writer} must be hidden");
+        }
+        for looking in ["queue_list", "queue_status", "queue_artifacts", "queue_artifact", "job_events"] {
+            assert!(read_only.iter().any(|n| n == looking), "{looking} must stay");
+        }
+    }
+
+    #[test]
+    fn a_writing_tool_called_in_read_only_mode_is_refused() {
+        let backend = Backend::Local(crate::job::Queue::at(std::env::temp_dir().join("rq-mcp-ro")).unwrap());
+        let err = call(&backend, "queue_cancel", &json!({"id": 1}), true).unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
 }

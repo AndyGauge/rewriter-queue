@@ -3,6 +3,7 @@ use crate::job::Spec;
 use run_events::{EventKind, FeatureRequest, Priority, RequestStatus};
 
 const TOKEN: &str = "secret";
+const READ_TOKEN: &str = "look-only";
 
 struct Harness {
     base: String,
@@ -16,7 +17,7 @@ fn harness(tag: &str) -> Harness {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let base = format!("http://{}", server.server_addr().to_ip().unwrap());
     let served = queue.clone();
-    std::thread::spawn(move || serve_requests(&server, &served, TOKEN.into()));
+    std::thread::spawn(move || serve_requests(&server, &served, Tokens { full: TOKEN.into(), read_only: Some(READ_TOKEN.into()) }));
     Harness { base, queue }
 }
 
@@ -243,4 +244,17 @@ fn the_worker_reaches_its_own_server_over_loopback() {
     assert_eq!(loopback_url("0.0.0.0:8003"), "http://127.0.0.1:8003");
     assert_eq!(loopback_url("[::]:9000"), "http://127.0.0.1:9000");
     assert_eq!(loopback_url("10.0.0.5:8003"), "http://10.0.0.5:8003");
+}
+
+#[test]
+fn the_read_only_token_can_look_but_not_change_or_pull_the_workspace() {
+    let h = harness("read-only");
+    let id = h.submit_job();
+    let (code, _) = h.call("GET", "/jobs", Some(READ_TOKEN), "");
+    assert_eq!(code, 200);
+    assert_eq!(h.call("GET", &format!("/jobs/{id}"), Some(READ_TOKEN), "").0, 200);
+    assert_eq!(h.call("POST", &format!("/jobs/{id}/cancel"), Some(READ_TOKEN), "").0, 403);
+    assert_eq!(h.call("POST", &format!("/jobs/{id}/events"), Some(READ_TOKEN), "[]").0, 403);
+    assert_eq!(h.call("GET", &format!("/jobs/{id}/result"), Some(READ_TOKEN), "").0, 403);
+    assert_eq!(h.call("GET", "/jobs", Some("wrong"), "").0, 401);
 }

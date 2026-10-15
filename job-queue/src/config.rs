@@ -49,3 +49,14 @@ pub fn token() -> io::Result<String> {
             ))
         })
 }
+
+/// A token that can only look: `REWRITER_QUEUE_READ_TOKEN`, or the `queue-read-token` file.
+pub fn read_token() -> Option<String> {
+    if let Ok(t) = std::env::var("REWRITER_QUEUE_READ_TOKEN") {
+        return Some(t.trim().to_string()).filter(|t| !t.is_empty());
+    }
+    std::fs::read_to_string(config_dir().join("queue-read-token"))
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|t| !t.is_empty())
+}

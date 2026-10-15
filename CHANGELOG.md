@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.13.0]
+
+### Added
+
+- A read-only way to watch the queue. The queue server accepts a second token
+  (`REWRITER_QUEUE_READ_TOKEN`, or the `queue-read-token` file in the server's config directory)
+  that can only read: it can list jobs, show status, logs, events, artifacts and analyses, but any
+  request that changes something, and the download of a job's whole uploaded workspace, is refused
+  with 403. `rewriter-queue mcp --read-only` uses that token, never the full one, and offers only
+  the looking tools (no submit, cancel or fetch).
+
 ## [0.12.0]
 
 ### Added

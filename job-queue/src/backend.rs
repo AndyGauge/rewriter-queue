@@ -26,6 +26,17 @@ impl Backend {
         }
     }
 
+    /// A backend that can only look. Needs a queue server and a read-only token for it; it
+    /// never falls back to the full token.
+    pub fn open_read_only() -> io::Result<Self> {
+        let url = config::server_url()
+            .ok_or_else(|| io::Error::other("read-only mode needs a queue server (REWRITER_QUEUE_URL)"))?;
+        let token = config::read_token().ok_or_else(|| {
+            io::Error::other("read-only mode needs REWRITER_QUEUE_READ_TOKEN or a queue-read-token file")
+        })?;
+        Ok(Backend::Remote(Client::new(url, token)))
+    }
+
     pub fn submit(&self, sub: Submission) -> io::Result<String> {
         let source = sub.source.canonicalize()?;
         match self {

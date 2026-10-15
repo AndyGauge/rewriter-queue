@@ -45,7 +45,8 @@ Commands:
   serve [--bind <addr>]
                     Host the queue over HTTP (default 0.0.0.0:8003) and run its jobs
   worker            Run a local worker in the foreground
-  mcp               Serve the queue over MCP on stdio
+  mcp [--read-only] Serve the queue over MCP on stdio; --read-only offers only the
+                    looking tools and uses the read-only token
 
 With a queue server configured ([queue] url in config.toml, or REWRITER_QUEUE_URL),
 every command talks to that server; otherwise a local queue is used.
@@ -166,10 +167,17 @@ fn run(args: &[String]) -> std::io::Result<()> {
         }
         Some("serve") => {
             let bind = flag(rest, "--bind").unwrap_or("0.0.0.0:8003");
-            server::run(local_queue()?, bind, config::token()?)?
+            server::run(
+                local_queue()?,
+                bind,
+                server::Tokens { full: config::token()?, read_only: config::read_token() },
+            )?
         }
         Some("worker") => worker::run(&local_queue()?)?,
-        Some("mcp") => mcp::serve(&Backend::open()?)?,
+        Some("mcp") if rest.iter().any(|a| a == "--read-only") => {
+            mcp::serve(&Backend::open_read_only()?, true)?
+        }
+        Some("mcp") => mcp::serve(&Backend::open()?, false)?,
         _ => usage(),
     }
     Ok(())
