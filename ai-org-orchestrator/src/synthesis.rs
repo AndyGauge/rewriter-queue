@@ -91,6 +91,7 @@ impl<'a> Manager<'a> {
         max_iter: usize,
         variant: Option<&str>,
         toolbox: Option<&(dyn crate::tools::Toolbox + Sync)>,
+        review_scope: Option<&str>,
     ) -> Result<(String, bool, usize), Box<dyn std::error::Error>> {
         enum NextCall {
             Full(String),
@@ -142,7 +143,7 @@ impl<'a> Manager<'a> {
                 continue;
             }
 
-            let review_input = format!("Review this output:\n\n{clean}");
+            let review_input = crate::review_scope::review_input(&clean, review_scope);
             let security = self.ws.checkpoint(&format!("{id_prefix}/iter/{iteration}/security"), || {
                 self.run("SecurityReviewer", SECURITY_REVIEWER, &review_input)
             })?;
@@ -1332,6 +1333,7 @@ impl<'a> Manager<'a> {
             effective_max_iter,
             variant,
             use_agentic.then_some(&restricted_toolbox as &(dyn crate::tools::Toolbox + Sync)),
+            Some(&format!("# Milestone: {}\n{}", milestone.name, milestone.task)),
         )?;
 
         if let Some(path) = &history_path {

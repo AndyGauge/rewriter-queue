@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [0.12.0]
+
+### Added
+
+- A mission can declare `Services: postgres`. The run then starts a throwaway Postgres on a free
+  localhost port, as the current user with no install or Docker, and gives each quality-gate test
+  run its own empty database through `DATABASE_URL`. The server's binaries are downloaded once into
+  `~/.cache/rewriter/postgres`. The server and its data are deleted when the run ends, however it
+  ends: a watchdog does it if the run is killed. This lets a database-backed rewrite be tested
+  against a real database, including a migration `up`, `down`, `up` round trip.
+- The planner now puts database migrations first when the source includes a `sea-orm-migration`
+  sample, in dependency order and one after another.
+
+### Fixed
+
+- The security review of a milestone is now given that milestone's scope and told that other
+  milestones' `todo!()` stubs are expected. Before, it judged every milestone against the whole
+  contract and rejected each one for functions it did not own: job #33 split 16 milestones that
+  way and none passed.
+
 ## [0.11.0]
 
 ### Added

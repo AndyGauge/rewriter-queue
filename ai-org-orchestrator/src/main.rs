@@ -11,7 +11,9 @@ mod pipeline_structure;
 mod plan_review;
 mod provider_setup;
 mod quality;
+mod review_scope;
 mod schema_check;
+mod services;
 mod split_guard;
 mod synthesis;
 mod tools;
@@ -213,6 +215,13 @@ fn main() {
     };
     eprintln!("Mission: {} bytes", mission.len());
 
+    if let Err(e) = services::start_declared(&mission) {
+        eprintln!("error: could not start the services the mission declares: {e}");
+        services::stop_all();
+        ws.observer().inspect(|o| o.fail("orchestrator", &format!("service start failed: {e}")));
+        std::process::exit(1);
+    }
+
     if !tools::source_dir_has_readable_files(Path::new(&args.source)) {
         eprintln!(
             "error: no readable source files found under {} (empty dir, or every file is binary/non-UTF-8)",
@@ -372,6 +381,7 @@ fn main() {
             if attempt == schema_check::SCHEMA_REPAIR_ATTEMPTS {
                 eprintln!("error: the schema still does not compile after {attempt} repair attempt(s):\n{errors}");
                 ws.observer().inspect(|o| o.fail("SchemaArchitect", "schema does not compile"));
+                services::stop_all();
                 std::process::exit(1);
             }
             eprintln!("==> Schema does not compile — repair attempt {}", attempt + 1);
@@ -410,6 +420,7 @@ fn main() {
                  {schema_lines} lines. Split the mission into smaller increments by hand."
             );
             ws.observer().inspect(|o| o.fail("orchestrator", "an increment is still too big for one run"));
+            services::stop_all();
             std::process::exit(1);
         }
         ws.observer().inspect(|o| o.stage("Increment planning"));
@@ -418,6 +429,7 @@ fn main() {
             Err(e) => {
                 eprintln!("error: {e}");
                 ws.observer().inspect(|o| o.fail("IncrementPlanner", &e.to_string()));
+                services::stop_all();
                 std::process::exit(1);
             }
         };
@@ -434,6 +446,7 @@ fn main() {
             planned.len()
         ))
         .unwrap();
+        services::stop_all();
         return;
     }
 
@@ -467,6 +480,7 @@ fn main() {
         v
     };
     eprintln!("    v2 done");
+    services::stop_all();
 
     ws.observer().inspect(|o| o.end_stage());
 

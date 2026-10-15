@@ -1,6 +1,6 @@
 [package]
 name = "bench"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Live benchmark and regression suite for the rewriter pipeline"
 license = "MIT OR Apache-2.0"

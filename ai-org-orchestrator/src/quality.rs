@@ -277,11 +277,22 @@ impl<'a> Manager<'a> {
             }
         }
 
-        // test
-        if let Ok(o) = std::process::Command::new("cargo")
-            .args(["test", "--manifest-path", &mf])
-            .output()
-        {
+        // test -- against its own empty database when the mission declared a Postgres service,
+        // so gates running in parallel never share state
+        let database = match crate::services::postgres().map(|pg| pg.new_database()) {
+            Some(Ok(db)) => Some(db),
+            Some(Err(e)) => {
+                issues.push(format!("## test database\ncould not create a database for the tests: {e}"));
+                None
+            }
+            None => None,
+        };
+        let mut test = std::process::Command::new("cargo");
+        test.args(["test", "--manifest-path", &mf]);
+        if let Some(db) = &database {
+            test.env("DATABASE_URL", db.url());
+        }
+        if let Ok(o) = test.output() {
             if !o.status.success() {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 let stderr = String::from_utf8_lossy(&o.stderr);

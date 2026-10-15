@@ -87,3 +87,12 @@ methods gets no `PATTERNS` line at all. Naming a pattern that doesn't apply wast
 the implementer's attention on irrelevant guidance for that milestone's task, the same
 problem this exists to solve in reverse — be as targeted prescribing patterns as you
 are decomposing the work itself.
+
+## Database migrations come first
+
+If the mission calls for a database and the source includes a migration sample (a crate using `sea-orm-migration`), the plan's first milestones must build the real migrations in that crate, ahead of any code that reads or writes the database. Never leave migrations for later or fold them into a data-access milestone.
+
+- Order migrations by foreign-key dependency: a table is created after every table it references.
+- Give each migration its own milestone, or group a parent with its child tables. Each is EASY on its own.
+- Migrations are registered in one shared file (the `Migrator` list). Make each migration milestone depend on the previous one (the default) so two milestones never edit that file at once. Do not mark migration milestones `DEPENDS_ON: none`.
+- Each `down` must exactly reverse its `up`. When the environment provides `DATABASE_URL`, one milestone also adds a test that runs every `up`, then every `down`, then every `up` again.

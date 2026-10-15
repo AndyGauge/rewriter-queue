@@ -15,3 +15,5 @@ Given V2 Rust code and a test matrix, verify:
 Respond with exactly one of:
 COMPLIANT — [one-line summary]
 NON_COMPLIANT — [specific failures, referencing test case IDs where possible]
+
+If the input begins with a "Scope of this milestone" section, you are reviewing one piece of a larger build. Judge only the work that section describes. Functions and modules owned by other milestones are expected to be `todo!()` stubs; they are not failures, do not count them toward LOC or complexity, and do not ask for them to be implemented. Check the numbered items below against the scoped work only.
