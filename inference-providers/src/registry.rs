@@ -140,6 +140,16 @@ fn retry_variant(req: &InferenceRequest, retry: usize) -> InferenceRequest {
     varied
 }
 
+/// A server that is still loading its model answers 503 "Loading model" for minutes after a
+/// restart. That is waiting, not failing: it gets its own long budget and does not use up the
+/// short retries meant for a server that misbehaved (job #34 failed in 17s that way).
+fn is_loading(e: &ProviderError) -> bool {
+    matches!(e, ProviderError::Unavailable(m) if m.starts_with("HTTP 503") && m.contains("Loading model"))
+}
+
+const LOADING_WAIT_SECS: u64 = if cfg!(test) { 0 } else { 20 };
+const MAX_LOADING_WAITS: usize = 45;
+
 fn is_transient(e: &ProviderError) -> bool {
     matches!(e, ProviderError::Unavailable(m) if m.starts_with("HTTP 5"))
 }
@@ -333,10 +343,18 @@ impl Registry {
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let mut rate_limited = 0;
         let mut transient = 0;
+        let mut loading = 0;
         let mut varied: Option<InferenceRequest> = None;
         loop {
             match self.try_complete(varied.as_ref().unwrap_or(req)) {
                 Ok(r) => return Ok(r),
+                Err(e) if is_loading(&e) && loading < MAX_LOADING_WAITS => {
+                    loading += 1;
+                    eprintln!(
+                        "    [model is loading] waiting {LOADING_WAIT_SECS}s (wait {loading}/{MAX_LOADING_WAITS})..."
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(LOADING_WAIT_SECS));
+                }
                 Err(ProviderError::RateLimit) if rate_limited < MAX_GLOBAL_RETRIES => {
                     rate_limited += 1;
                     eprintln!(
@@ -380,6 +398,7 @@ impl Registry {
 
         let mut rate_limited = 0;
         let mut transient = 0;
+        let mut loading = 0;
         let mut varied: Option<InferenceRequest> = None;
         loop {
             match slot.provider.complete(varied.as_ref().unwrap_or(req)) {
@@ -397,6 +416,14 @@ impl Registry {
                          (attempt {rate_limited}/{MAX_GLOBAL_RETRIES})..."
                     );
                     std::thread::sleep(std::time::Duration::from_secs(65));
+                }
+                Err(e) if is_loading(&e) && loading < MAX_LOADING_WAITS => {
+                    loading += 1;
+                    eprintln!(
+                        "    [{provider_name}] model is loading (pinned conversation) — waiting \
+                         {LOADING_WAIT_SECS}s (wait {loading}/{MAX_LOADING_WAITS})..."
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(LOADING_WAIT_SECS));
                 }
                 Err(e) if is_transient(&e) && transient < TRANSIENT_BACKOFF_SECS.len() => {
                     let wait = TRANSIENT_BACKOFF_SECS[transient];

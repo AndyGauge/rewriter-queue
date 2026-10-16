@@ -804,3 +804,20 @@ fn each_retry_of_a_server_error_samples_differently_from_the_failed_attempt() {
     assert_eq!(attempts[2], (Some(1.0), Some(0.3)));
     assert_eq!(attempts[3], (Some(0.3), None));
 }
+
+#[test]
+fn a_model_that_is_still_loading_is_waited_for_beyond_the_short_retries() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let (r, _, _) = Builder::new()
+        .add("solo", vec![model(ModelTier::Heavy, 0.0, 0.0)], true, move |_q: &InferenceRequest| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 10 {
+                Err(ProviderError::Unavailable(r#"HTTP 503: {"error":{"message":"Loading model"}}"#.into()))
+            } else {
+                reply("ready", 1)
+            }
+        })
+        .build();
+    r.complete(&req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 11);
+}

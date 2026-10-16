@@ -124,7 +124,7 @@ impl<'a> Manager<'a> {
     }
 
     fn gate(&self, raw_code: &str, variant: Option<&str>, integration: bool) -> (String, String) {
-        let result = self.run_quality_gate(raw_code, variant);
+        let result = self.run_quality_gate(raw_code, variant, integration);
         if let Some(o) = self.ws.observer() {
             if self.ws.v2_dir(variant).join("Cargo.toml").exists() {
                 o.gate_result(
@@ -138,7 +138,7 @@ impl<'a> Manager<'a> {
         result
     }
 
-    fn run_quality_gate(&self, raw_code: &str, variant: Option<&str>) -> (String, String) {
+    fn run_quality_gate(&self, raw_code: &str, variant: Option<&str>, integration: bool) -> (String, String) {
         let code = Self::strip_fences(raw_code);
         let v2_dir = self.ws.v2_dir(variant);
         let manifest = v2_dir.join("Cargo.toml");
@@ -177,17 +177,24 @@ impl<'a> Manager<'a> {
         let mut cargo_toml_issue: Option<String> = None;
         for (rel_path, content) in &sections {
             if rel_path == "Cargo.toml" {
-                if let Err(e) = content.parse::<toml::Value>() {
-                    // Don't let a malformed manifest (trailing prose, a stray code fence)
-                    // overwrite a manifest that was actually working.
-                    cargo_toml_issue = Some(format!(
-                        "Cargo.toml did not parse as valid TOML ({e}) -- kept the existing \
-                         manifest instead of overwriting it with this. Likely cause: trailing \
-                         prose or a stray code fence after the TOML content. Emit Cargo.toml \
-                         with nothing in it but valid TOML."
-                    ));
-                    continue;
+                let existing = std::fs::read_to_string(&manifest).ok();
+                match crate::schema_check::reconcile_manifest(existing.as_deref(), content) {
+                    Ok(reconciled) => {
+                        if let Err(e) = std::fs::write(&manifest, reconciled) {
+                            return (code.to_string(), format!("failed to write Cargo.toml: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        // Don't let a malformed manifest (trailing prose, a stray code fence,
+                        // no [package]) overwrite a manifest that was actually working.
+                        cargo_toml_issue = Some(format!(
+                            "Cargo.toml was not used ({e}) -- kept the existing manifest. \
+                             Emit Cargo.toml as valid TOML and nothing else: either a complete \
+                             manifest, or just the [dependencies] you need added."
+                        ));
+                    }
                 }
+                continue;
             }
             let full_path = v2_dir.join(rel_path);
             if let Some(parent) = full_path.parent() {
@@ -263,11 +270,15 @@ impl<'a> Manager<'a> {
             return (clean, issues.join("\n\n"));
         }
 
-        // clippy
-        if let Ok(o) = std::process::Command::new("cargo")
-            .args(["clippy", "--manifest-path", &mf, "--", "-D", "warnings"])
-            .output()
-        {
+        // clippy -- a milestone's crate still holds `todo!()` stubs for the milestones that
+        // are not built yet, and an unimplemented stub's parameters are all "unused". Only the
+        // assembled crate is held to that lint (job #36: every milestone failed on it).
+        let mut clippy = std::process::Command::new("cargo");
+        clippy.args(["clippy", "--manifest-path", &mf, "--", "-D", "warnings"]);
+        if !integration {
+            clippy.args(["-A", "unused_variables"]);
+        }
+        if let Ok(o) = clippy.output() {
             if !o.status.success() {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 issues.push(format!(

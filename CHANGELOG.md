@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.13.1]
+
+### Fixed
+
+- A `Cargo.toml` that a model emitted with only a `[dependencies]` block no longer replaces the
+  crate's manifest. It is merged into the existing one, and a manifest with no `[package]` and
+  nothing to merge it into is refused. Before, such a file broke every later cargo command ("no
+  targets specified"), which is what stopped job #36's first milestone.
+- The per-milestone clippy check no longer fails on unused variables. The `todo!()` stubs of
+  milestones not built yet have unused parameters, so every milestone failed `-D warnings` until
+  all of them existed. The check on the assembled crate still has the lint.
+- A model server that is still loading (HTTP 503 "Loading model") is now waited for, up to
+  about 15 minutes, instead of using up the three short retries. Job #34 failed in 17 seconds
+  when the queue was restarted right after the model.
+
 ## [0.13.0]
 
 ### Added

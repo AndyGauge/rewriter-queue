@@ -20,6 +20,36 @@ pub(crate) fn merge_dependencies(seed: &str, schema_manifest: &str) -> Option<St
     toml::to_string(&base).ok()
 }
 
+/// What to write when the model emits a `Cargo.toml` section. A complete manifest is taken as
+/// it is. One without a `[package]` table (just a `[dependencies]` block, as models often
+/// emit) is overlaid onto the manifest already on disk, so the package and its targets are
+/// never lost (job #36: a bare `[dependencies]` file replaced the manifest and every later
+/// cargo command failed with "no targets specified").
+pub(crate) fn reconcile_manifest(existing: Option<&str>, incoming: &str) -> Result<String, String> {
+    let theirs: toml::Value = incoming.parse().map_err(|e| format!("not valid TOML ({e})"))?;
+    if theirs.get("package").is_some() {
+        return Ok(incoming.to_string());
+    }
+    let mut base: toml::Value = existing
+        .and_then(|e| e.parse().ok())
+        .filter(|b: &toml::Value| b.get("package").is_some())
+        .ok_or("it has no [package] table and there is no working manifest to add it to")?;
+    for section in ["dependencies", "dev-dependencies"] {
+        let Some(deps) = theirs.get(section).and_then(|d| d.as_table()) else { continue };
+        let table = base
+            .as_table_mut()
+            .expect("a parsed manifest is a table")
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| format!("the existing [{section}] is not a table"))?;
+        for (name, spec) in deps {
+            table.insert(name.clone(), spec.clone());
+        }
+    }
+    toml::to_string(&base).map_err(|e| e.to_string())
+}
+
 impl<'a> Manager<'a> {
     /// The V2 manifest with the schema's declared dependencies merged in, if it declares any.
     pub(crate) fn schema_manifest(&self, schema: &str) -> Option<String> {
@@ -97,6 +127,27 @@ mod tests {
         let merged = merge_dependencies(&seed, "[dependencies]\nserde = \"1\"\n").unwrap();
         let parsed: toml::Value = merged.parse().unwrap();
         assert_eq!(parsed["dependencies"]["serde"].as_str(), Some("1"));
+    }
+
+    #[test]
+    fn a_complete_manifest_replaces_the_existing_one() {
+        let full = "[package]\nname = \"x\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
+        assert_eq!(reconcile_manifest(Some(SEED), full).unwrap(), full);
+    }
+
+    #[test]
+    fn a_bare_dependencies_block_is_added_to_the_existing_package() {
+        let merged = reconcile_manifest(Some(SEED), "[dependencies]\nserde = \"1\"\n[dev-dependencies]\ncsv = \"1\"\n").unwrap();
+        let parsed: toml::Value = merged.parse().unwrap();
+        assert_eq!(parsed["package"]["name"].as_str(), Some("v2"));
+        assert_eq!(parsed["dependencies"]["serde"].as_str(), Some("1"));
+        assert_eq!(parsed["dev-dependencies"]["csv"].as_str(), Some("1"));
+    }
+
+    #[test]
+    fn a_bare_block_with_nothing_to_add_it_to_is_refused() {
+        assert!(reconcile_manifest(None, "[dependencies]\nserde = \"1\"\n").is_err());
+        assert!(reconcile_manifest(Some("[dependencies]\n"), "[dependencies]\nserde = \"1\"\n").is_err());
     }
 
     #[test]
