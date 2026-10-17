@@ -1,8 +1,6 @@
 use crate::manager::Manager;
 use std::collections::HashMap;
 
-const LINE_LIMIT: usize = 500;
-
 impl<'a> Manager<'a> {
     /// Strip markdown code fences from LLM output, tolerating preamble text.
     pub(crate) fn strip_fences(s: &str) -> &str {
@@ -109,7 +107,7 @@ impl<'a> Manager<'a> {
 
     /// Run cargo quality checks against the V2 crate draft.
     /// Handles multi-file output (`// === src/file.rs ===` markers).
-    /// Applies `cargo fmt`, enforces 500-line limit per file, then checks
+    /// Applies `cargo fmt`, then checks
     /// build / clippy / test. Returns `(clean_source, errors)`.
     ///
     /// `variant` selects which crate directory this call builds against -- `None` is the
@@ -232,25 +230,6 @@ impl<'a> Manager<'a> {
         let mut issues: Vec<String> = Vec::new();
         if let Some(issue) = cargo_toml_issue {
             issues.push(format!("## Cargo.toml\n{issue}"));
-        }
-
-        // 500-line modularity check
-        let over_limit: Vec<String> = formatted
-            .iter()
-            .filter(|(_, content)| content.lines().count() > LINE_LIMIT)
-            .map(|(path, content)| format!("{path} ({} lines)", content.lines().count()))
-            .collect();
-        if !over_limit.is_empty() {
-            let mut list = over_limit.clone();
-            list.sort();
-            issues.push(format!(
-                "## modularity\n\
-                 Files exceeding the {LINE_LIMIT}-line limit must be split into submodules:\n\
-                 {}\n\n\
-                 Declare each submodule with `mod name;` in main.rs and emit its content \
-                 prefixed with `// === src/name.rs ===`. Every file must be ≤{LINE_LIMIT} lines.",
-                list.join("\n")
-            ));
         }
 
         // build — short-circuit on failure

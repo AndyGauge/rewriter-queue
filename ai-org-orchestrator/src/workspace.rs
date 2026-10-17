@@ -226,18 +226,20 @@ impl Workspace {
         }
     }
 
-    /// Seed a freshly-isolated milestone workspace with the current crate manifest
-    /// before it starts its own quality-gate loop. Only the manifest is copied: like the
-    /// shared sequential crate directory, an isolated one is scratch space the quality
-    /// gate repopulates from that one milestone's own output every iteration, not a
-    /// snapshot of sibling milestones' code -- see the scheduling comment in
-    /// `synthesis.rs` for why a milestone never needs to see sibling code to build.
+    /// Seed a freshly-isolated milestone workspace with the current crate (manifest, sources
+    /// and tests) before it starts its own quality-gate loop, so cargo has a target to build
+    /// from the first iteration. The quality gate repopulates the sources from that one
+    /// milestone's own output every iteration.
     pub fn seed_variant_workspace(&self, from: Option<&str>, variant: &str) -> std::io::Result<()> {
         let dst = self.v2_dir(Some(variant));
         fs::create_dir_all(&dst)?;
-        let src_manifest = self.v2_dir(from).join("Cargo.toml");
-        if src_manifest.exists() {
-            fs::copy(&src_manifest, dst.join("Cargo.toml"))?;
+        let src = self.v2_dir(from);
+        let manifest = src.join("Cargo.toml");
+        if manifest.exists() {
+            fs::copy(&manifest, dst.join("Cargo.toml"))?;
+        }
+        for dir in ["src", "tests"] {
+            copy_dir(&src.join(dir), &dst.join(dir))?;
         }
         Ok(())
     }
@@ -287,6 +289,23 @@ pub fn read_source_dir(dir: &Path) -> std::io::Result<String> {
     Ok(out)
 }
 
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !from.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
@@ -296,6 +315,21 @@ mod checkpoint_tests {
         let dir = std::env::temp_dir().join(format!("aoo-ws-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Workspace::new(dir).unwrap()
+    }
+
+    #[test]
+    fn a_fanned_out_milestone_starts_with_the_current_sources() {
+        let ws = temp_ws("seed");
+        let shared = ws.v2_dir(None);
+        std::fs::create_dir_all(shared.join("src")).unwrap();
+        std::fs::write(shared.join("Cargo.toml"), "[package]\nname = \"v2\"\n").unwrap();
+        std::fs::write(shared.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+        ws.seed_variant_workspace(None, "m1").unwrap();
+
+        let seeded = ws.v2_dir(Some("m1"));
+        assert!(seeded.join("Cargo.toml").exists());
+        assert_eq!(std::fs::read_to_string(seeded.join("src/lib.rs")).unwrap(), "pub fn a() {}\n");
     }
 
     #[test]

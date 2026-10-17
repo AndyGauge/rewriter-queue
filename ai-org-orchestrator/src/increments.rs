@@ -2,10 +2,8 @@ use crate::agents::INCREMENT_PLANNER;
 use crate::manager::Manager;
 use serde_json::json;
 
-/// Rust lines of schema past which a mission is too big for one run. Every milestone carries
-/// the whole schema in its own crate, and a crate file past 500 lines fails the modularity
-/// gate, so a schema this size cannot be built on reliably (job #31: a 764-line schema put every
-/// milestone at 800+ lines, and each one then split its file badly).
+/// Rust lines of schema past which a mission that asks for it (`Increments: split`) is built
+/// as a series of smaller jobs instead of one.
 pub(crate) const SCHEMA_LINE_BUDGET: usize = 500;
 pub(crate) const MAX_INCREMENTS: usize = 6;
 const PLAN_ATTEMPTS: usize = 2;
@@ -23,6 +21,15 @@ pub(crate) fn schema_rust_lines(schema: &str) -> usize {
         .filter(|(path, _)| path.ends_with(".rs"))
         .map(|(_, content)| content.lines().count())
         .sum()
+}
+
+/// True when the mission asks to be split into increments once its schema is large.
+pub(crate) fn split_requested(mission: &str) -> bool {
+    mission.lines().any(|line| {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']).trim_start().to_lowercase();
+        line.strip_prefix("increments:")
+            .is_some_and(|v| v.trim().trim_matches(['*', '`', '.']).trim() == "split")
+    })
 }
 
 pub(crate) fn parse_increments(text: &str) -> Vec<Increment> {
@@ -136,6 +143,14 @@ mod tests {
     fn an_increment_with_no_body_or_no_name_is_dropped() {
         assert!(parse_increments("## INCREMENT: empty\n\n## INCREMENT:\ntext").is_empty());
         assert!(parse_increments("no headings at all").is_empty());
+    }
+
+    #[test]
+    fn splitting_is_only_on_when_the_mission_says_so() {
+        assert!(split_requested("# M\n- **Increments:** split\n"));
+        assert!(split_requested("Increments: split"));
+        assert!(!split_requested("Increments: none"));
+        assert!(!split_requested("a very big schema"));
     }
 
     #[test]

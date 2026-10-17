@@ -51,9 +51,9 @@ impl<'a> Manager<'a> {
         Self::split_source_n(source, 1)
     }
 
-    /// Run TargetImplementer with quality gate (build/clippy/test/modularity) then
+    /// Run TargetImplementer with quality gate (build/clippy/test) then
     /// SecurityReviewer and MaintenanceReviewer. Quality gate runs first — LLM reviewers
-    /// are skipped when the code does not compile or fails modularity.
+    /// are skipped when the code does not compile.
     ///
     /// A quality-gate failure is a localized, compiler-shaped problem, so it's fixed with a
     /// SEARCH/REPLACE patch against the last output (see `patch.rs`) rather than a full
@@ -195,7 +195,7 @@ impl<'a> Manager<'a> {
     /// `toolbox`: `Some` routes both the patch request and the fallback regeneration through
     /// `run_agentic` instead of a plain `run` — see `run_with_dual_review`'s own doc comment
     /// for why only some callers pass one.
-    fn try_patch(
+    pub(crate) fn try_patch(
         &self,
         worker_name: &str,
         worker_system: &str,
@@ -244,7 +244,7 @@ impl<'a> Manager<'a> {
                     "{base_task}\n\n# Quality Gate Failures ({label})\n\
                      {quality_errors}\n\n\
                      Fix ALL issues above. The code must compile, pass `clippy -D warnings`, \
-                     pass all tests, and keep every file ≤500 lines. \
+                     pass all tests, \
                      Return only the complete corrected Rust source."
                 );
                 call(&fallback_task)
@@ -646,6 +646,7 @@ impl<'a> Manager<'a> {
             let code = self.synthesize_by_milestones(
                 worker_system, contract, schema, &full_task, gherkin, max_iter, toolbox,
             )?;
+            let code = self.refactor_pass(code, contract, schema, worker_system);
             let code = self.run_review_panel(code, contract, schema, worker_system, max_iter, toolbox)?;
             return Ok(code);
         }

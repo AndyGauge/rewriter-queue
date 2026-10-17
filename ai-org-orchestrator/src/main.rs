@@ -1,3 +1,4 @@
+mod advice;
 mod agents;
 mod analysis;
 mod debug;
@@ -409,7 +410,7 @@ fn main() {
 
     // ── 5c. A schema this size means the mission is too big for one run ──────
     let schema_lines = increments::schema_rust_lines(&schema);
-    if schema_lines > increments::SCHEMA_LINE_BUDGET {
+    if schema_lines > increments::SCHEMA_LINE_BUDGET && increments::split_requested(&mission) {
         eprintln!(
             "==> The schema is {schema_lines} lines against a budget of {} — this mission is too big for one run",
             increments::SCHEMA_LINE_BUDGET

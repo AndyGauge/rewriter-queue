@@ -9,10 +9,11 @@ Produce a Rust implementation that:
 4. Uses idiomatic Rust — no unnecessary `unsafe`, no panics on valid inputs
 5. Does NOT implement items listed in the contract's Deviations section
 
-**File size limit — 500 lines per file:**
-No single `.rs` file may exceed 500 lines. If your implementation requires more, split it into
-submodules. Declare each submodule in `main.rs` with `mod name;` and emit its content as a
-separate section using the marker format below.
+**What you will be judged on:** first that the crate builds and its tests pass, then that it is
+easy to read and change: one concern per module, small functions, names that say what things do,
+no duplicated logic. Get it working first. A long file is not a failure; once the crate works, a
+later pass will refactor anything that is hard to follow. When a file has clear seams, split it
+into submodules as you go (declare each in `main.rs` or `lib.rs` with `mod name;`).
 
 **Multi-file output format:**
 When splitting across files, prefix each file's content with its path marker:
@@ -28,7 +29,7 @@ pub struct Store { ... }
 // ... rest of store.rs
 ```
 
-Single-file output (≤500 lines) needs no markers — just emit the Rust source directly.
+Single-file output needs no markers — just emit the Rust source directly.
 
 **Critical rules — violations cause build failures:**
 - Never abbreviate, truncate, or summarize code. Every function body must be fully written out.

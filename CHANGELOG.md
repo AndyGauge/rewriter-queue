@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.14.0]
+
+### Changed
+
+- File length is no longer a pass/fail check. The quality gate decides on build, clippy and tests
+  alone. The implementer prompt now says up front what the code will be judged on (works first,
+  then readable and easy to change), and once the whole crate works one refactor pass runs
+  against a list of long files. Its result is kept only if the crate still passes the gate.
+- A large schema no longer forces a split into increments. Add `Increments: split` to a mission
+  to ask for the old behaviour.
+
+### Fixed
+
+- Milestones that run in parallel start from the current crate sources instead of a bare
+  manifest, which made cargo fail with "no targets specified" before the model wrote anything.
+
 ## [0.13.1]
 
 ### Fixed
