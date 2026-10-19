@@ -274,13 +274,20 @@ fn main() {
     };
     eprintln!("    contract done");
 
-    // ── 2. Acceptance criteria (Gherkin) ──────────────────────────────────────
-    let gherkin = if let Ok(cached) = ws.get_artifact("acceptance.feature") {
-        eprintln!("==> Acceptance criteria (resuming from checkpoint)");
-        cached
-    } else {
+    // ── 2 to 5. Acceptance criteria, test matrix, inductive analysis, schema ──
+    // Acceptance criteria and the test matrix need only the contract, and nothing reads them
+    // before synthesis. The schema needs the contract and the inductive analysis. So when the
+    // providers can serve more than one request at once, the first two run beside the
+    // inductive analysis and the schema instead of ahead of them.
+    let acceptance_stage = |announce: bool| -> String {
+        if let Ok(cached) = ws.get_artifact("acceptance.feature") {
+            eprintln!("==> Acceptance criteria (resuming from checkpoint)");
+            return cached;
+        }
         eprintln!("==> Acceptance criteria");
-        ws.observer().inspect(|o| o.stage("Acceptance criteria"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Acceptance criteria"));
+        }
         let ac_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then write Gherkin acceptance criteria covering its key behaviors and edge cases. \
              Read V1 source with list_files/read_file only if you need to confirm a concrete \
@@ -298,15 +305,16 @@ fn main() {
         ws.emit_artifact("acceptance.feature", &g).unwrap();
         g
     };
-    eprintln!("    acceptance criteria done");
 
-    // ── 3. Test matrix refinement ─────────────────────────────────────────────
-    let refined = if let Ok(cached) = ws.get_artifact("refined_test_matrix.json") {
-        eprintln!("==> Test matrix refinement (resuming from checkpoint)");
-        cached
-    } else {
+    let test_matrix_stage = |announce: bool| {
+        if ws.get_artifact("refined_test_matrix.json").is_ok() {
+            eprintln!("==> Test matrix refinement (resuming from checkpoint)");
+            return;
+        }
         eprintln!("==> Test matrix refinement");
-        ws.observer().inspect(|o| o.stage("Test matrix refinement"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Test matrix refinement"));
+        }
         let raw_matrix = ws.read_test_matrix().unwrap_or_default();
         let te_task = format!(
             "# Raw Test Matrix\n{raw_matrix}\n\n\
@@ -319,18 +327,17 @@ fn main() {
             .run_agentic("TestEngineer", TEST_ENGINEER, &te_task, &toolbox, manager::AGENTIC_MAX_TURNS)
             .expect("test engineer failed");
         ws.emit_artifact("refined_test_matrix.json", &r).unwrap();
-        r
     };
-    eprintln!("    test matrix refined");
-    let _ = refined; // consumed via read_test_matrix below
 
-    // ── 4. Inductive analysis ─────────────────────────────────────────────────
-    let inductive = if let Ok(cached) = ws.get_artifact("inductive_analysis.md") {
-        eprintln!("==> Inductive analysis (resuming from checkpoint)");
-        cached
-    } else {
+    let inductive_stage = |announce: bool| -> String {
+        if let Ok(cached) = ws.get_artifact("inductive_analysis.md") {
+            eprintln!("==> Inductive analysis (resuming from checkpoint)");
+            return cached;
+        }
         eprintln!("==> Inductive analysis");
-        ws.observer().inspect(|o| o.stage("Inductive analysis"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Inductive analysis"));
+        }
         let ir_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then analyze V1 as a system using list_files/read_file. Surface implicit \
              invariants, systemic patterns, architectural analogies, and risk zones. For a \
@@ -343,13 +350,12 @@ fn main() {
         ws.emit_artifact("inductive_analysis.md", &i).unwrap();
         i
     };
-    eprintln!("    inductive analysis done");
 
-    // ── 5. Schema ─────────────────────────────────────────────────────────────
-    let schema = if let Ok(cached) = ws.get_artifact("schema.rs") {
-        eprintln!("==> Schema (resuming from checkpoint)");
-        cached
-    } else {
+    let schema_stage = || -> String {
+        if let Ok(cached) = ws.get_artifact("schema.rs") {
+            eprintln!("==> Schema (resuming from checkpoint)");
+            return cached;
+        }
         eprintln!("==> Schema");
         ws.observer().inspect(|o| o.stage("Schema"));
         let schema_task = "Read the ObjectiveContract (read_artifact(\"objective_contract.md\")) \
@@ -365,7 +371,41 @@ fn main() {
         ws.emit_artifact("schema.rs", &s).unwrap();
         s
     };
-    eprintln!("    schema done");
+
+    let concurrent = mgr.registry.capable_heavy_slots() >= 2;
+    let (gherkin, inductive, schema) = if concurrent {
+        eprintln!(
+            "    {} parallel slots: acceptance criteria and test matrix run beside the inductive analysis and schema",
+            mgr.registry.capable_heavy_slots()
+        );
+        ws.observer().inspect(|o| o.stage("Inductive analysis (acceptance criteria and test matrix alongside)"));
+        std::thread::scope(|scope| {
+            let acceptance = scope.spawn(|| acceptance_stage(false));
+            let test_matrix = scope.spawn(|| test_matrix_stage(false));
+            let inductive = inductive_stage(false);
+            eprintln!("    inductive analysis done");
+            let schema = schema_stage();
+            eprintln!("    schema done");
+            let gherkin = acceptance
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+            test_matrix
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+            eprintln!("    acceptance criteria and test matrix done");
+            (gherkin, inductive, schema)
+        })
+    } else {
+        let gherkin = acceptance_stage(true);
+        eprintln!("    acceptance criteria done");
+        test_matrix_stage(true);
+        eprintln!("    test matrix refined");
+        let inductive = inductive_stage(true);
+        eprintln!("    inductive analysis done");
+        let schema = schema_stage();
+        eprintln!("    schema done");
+        (gherkin, inductive, schema)
+    };
 
     // ── 5b. Schema must compile before anything is built on it ───────────────
     let schema = {
