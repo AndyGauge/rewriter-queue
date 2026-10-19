@@ -160,6 +160,24 @@ pub struct Registry {
     slots: Vec<Arc<Slot>>,
     weights: (f64, f64, f64), // (cost, latency, quality)
     explore_tick: AtomicU64,
+    /// Requests currently inside `complete` or `complete_pinned`.
+    in_flight: AtomicUsize,
+}
+
+/// Counts one request as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlight(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Registry {
@@ -204,7 +222,7 @@ impl Registry {
         }
 
         let r = &cfg.router;
-        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality), explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality), explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     /// Build from already-constructed providers with explicit (cost, latency, quality) weights.
@@ -213,7 +231,7 @@ impl Registry {
             .into_iter()
             .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()), channels: AtomicUsize::new(1) }))
             .collect();
-        Registry { slots, weights, explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights, explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     pub fn snapshot(&self) -> Vec<ProviderSnapshot> {
@@ -259,7 +277,7 @@ impl Registry {
             }));
         }
 
-        Registry { slots, weights: (1.0, 0.5, 2.0), explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights: (1.0, 0.5, 2.0), explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     /// Run the Qualification Query battery against every available provider.
@@ -346,10 +364,21 @@ impl Registry {
             .sum()
     }
 
+    /// Requests being served right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Channels not in use: what `capable_heavy_slots` could serve beyond what is in flight.
+    pub fn free_channels(&self) -> usize {
+        self.capable_heavy_slots().saturating_sub(self.in_flight())
+    }
+
     /// Route a request to the best available provider for the given tier.
     /// Retries up to 4 times with a 65-second sleep when all providers are rate-limited, and
     /// up to `TRANSIENT_BACKOFF_SECS.len()` times with a short backoff on a server-side 5xx.
     pub fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+        let _flight = InFlight::enter(&self.in_flight);
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let mut rate_limited = 0;
         let mut transient = 0;
@@ -399,6 +428,7 @@ impl Registry {
         provider_name: &str,
         req: &InferenceRequest,
     ) -> Result<InferenceResponse, ProviderError> {
+        let _flight = InFlight::enter(&self.in_flight);
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let slot = self
             .slots

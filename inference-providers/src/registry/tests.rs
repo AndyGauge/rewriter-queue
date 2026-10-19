@@ -603,6 +603,20 @@ fn channels_default_to_one_and_are_read_from_the_config() {
     assert_eq!(r.slots[1].channels.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
+#[test]
+fn free_channels_are_the_capable_channels_less_what_is_in_flight() {
+    let (r, _, _) = Builder::new().ok("wide", ModelTier::Heavy, 0.0).build();
+    r.slots[0].channels.store(8, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(r.in_flight(), 0);
+    assert_eq!(r.free_channels(), 8);
+    r.complete(&req(ModelTier::Heavy, 0, 0)).unwrap();
+    assert_eq!(r.in_flight(), 0, "a finished request is no longer in flight");
+    r.in_flight.store(3, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(r.free_channels(), 5);
+    r.in_flight.store(20, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(r.free_channels(), 0, "never negative");
+}
+
 // ── Qualification queries ───────────────────────────────────────────────────
 
 fn qq_answer(user: &str, truncate: bool) -> String {
