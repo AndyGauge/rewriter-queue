@@ -6,7 +6,7 @@ use crate::{
     config::{Config, ProviderKind},
     types::{InferenceRequest, InferenceResponse, ModelTier, ProviderError},
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -103,6 +103,8 @@ impl ProviderMetrics {
 struct Slot {
     provider: Box<dyn Provider>,
     metrics: Mutex<ProviderMetrics>,
+    /// Concurrent requests the backend behind this provider can serve (at least 1).
+    channels: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +199,7 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider,
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(pc.channels.max(1)),
             }));
         }
 
@@ -208,7 +211,7 @@ impl Registry {
     pub fn with_providers(providers: Vec<Box<dyn Provider>>, weights: (f64, f64, f64)) -> Self {
         let slots = providers
             .into_iter()
-            .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()) }))
+            .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()), channels: AtomicUsize::new(1) }))
             .collect();
         Registry { slots, weights, explore_tick: AtomicU64::new(0) }
     }
@@ -243,6 +246,7 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider: Box::new(AnthropicProvider::new(key, models)),
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(1),
             }));
         }
 
@@ -251,6 +255,7 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider: Box::new(OllamaProvider::new(host, ollama_models)),
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(1),
             }));
         }
 
@@ -293,6 +298,7 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(GeminiProvider::new(api_key, models)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
@@ -304,6 +310,7 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(ClaudeCliProvider::new(model)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
@@ -319,12 +326,14 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(OpenAiCompatProvider::new(name, base_url, api_key, models)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
-    /// Count provider slots that are capable of Heavy-tier code generation.
+    /// Count the concurrent requests the providers capable of Heavy-tier code generation can
+    /// serve: each qualifying provider contributes its `channels` (1 unless configured).
     /// Used by the orchestrator to decide synthesis parallelism.
-    /// A slot qualifies if: available, has a Heavy model, context_ok, quality >= 0.5.
+    /// A provider qualifies if: available, has a Heavy model, context_ok, quality >= 0.5.
     pub fn capable_heavy_slots(&self) -> usize {
         self.slots.iter()
             .filter(|s| {
@@ -333,7 +342,8 @@ impl Registry {
                 let m = s.metrics.lock().unwrap();
                 m.context_ok && m.quality_score >= 0.5
             })
-            .count()
+            .map(|s| s.channels.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Route a request to the best available provider for the given tier.

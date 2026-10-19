@@ -39,6 +39,15 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// How many requests the backend serves at once (a llama-server's `--parallel`, a vLLM's
+    /// `--max-num-seqs`). The orchestrator fans work out to this many parallel workers; it
+    /// does not read the number from the server, so set it to match.
+    #[serde(default = "one_channel")]
+    pub channels: usize,
+}
+
+fn one_channel() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

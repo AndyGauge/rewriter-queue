@@ -566,6 +566,43 @@ fn capable_heavy_slots_counts_only_qualified_providers() {
     assert_eq!(r.capable_heavy_slots(), 1);
 }
 
+#[test]
+fn a_provider_with_channels_counts_for_each_of_them() {
+    let (r, _, _) = Builder::new()
+        .ok("wide", ModelTier::Heavy, 0.0)
+        .ok("narrow", ModelTier::Heavy, 0.0)
+        .ok("wide-but-low-quality", ModelTier::Heavy, 0.0)
+        .build();
+    r.slots[0].channels.store(8, std::sync::atomic::Ordering::Relaxed);
+    r.slots[2].channels.store(4, std::sync::atomic::Ordering::Relaxed);
+    r.slots[2].metrics.lock().unwrap().quality_score = 0.2;
+    assert_eq!(r.capable_heavy_slots(), 8 + 1);
+}
+
+#[test]
+fn channels_default_to_one_and_are_read_from_the_config() {
+    let toml = r#"
+        [[providers]]
+        name = "wide"
+        type = "openai-compat"
+        base_url = "http://localhost:1/v1"
+        models = ["m"]
+        channels = 8
+
+        [[providers]]
+        name = "plain"
+        type = "openai-compat"
+        base_url = "http://localhost:2/v1"
+        models = ["m"]
+    "#;
+    let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.providers[0].channels, 8);
+    assert_eq!(cfg.providers[1].channels, 1);
+    let r = Registry::from_config(&cfg);
+    assert_eq!(r.slots[0].channels.load(std::sync::atomic::Ordering::Relaxed), 8);
+    assert_eq!(r.slots[1].channels.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
 // ── Qualification queries ───────────────────────────────────────────────────
 
 fn qq_answer(user: &str, truncate: bool) -> String {
