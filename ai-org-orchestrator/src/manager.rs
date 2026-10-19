@@ -6,7 +6,8 @@ use crate::{
 };
 use inference_providers::{InferenceRequest, ReasoningEffort, Registry, Turn};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 pub(crate) const SPLIT_THRESHOLD: usize = 100_000;
 pub(crate) const CHUNK_TARGET: usize = 8_000;
@@ -94,6 +95,9 @@ pub struct Manager<'a> {
     /// of responses constructs a `Manager` with `new()`. Only `main.rs` opts in.
     answer_at_high_effort: bool,
     pub(crate) gate_signatures: std::sync::Mutex<HashMap<String, BTreeSet<String>>>,
+    /// When set, a running conversation stops at its next turn with a "cancelled" error.
+    /// Speculative work carries one so it can be dropped when its guess turns out wrong.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> Manager<'a> {
@@ -106,7 +110,17 @@ impl<'a> Manager<'a> {
             estimation_history: None,
             answer_at_high_effort: false,
             gate_signatures: std::sync::Mutex::new(HashMap::new()),
+            cancel: None,
         }
+    }
+
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     pub fn with_answers_at_high_effort(mut self) -> Self {
@@ -320,6 +334,9 @@ impl<'a> Manager<'a> {
         let mut turn = 0;
 
         loop {
+            if self.is_cancelled() {
+                return Err(format!("{agent} was cancelled").into());
+            }
             if turn >= effective_max_turns {
                 if breaker_tripped {
                     return Err(format!(

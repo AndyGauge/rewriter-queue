@@ -6,7 +6,7 @@ use crate::{
     config::{Config, ProviderKind},
     types::{InferenceRequest, InferenceResponse, ModelTier, ProviderError},
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -103,6 +103,8 @@ impl ProviderMetrics {
 struct Slot {
     provider: Box<dyn Provider>,
     metrics: Mutex<ProviderMetrics>,
+    /// Concurrent requests the backend behind this provider can serve (at least 1).
+    channels: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +160,24 @@ pub struct Registry {
     slots: Vec<Arc<Slot>>,
     weights: (f64, f64, f64), // (cost, latency, quality)
     explore_tick: AtomicU64,
+    /// Requests currently inside `complete` or `complete_pinned`.
+    in_flight: AtomicUsize,
+}
+
+/// Counts one request as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlight(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Registry {
@@ -197,20 +217,21 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider,
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(pc.channels.max(1)),
             }));
         }
 
         let r = &cfg.router;
-        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality), explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights: (r.weight_cost, r.weight_latency, r.weight_quality), explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     /// Build from already-constructed providers with explicit (cost, latency, quality) weights.
     pub fn with_providers(providers: Vec<Box<dyn Provider>>, weights: (f64, f64, f64)) -> Self {
         let slots = providers
             .into_iter()
-            .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()) }))
+            .map(|provider| Arc::new(Slot { provider, metrics: Mutex::new(ProviderMetrics::default()), channels: AtomicUsize::new(1) }))
             .collect();
-        Registry { slots, weights, explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights, explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     pub fn snapshot(&self) -> Vec<ProviderSnapshot> {
@@ -243,6 +264,7 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider: Box::new(AnthropicProvider::new(key, models)),
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(1),
             }));
         }
 
@@ -251,10 +273,11 @@ impl Registry {
             slots.push(Arc::new(Slot {
                 provider: Box::new(OllamaProvider::new(host, ollama_models)),
                 metrics: Mutex::new(ProviderMetrics::default()),
+                channels: AtomicUsize::new(1),
             }));
         }
 
-        Registry { slots, weights: (1.0, 0.5, 2.0), explore_tick: AtomicU64::new(0) }
+        Registry { slots, weights: (1.0, 0.5, 2.0), explore_tick: AtomicU64::new(0), in_flight: AtomicUsize::new(0) }
     }
 
     /// Run the Qualification Query battery against every available provider.
@@ -293,6 +316,7 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(GeminiProvider::new(api_key, models)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
@@ -304,6 +328,7 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(ClaudeCliProvider::new(model)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
@@ -319,12 +344,14 @@ impl Registry {
         self.slots.push(Arc::new(Slot {
             provider: Box::new(OpenAiCompatProvider::new(name, base_url, api_key, models)),
             metrics: Mutex::new(ProviderMetrics::default()),
+            channels: AtomicUsize::new(1),
         }));
     }
 
-    /// Count provider slots that are capable of Heavy-tier code generation.
+    /// Count the concurrent requests the providers capable of Heavy-tier code generation can
+    /// serve: each qualifying provider contributes its `channels` (1 unless configured).
     /// Used by the orchestrator to decide synthesis parallelism.
-    /// A slot qualifies if: available, has a Heavy model, context_ok, quality >= 0.5.
+    /// A provider qualifies if: available, has a Heavy model, context_ok, quality >= 0.5.
     pub fn capable_heavy_slots(&self) -> usize {
         self.slots.iter()
             .filter(|s| {
@@ -333,13 +360,25 @@ impl Registry {
                 let m = s.metrics.lock().unwrap();
                 m.context_ok && m.quality_score >= 0.5
             })
-            .count()
+            .map(|s| s.channels.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Requests being served right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Channels not in use: what `capable_heavy_slots` could serve beyond what is in flight.
+    pub fn free_channels(&self) -> usize {
+        self.capable_heavy_slots().saturating_sub(self.in_flight())
     }
 
     /// Route a request to the best available provider for the given tier.
     /// Retries up to 4 times with a 65-second sleep when all providers are rate-limited, and
     /// up to `TRANSIENT_BACKOFF_SECS.len()` times with a short backoff on a server-side 5xx.
     pub fn complete(&self, req: &InferenceRequest) -> Result<InferenceResponse, ProviderError> {
+        let _flight = InFlight::enter(&self.in_flight);
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let mut rate_limited = 0;
         let mut transient = 0;
@@ -389,6 +428,7 @@ impl Registry {
         provider_name: &str,
         req: &InferenceRequest,
     ) -> Result<InferenceResponse, ProviderError> {
+        let _flight = InFlight::enter(&self.in_flight);
         const MAX_GLOBAL_RETRIES: u32 = 4;
         let slot = self
             .slots

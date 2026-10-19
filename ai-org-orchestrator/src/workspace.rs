@@ -105,6 +105,11 @@ impl Workspace {
         self.write(&format!("artifacts/{name}"), content)
     }
 
+    /// Delete an artifact; a missing one is not an error.
+    pub fn remove_artifact(&self, name: &str) {
+        let _ = std::fs::remove_file(self.root.join("artifacts").join(name));
+    }
+
     pub fn get_artifact(&self, name: &str) -> std::io::Result<String> {
         std::fs::read_to_string(self.root.join("artifacts").join(name))
     }

@@ -15,6 +15,7 @@ mod quality;
 mod review_scope;
 mod schema_check;
 mod services;
+mod speculate;
 mod split_guard;
 mod synthesis;
 mod tools;
@@ -22,6 +23,9 @@ mod workspace;
 
 use agents::*;
 use manager::Manager;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::collections::HashMap;
 use std::path::Path;
 use tools::PipelineToolbox;
@@ -118,6 +122,39 @@ fn parse_args() -> Args {
         claude_cli_model,
         gemini_key,
         max_iter,
+    }
+}
+
+/// Fewest channels at which later stages are started early: one for the contract, one kept
+/// back for the main path, and at least one to speculate on.
+const SPECULATE_MIN_CHANNELS: usize = 3;
+const SPECULATE_RESERVE: usize = 1;
+const SPECULATIVE_MARKER: &str = "speculative.json";
+/// Everything speculation may write under its final name, so it can be removed again.
+const SPECULATIVE_ARTIFACTS: [&str; 4] = [
+    "inductive_analysis.md",
+    "schema.rs",
+    "refined_test_matrix.json",
+    "acceptance.feature",
+];
+
+/// Record that early results may exist and are not yet confirmed. If the process dies before
+/// they are confirmed or discarded, the next start removes them rather than trusting them.
+fn mark_speculative(ws: &Workspace) {
+    let _ = ws.emit_artifact(SPECULATIVE_MARKER, "early results written before the contract was final");
+}
+
+fn clear_speculative_marker(ws: &Workspace) {
+    ws.remove_artifact(SPECULATIVE_MARKER);
+}
+
+/// Remove early results that were never confirmed.
+fn discard_speculative(ws: &Workspace) {
+    if ws.get_artifact(SPECULATIVE_MARKER).is_ok() {
+        for name in SPECULATIVE_ARTIFACTS {
+            ws.remove_artifact(name);
+        }
+        clear_speculative_marker(ws);
     }
 }
 
@@ -259,54 +296,43 @@ fn main() {
         PipelineToolbox::new(&args.source, &ws, &mgr, agent, system, manager::AGENTIC_MAX_TURNS)
     };
 
-    // ── 1. ObjectiveContract ──────────────────────────────────────────────────
-    let contract = if let Ok(cached) = ws.get_artifact("objective_contract.md") {
-        eprintln!("==> ObjectiveContract (resuming from checkpoint)");
-        cached
-    } else {
-        eprintln!("==> ObjectiveContract");
-        ws.observer().inspect(|o| o.stage("ObjectiveContract"));
-        let toolbox = toolbox_for("MissionArchitect", MISSION_ARCHITECT);
-        let c = author_contract(&mgr, &mission, args.max_iter, &toolbox)
-            .expect("contract phase failed");
-        ws.emit_artifact("objective_contract.md", &c).unwrap();
-        c
-    };
-    eprintln!("    contract done");
-
-    // ── 2. Acceptance criteria (Gherkin) ──────────────────────────────────────
-    let gherkin = if let Ok(cached) = ws.get_artifact("acceptance.feature") {
-        eprintln!("==> Acceptance criteria (resuming from checkpoint)");
-        cached
-    } else {
+    // The stages after the contract. Each takes the manager to run on, so speculative work can
+    // use one that can be cancelled; `announce` sets the stage label and `emit` writes the
+    // checkpoint. They return errors instead of panicking so that a cancelled run is quiet.
+    let acceptance_stage = |m: &Manager, announce: bool, emit: bool| -> Result<String, String> {
+        if let Ok(cached) = ws.get_artifact("acceptance.feature") {
+            eprintln!("==> Acceptance criteria (resuming from checkpoint)");
+            return Ok(cached);
+        }
         eprintln!("==> Acceptance criteria");
-        ws.observer().inspect(|o| o.stage("Acceptance criteria"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Acceptance criteria"));
+        }
         let ac_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then write Gherkin acceptance criteria covering its key behaviors and edge cases. \
              Read V1 source with list_files/read_file only if you need to confirm a concrete \
              detail the contract doesn't spell out.";
-        let toolbox = toolbox_for("AcceptanceCriteria", ACCEPTANCE_CRITERIA);
-        let g = mgr
-            .run_agentic(
-                "AcceptanceCriteria",
-                ACCEPTANCE_CRITERIA,
-                ac_task,
-                &toolbox,
-                manager::AGENTIC_MAX_TURNS,
-            )
-            .expect("acceptance criteria phase failed");
-        ws.emit_artifact("acceptance.feature", &g).unwrap();
-        g
+        let toolbox = PipelineToolbox::new(
+            &args.source, &ws, m, "AcceptanceCriteria", ACCEPTANCE_CRITERIA, manager::AGENTIC_MAX_TURNS,
+        );
+        let g = m
+            .run_agentic("AcceptanceCriteria", ACCEPTANCE_CRITERIA, ac_task, &toolbox, manager::AGENTIC_MAX_TURNS)
+            .map_err(|e| e.to_string())?;
+        if emit {
+            ws.emit_artifact("acceptance.feature", &g).map_err(|e| e.to_string())?;
+        }
+        Ok(g)
     };
-    eprintln!("    acceptance criteria done");
 
-    // ── 3. Test matrix refinement ─────────────────────────────────────────────
-    let refined = if let Ok(cached) = ws.get_artifact("refined_test_matrix.json") {
-        eprintln!("==> Test matrix refinement (resuming from checkpoint)");
-        cached
-    } else {
+    let test_matrix_stage = |m: &Manager, announce: bool, emit: bool| -> Result<String, String> {
+        if let Ok(cached) = ws.get_artifact("refined_test_matrix.json") {
+            eprintln!("==> Test matrix refinement (resuming from checkpoint)");
+            return Ok(cached);
+        }
         eprintln!("==> Test matrix refinement");
-        ws.observer().inspect(|o| o.stage("Test matrix refinement"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Test matrix refinement"));
+        }
         let raw_matrix = ws.read_test_matrix().unwrap_or_default();
         let te_task = format!(
             "# Raw Test Matrix\n{raw_matrix}\n\n\
@@ -314,58 +340,210 @@ fn main() {
              read whatever V1 source files you need with list_files/read_file. For each test \
              case, determine concrete inputs and expected V1 outputs."
         );
-        let toolbox = toolbox_for("TestEngineer", TEST_ENGINEER);
-        let r = mgr
+        let toolbox = PipelineToolbox::new(
+            &args.source, &ws, m, "TestEngineer", TEST_ENGINEER, manager::AGENTIC_MAX_TURNS,
+        );
+        let r = m
             .run_agentic("TestEngineer", TEST_ENGINEER, &te_task, &toolbox, manager::AGENTIC_MAX_TURNS)
-            .expect("test engineer failed");
-        ws.emit_artifact("refined_test_matrix.json", &r).unwrap();
-        r
+            .map_err(|e| e.to_string())?;
+        if emit {
+            ws.emit_artifact("refined_test_matrix.json", &r).map_err(|e| e.to_string())?;
+        }
+        Ok(r)
     };
-    eprintln!("    test matrix refined");
-    let _ = refined; // consumed via read_test_matrix below
 
-    // ── 4. Inductive analysis ─────────────────────────────────────────────────
-    let inductive = if let Ok(cached) = ws.get_artifact("inductive_analysis.md") {
-        eprintln!("==> Inductive analysis (resuming from checkpoint)");
-        cached
-    } else {
+    let inductive_stage = |m: &Manager, announce: bool, emit: bool| -> Result<String, String> {
+        if let Ok(cached) = ws.get_artifact("inductive_analysis.md") {
+            eprintln!("==> Inductive analysis (resuming from checkpoint)");
+            return Ok(cached);
+        }
         eprintln!("==> Inductive analysis");
-        ws.observer().inspect(|o| o.stage("Inductive analysis"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Inductive analysis"));
+        }
         let ir_task = "Read the ObjectiveContract with read_artifact(\"objective_contract.md\"), \
              then analyze V1 as a system using list_files/read_file. Surface implicit \
              invariants, systemic patterns, architectural analogies, and risk zones. For a \
              large source tree, use fan_out to analyze independent subsystems concurrently, \
              then weave the results together yourself.";
-        let toolbox = toolbox_for("InductiveReasoner", INDUCTIVE_REASONER);
-        let i = mgr
+        let toolbox = PipelineToolbox::new(
+            &args.source, &ws, m, "InductiveReasoner", INDUCTIVE_REASONER, manager::AGENTIC_MAX_TURNS,
+        );
+        let i = m
             .run_agentic("InductiveReasoner", INDUCTIVE_REASONER, ir_task, &toolbox, manager::AGENTIC_MAX_TURNS)
-            .expect("inductive reasoner failed");
-        ws.emit_artifact("inductive_analysis.md", &i).unwrap();
-        i
+            .map_err(|e| e.to_string())?;
+        if emit {
+            ws.emit_artifact("inductive_analysis.md", &i).map_err(|e| e.to_string())?;
+        }
+        Ok(i)
     };
-    eprintln!("    inductive analysis done");
 
-    // ── 5. Schema ─────────────────────────────────────────────────────────────
-    let schema = if let Ok(cached) = ws.get_artifact("schema.rs") {
-        eprintln!("==> Schema (resuming from checkpoint)");
-        cached
-    } else {
+    let schema_stage = |m: &Manager, announce: bool, emit: bool| -> Result<String, String> {
+        if let Ok(cached) = ws.get_artifact("schema.rs") {
+            eprintln!("==> Schema (resuming from checkpoint)");
+            return Ok(cached);
+        }
         eprintln!("==> Schema");
-        ws.observer().inspect(|o| o.stage("Schema"));
+        if announce {
+            ws.observer().inspect(|o| o.stage("Schema"));
+        }
         let schema_task = "Read the ObjectiveContract (read_artifact(\"objective_contract.md\")) \
              and the Inductive Analysis (read_artifact(\"inductive_analysis.md\")), then read \
              whatever V1 source you need with list_files/read_file. Design the Rust type \
              system and public API stubs for V2. Preserve the implicit invariants identified \
              in the Inductive Analysis.";
-        let toolbox = toolbox_for("SchemaArchitect", SCHEMA_ARCHITECT);
-        let s = mgr
+        let toolbox = PipelineToolbox::new(
+            &args.source, &ws, m, "SchemaArchitect", SCHEMA_ARCHITECT, manager::AGENTIC_MAX_TURNS,
+        );
+        let s = m
             .run_agentic("SchemaArchitect", SCHEMA_ARCHITECT, schema_task, &toolbox, manager::AGENTIC_MAX_TURNS)
-            .expect("schema phase failed");
+            .map_err(|e| e.to_string())?;
         let s = Manager::strip_fences(&s).to_string();
-        ws.emit_artifact("schema.rs", &s).unwrap();
-        s
+        if emit {
+            ws.emit_artifact("schema.rs", &s).map_err(|e| e.to_string())?;
+        }
+        Ok(s)
     };
-    eprintln!("    schema done");
+
+    // ── 1. ObjectiveContract ──────────────────────────────────────────────────
+    // With channels to spare, the stages that follow start from the contract's first settled
+    // draft while the architect and reviewer carry on. If the approved contract is the draft,
+    // what they produced stands as the checkpoints; if it changed, it is thrown away and any
+    // of it still running is cancelled. The contract is the only thing they are built on.
+    let contract = if let Ok(cached) = ws.get_artifact("objective_contract.md") {
+        eprintln!("==> ObjectiveContract (resuming from checkpoint)");
+        cached
+    } else {
+        eprintln!("==> ObjectiveContract");
+        ws.observer().inspect(|o| o.stage("ObjectiveContract"));
+        discard_speculative(&ws);
+        let toolbox = toolbox_for("MissionArchitect", MISSION_ARCHITECT);
+        if mgr.registry.capable_heavy_slots() >= SPECULATE_MIN_CHANNELS {
+            let finished = AtomicBool::new(false);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let draft = Mutex::new(None::<u64>);
+            let (c, lane) = std::thread::scope(|scope| {
+                let lane = scope.spawn(|| {
+                    let text = speculate::wait_for_draft(
+                        &|| ws.get_artifact("objective_contract.md").ok(),
+                        &finished,
+                        Duration::from_secs(15),
+                        Duration::from_secs(2),
+                    )?;
+                    *draft.lock().unwrap() = Some(speculate::fingerprint(&text));
+                    eprintln!(
+                        "    contract draft settled: starting later stages on {} spare channels",
+                        mgr.registry.free_channels()
+                    );
+                    mark_speculative(&ws);
+                    let spec = Manager::new(&ws, mgr.registry).with_cancel(cancel.clone());
+                    let tasks = vec![
+                        speculate::Task {
+                            name: "inductive",
+                            priority: speculate::priority(3, 0.7),
+                            requires: None,
+                            run: Box::new(|| inductive_stage(&spec, false, true)),
+                        },
+                        speculate::Task {
+                            name: "schema",
+                            priority: speculate::priority(2, 0.8),
+                            requires: Some("inductive"),
+                            run: Box::new(|| schema_stage(&spec, false, true)),
+                        },
+                        speculate::Task {
+                            name: "test matrix",
+                            priority: speculate::priority(1, 0.9),
+                            requires: None,
+                            run: Box::new(|| test_matrix_stage(&spec, false, true)),
+                        },
+                        speculate::Task {
+                            name: "acceptance",
+                            priority: speculate::priority(1, 0.3),
+                            requires: None,
+                            run: Box::new(|| acceptance_stage(&spec, false, true)),
+                        },
+                    ];
+                    Some(speculate::run(
+                        tasks,
+                        &|| mgr.registry.free_channels(),
+                        SPECULATE_RESERVE,
+                        &cancel,
+                        Duration::from_millis(250),
+                    ))
+                });
+                let c = author_contract(&mgr, &mission, args.max_iter, &toolbox)
+                    .expect("contract phase failed");
+                finished.store(true, Ordering::SeqCst);
+                ws.emit_artifact("objective_contract.md", &c).unwrap();
+                if *draft.lock().unwrap() != Some(speculate::fingerprint(&c)) {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                let lane = lane.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                (c, lane)
+            });
+            match lane {
+                None => eprintln!("    contract finished before a draft settled; nothing was started early"),
+                Some(done) if *draft.lock().unwrap() == Some(speculate::fingerprint(&c)) => {
+                    let kept: Vec<&str> =
+                        done.iter().filter(|d| d.result.is_ok()).map(|d| d.name).collect();
+                    eprintln!("    the contract is its draft: kept {} early result(s): {}", kept.len(), kept.join(", "));
+                    clear_speculative_marker(&ws);
+                }
+                Some(_) => {
+                    eprintln!("    the contract changed after its draft: discarding the early results");
+                    discard_speculative(&ws);
+                }
+            }
+            c
+        } else {
+            let c = author_contract(&mgr, &mission, args.max_iter, &toolbox)
+                .expect("contract phase failed");
+            ws.emit_artifact("objective_contract.md", &c).unwrap();
+            c
+        }
+    };
+    eprintln!("    contract done");
+
+    // ── 2 to 5. Acceptance criteria, test matrix, inductive analysis, schema ──
+    // Whatever speculation kept is already a checkpoint and is skipped here. What is left runs
+    // as before: acceptance criteria and the test matrix beside the inductive analysis and
+    // the schema when the providers can serve more than one request at once.
+    let concurrent = mgr.registry.capable_heavy_slots() >= 2;
+    let (gherkin, inductive, schema) = if concurrent {
+        eprintln!(
+            "    {} parallel slots: acceptance criteria and test matrix run beside the inductive analysis and schema",
+            mgr.registry.capable_heavy_slots()
+        );
+        ws.observer().inspect(|o| o.stage("Inductive analysis (acceptance criteria and test matrix alongside)"));
+        std::thread::scope(|scope| {
+            let acceptance = scope.spawn(|| acceptance_stage(&mgr, false, true));
+            let test_matrix = scope.spawn(|| test_matrix_stage(&mgr, false, true));
+            let inductive = inductive_stage(&mgr, false, true).expect("inductive reasoner failed");
+            eprintln!("    inductive analysis done");
+            let schema = schema_stage(&mgr, true, true).expect("schema phase failed");
+            eprintln!("    schema done");
+            let gherkin = acceptance
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+                .expect("acceptance criteria phase failed");
+            test_matrix
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+                .expect("test engineer failed");
+            eprintln!("    acceptance criteria and test matrix done");
+            (gherkin, inductive, schema)
+        })
+    } else {
+        let gherkin = acceptance_stage(&mgr, true, true).expect("acceptance criteria phase failed");
+        eprintln!("    acceptance criteria done");
+        test_matrix_stage(&mgr, true, true).expect("test engineer failed");
+        eprintln!("    test matrix refined");
+        let inductive = inductive_stage(&mgr, true, true).expect("inductive reasoner failed");
+        eprintln!("    inductive analysis done");
+        let schema = schema_stage(&mgr, true, true).expect("schema phase failed");
+        eprintln!("    schema done");
+        (gherkin, inductive, schema)
+    };
 
     // ── 5b. Schema must compile before anything is built on it ───────────────
     let schema = {

@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- `snippet-graph` (binary `sg`) joins the workspace and the release tarballs: builds a crate one function at a time from a spec, with tests written first, repair of the function the tests blame, versioned history, a failure ledger, a skeleton review that splits functions doing too much, and a handoff repository with a status per function.
+- Providers take `channels`: the number of requests the backend serves at once. The orchestrator now fans out to that many workers instead of one per provider.
+- The pipeline runs acceptance criteria and the test matrix beside the inductive analysis and the schema when the providers can serve two or more requests at once. Only the schema needs the inductive analysis; nothing before synthesis reads the other two. With one channel the order is unchanged.
+- Early start: when three or more channels are free, the stages after the contract start from the contract's first settled draft while the architect and reviewer carry on. The results stand if the approved contract is the draft and are discarded (and anything still running cancelled) if not. A conversation can now be cancelled at its next turn, and the registry counts requests in flight and free channels. Plan: `docs/speculation-and-notes-plan.md`.
+- `deploy/spark/`: service definitions, a speed test and a memory watchdog for a single inference box. `docs/remote-deployment.md` gains measured memory and throughput for 8 parallel slots.
+
 ## [0.14.0]
 
 ### Changed

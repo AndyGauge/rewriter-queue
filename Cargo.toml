@@ -5,6 +5,7 @@ members = [
     "job-queue",
     "run-events",
     "bench",
+    "snippet-graph",
 ]
 resolver = "2"
 
@@ -15,3 +16,5 @@ chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 ureq = { version = "2", features = ["json"] }
 toml = "0.8"
+thiserror = "1"
+syn = { version = "2", features = ["full", "visit", "visit-mut", "extra-traits"] }

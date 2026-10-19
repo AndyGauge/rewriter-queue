@@ -30,7 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --release -p job-queue -p ai-org-orchestrator
+        run: cargo build --release -p job-queue -p ai-org-orchestrator -p snippet-graph
 
       - name: Package
         shell: bash
@@ -40,6 +40,7 @@ jobs:
           mkdir "$name"
           cp target/release/rewriter-queue "$name/"
           cp target/release/ai-org-orchestrator "$name/"
+          cp target/release/sg "$name/"
           cp LICENSE-MIT LICENSE-APACHE "$name/"
           tar czf "$name.tar.gz" "$name"
 

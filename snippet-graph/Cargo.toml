@@ -1,0 +1,17 @@
+[package]
+name = "snippet-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+syn = { workspace = true }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+inference-providers = { path = "../inference-providers" }
+
+[[bin]]
+name = "sg"
+path = "src/bin/sg.rs"

@@ -43,6 +43,58 @@ in particular:
 - Leave real headroom, not just enough to fit at idle — concurrent
   requests, the OS, and anything else on the box all need memory too.
 
+### Parallel channels, context and memory
+
+`llama-server --parallel N` gives the server N slots that serve requests at once. `-c` is the
+**total** context, split evenly: each slot gets `c / N`. For 8 slots of 262,144 tokens, `-c 2097152`.
+
+The queue does not read the slot count from the server. It fans work out to as many workers as
+the providers in `config.toml` can serve, which is one per provider unless you say otherwise:
+
+```toml
+[[providers]]
+name = "backend-a"
+type = "openai-compat"
+base_url = "http://<inference-box>:8001/v1"
+models = ["your-model-id"]
+channels = 8        # match llama-server's --parallel (or vLLM's --max-num-seqs)
+```
+
+Without `channels`, a server with 8 slots is used one request at a time.
+
+**Memory.** Weights plus cache plus a few GB of buffers, and the cache is the part that grows
+with `--parallel` and `-c`. For a hybrid model only the full-attention layers keep a per-token
+cache: `layers_with_attention x 2 (K and V) x kv_heads x head_dim x bytes_per_value`. Read these
+from the GGUF header (`block_count`, `full_attention_interval`, `attention.head_count_kv`,
+`attention.key_length`). Measured on a 121 GB unified-memory box (DGX Spark / GB10):
+
+| Model and settings | Cache | Used after load | Used under load |
+|---|---|---|---|
+| Qwen3-Coder-Next Q4_K_XL (49.6 GB), 8 slots x 262,144, `-ctk q8_0 -ctv q8_0` | 27 GB (13 KB/token) | 82 GB | 86 GB |
+| same, cache left at f16 | 52 GB (24.6 KB/token), not run | about 105 GB (estimate) | |
+| gpt-oss-120b MXFP4, 8 slots x 122,880 | about 37 GB | | 99 GB |
+
+At 99 GB used, with 16 requests in flight, the box stopped answering ssh and needed a power
+cycle. Keep 30 GB or more of headroom on a unified-memory machine, and store the cache as
+`q8_0` before reaching for fewer slots. A watchdog that kills `llama-server` when available
+memory falls under about 6 GB (`deploy/spark/memguard.sh`) turns that failure into a restart.
+
+**Throughput** on the same box (tokens per second per stream, total in brackets), measured with
+`deploy/spark/tps.py`:
+
+| Streams | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| Qwen3-Coder-Next, 8 slots, q8_0 cache | 53 | 41 (81) | 30 (116) | 23 (176) | 16 (163) |
+| gpt-oss-120b, 8 slots | 54 | 36 (72) | 24 (97) | 14 (110) | 10 (112) |
+| gpt-oss-120b, 2 slots | 54 | 37 (73) | 27 (72) | 19 (74) | n/a |
+
+Past as many streams as there are slots the total stays flat, because the extra requests wait.
+A single stream runs at about 54 tokens per second whatever the model, so concurrency is the
+lever. The weight format (MXFP4 or Q4_K_XL, both about 4 bits) made no measurable difference.
+
+Nothing here restarts after a reboot. Use the systemd units below, or `deploy/spark/services.py`,
+which describes each server in `services.toml` and starts or swaps them.
+
 ## The queue server
 
 Runs anywhere that can reach the inference backend(s) over HTTP — doesn't
@@ -63,6 +115,7 @@ name = "backend-a"
 type = "openai-compat"
 base_url = "http://<inference-box>:8001/v1"
 models = ["your-model-id"]
+channels = 8   # the backend's parallel slots; see "Parallel channels, context and memory"
 
 [queue]
 url = "http://<this-box>:8003"
